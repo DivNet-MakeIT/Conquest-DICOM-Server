@@ -151,7 +151,7 @@ then
         cp dgate webserver/htdocs/app/newweb;
 	cp src/servertask/servertask webserver/htdocs/api/dicom/servertask;
 	chmod 777 webserver/htdocs/api/dicom/servertask;
-	sudo cp -r webserver/htdocs/* /var/www/html;
+	sudo cp -rn webserver/htdocs/* /var/www/html;
 	
 	[ ! -d data/dbase ] && mkdir data/dbase
 	[ ! -d data/incoming ] && mkdir data/incoming

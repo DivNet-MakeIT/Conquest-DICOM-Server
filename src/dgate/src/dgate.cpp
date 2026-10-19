@@ -1287,6 +1287,7 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			instance list (0x0120); do not send event if action could not be read; SOP class only
 			accepted when enabled; event on new association was sent without data (writing empties 
 			the object: now a copy is written first) and now proposes the SCP role
+20261019	mmd	StorageCommitment: refuse N-ACTION (0x0124) from a calling AE that is not in acrnema.map
 
 ENDOFUPDATEHISTORY
 */
@@ -21526,6 +21527,21 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 	if (ActionStorageCommitmentPushRequest.Read(DCO, PDU, *CommitData))
 		{
 		OperatorConsole.printf("Storage commitment request recieved\n");
+
+		// only a calling AE known in acrnema.map may ask: the answer tells which instances
+		// exist here, and the event has to be sent back to an address taken from that map
+		memset(Calling, 0, 20);
+		strcpy(Calling, (char *)(((AAssociateAC *)PDU)->CallingApTitle));
+		if (Calling[0]>32)
+		  while (strlen(Calling) && Calling[strlen(Calling)-1]==' ') Calling[strlen(Calling)-1] = 0;
+		if (!GetACRNema(Calling, (char *)ip, (char *)port, (char *)compress))
+			{
+			OperatorConsole.printf("*** Storage commitment - refused, calling AE not in acrnema.map: %s\n", Calling);
+	 		ActionStorageCommitmentPushResponse.Write(PDU, DCO, &StorageCommitmentPushModelInstanceUID, 1, 0x0124, NULL);
+			delete *CommitData;
+			*CommitData = NULL;
+			return TRUE;
+			}
 
 		// only instances with a database record and a non-empty file stay in 0008,1199;
 		// the others are moved to 0008,1198 and counted in nfail

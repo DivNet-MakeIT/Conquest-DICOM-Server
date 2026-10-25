@@ -188,6 +188,10 @@ BOOL	GetFileName(VR	*, char *, char *, BOOL UpdateLRU = TRUE, char *patid=NULL, 
 BOOL	GetFileName(VR	*, char *, char *, Database &, BOOL UpdateLRU = TRUE, char *patid=NULL, char *study=NULL, char *series=NULL);
 BOOL	InitACRNemaAddressArray();
 BOOL	CloseACRNemaAddressArray();
+UINT	GetACRNemaCount(void);
+BOOL	GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry);
+BOOL	PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress);
+BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);
 BOOL	RemoveFromPACS(DICOMDataObject *, BOOL KeepImages = FALSE);

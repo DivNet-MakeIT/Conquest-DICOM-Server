@@ -1295,6 +1295,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			in one step (results unchanged, no half-built map seen by other threads)
 20261025	mmd	acrnema.map optional 5th column (T, SC, R, Rn, RI); kept by write_amap, put_amap (6th item),
 			get_amap/get_amaps (13th argument), Lua get_amap (5th value) and the -m listing
+20261025	mmd	OutgoingStorageCommitment (default 0): tables SCObject/SCTransaction/SCTxMember and
+			N-EVENT-REPORT handling for results of storage commitment requests sent by this server
+			(result checked in full before anything is recorded; sender must connect from its
+			acrnema.map address unless OutgoingSCCheckIP = 0)
 
 ENDOFUPDATEHISTORY
 */
@@ -1457,6 +1461,8 @@ char	VirtualServerFor[11][48];			// AE's of servers providing data for this one 
 BOOL	VirtualServerPerSeries[11];			// If set, get images at SERIES level instead of at IMAGE level
 int	CacheVirtualData=1;				// if set, keep (cache) passed through data
 int	EnableStorageCommitment=0;			// if set, accept and process storage commitment (N-ACTION, N-EVENT-REPORT)
+int	OutgoingStorageCommitment=0;			// if set, storage commitment for data sent to nodes with SC in acrnema.map
+int	OutgoingSCCheckIP=1;				// results only accepted from the address of the destination in acrnema.map
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -1666,6 +1672,7 @@ def(QueueSize)
 def(ForwardCollectDelay)
 def(CacheVirtualData)
 def(EnableStorageCommitment)
+def(OutgoingStorageCommitment)
 
 def(gJpegQuality)
 def(gUseOpenJpeg)
@@ -15699,6 +15706,8 @@ class	StorageApp	:
 		void FailSafeStorage(CheckedPDU_Service *PDU);
 		BOOL PrinterSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject *PrintData[], int Thread, char *lua);
 		BOOL StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject **CommitData);
+		BOOL SCEventReportSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP);
+		BOOL SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO);
 	};
 
 // from dbsql.cpp
@@ -21627,6 +21636,395 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 	return FALSE;
 	}
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// Outgoing storage commitment (this server as SCU), part 1: persistent state and the
+// N-EVENT-REPORT that carries the result. Only active with OutgoingStorageCommitment = 1.
+//
+// Tables (created when missing, never when the switch is 0):
+//   SCObject       one row per object and destination: current state
+//   SCTransaction  one row per N-ACTION (TransactionUID); not changed once closed
+//   SCTxMember     the objects of each transaction, written before the N-ACTION is sent;
+//                  Outcome (1 committed, 2 failed) and Reason keep the result as received
+// Object states: NOTED REQUESTED COMMITTED FAILED TIMEOUT UNSUPPORTED HELD
+// Transaction states: OPEN CLOSED ABANDONED (replaced by a newer request for the same objects)
+//////////////////////////////////////////////////////////////////////////////////////////
+
+#define SC_MAXMEMBERS 20000
+
+static CRITICAL_SECTION	SCTableCritical;
+static struct SCTableCriticalInit
+	{
+	SCTableCriticalInit() { InitializeCriticalSection(&SCTableCritical); }
+	}	SCTableCriticalInitObject;
+static BOOL SCTablesReady = FALSE;
+
+// a UID as used in our SQL: digits and dots only, 1..64 characters
+static BOOL SCIsUID(const char *s)
+	{
+	int n = strlen(s);
+	if (n<1 || n>64) return FALSE;
+	for (int i=0; i<n; i++) if (!((s[i]>='0' && s[i]<='9') || s[i]=='.')) return FALSE;
+	return TRUE;
+	}
+
+// an AE title as used in our SQL: printable, no quote or backslash, 1..16 characters
+static BOOL SCIsAE(const char *s)
+	{
+	int n = strlen(s);
+	if (n<1 || n>16) return FALSE;
+	for (int i=0; i<n; i++) if (s[i]<32 || s[i]>126 || s[i]=='\'' || s[i]=='\\') return FALSE;
+	return TRUE;
+	}
+
+static void SCTrim(char *s)
+	{
+	while (strlen(s) && s[strlen(s)-1]==' ') s[strlen(s)-1] = 0;
+	}
+
+// Read a UID exactly as sent: at most 64 characters, one trailing pad (NUL or space)
+// allowed, nothing cut and no embedded NUL. buf must hold 65 bytes.
+static BOOL SCVRUID(VR *vr, char *buf)
+	{
+	unsigned int n;
+	buf[0] = 0;
+	if (!vr || !vr->Data || vr->Length==0 || vr->Length>64) return FALSE;
+	n = vr->Length;
+	memcpy(buf, vr->Data, n);
+	buf[n] = 0;
+	if (buf[n-1]==0 || buf[n-1]==' ') buf[--n] = 0;
+	if (strlen(buf)!=n) return FALSE;
+	return SCIsUID(buf);
+	}
+
+// "CalledAE = 'X'" compared exactly (MySQL/MariaDB compare strings without case by default)
+static void SCAEWhere(Database &DB, char *out, const char *ae)
+	{
+	if (DB.db_type==DT_MYSQL) sprintf(out, "CalledAE = BINARY '%s'", ae);
+	else                      sprintf(out, "CalledAE = '%s'", ae);
+	}
+
+static BOOL SCVRString(VR *vr, char *buf, int size)
+	{
+	buf[0] = 0;
+	if (!vr || !vr->Length) return FALSE;
+	vr->GetString(buf, size);
+	SCTrim(buf);
+	return buf[0]!=0;
+	}
+
+// create the tables when they do not exist yet; FALSE when the database cannot hold them
+BOOL SCEnsureTables(Database &DB)
+	{
+	BOOL ok = TRUE;
+	if (SCTablesReady) return TRUE;
+	if (DB.db_type==DT_DBASEIII || DB.db_type==DT_DBASEIIINOINDEX || DB.db_type==DT_NULL)
+		{
+		OperatorConsole.printf("*** Outgoing storage commitment needs an SQL database (not available with the built-in dbase driver)\n");
+		return FALSE;
+		}
+
+	EnterCriticalSection(&SCTableCritical);
+	if (!SCTablesReady)
+		{
+		if (!DB.Query("SCTransaction", "TxUID", "TxUID = '0'", NULL))
+			{
+			ok = DB.CreateTable("SCTransaction",
+				"TxUID varchar(64), CalledAE varchar(16), SentAt int, ClosedAt int, "
+				"State varchar(10), Result varchar(10), Members int");
+			if (ok) DB.CreateIndex("SCTransaction", "sctx_uid", "TxUID");
+			}
+		if (ok && !DB.Query("SCTxMember", "TxUID", "TxUID = '0'", NULL))
+			{
+			ok = DB.CreateTable("SCTxMember",
+				"TxUID varchar(64), SOPInstUID varchar(64), SOPClassUID varchar(64), "
+				"Outcome int, Reason int");
+			if (ok) DB.CreateIndex("SCTxMember", "scmem_tx", "TxUID");
+			}
+		if (ok && !DB.Query("SCObject", "SOPInstUID", "SOPInstUID = '0'", NULL))
+			{
+			ok = DB.CreateTable("SCObject",
+				"CalledAE varchar(16), SOPInstUID varchar(64), SOPClassUID varchar(64), "
+				"StudyUID varchar(64), State varchar(12), TxUID varchar(64), Attempts int, "
+				"Resends int, ResendRes int, FirstSent int, LastSent int, NextTry int, "
+				"CommittedAt int, FailReason int, DestIP varchar(128), DestPort varchar(16), "
+				"DestTLS int, MapGen int, NoResend int");
+			if (ok) DB.CreateIndex("SCObject", "scobj_key", "CalledAE, SOPInstUID");
+			if (ok) DB.CreateIndex("SCObject", "scobj_state", "State");
+			}
+		if (ok) OperatorConsole.printf("Outgoing storage commitment tables ready\n");
+		else    OperatorConsole.printf("*** Outgoing storage commitment: could not create tables\n");
+		SCTablesReady = ok;
+		}
+	LeaveCriticalSection(&SCTableCritical);
+	return SCTablesReady;
+	}
+
+struct SCMember { char inst[65]; char cls[65]; int seen; int reason; int outcome; int oreason; };
+
+static int SCMemberCompare(const void *a, const void *b)
+	{ return strcmp(((const SCMember*)a)->inst, ((const SCMember*)b)->inst); }
+
+// Check one sequence of the result against the members of the transaction: every item must
+// be a member, with the same SOP class, and appear once in both sequences together.
+// mark = 1 for 0008,1199 (committed), 2 for 0008,1198 (failed). Returns FALSE on any mismatch.
+static BOOL SCCheckSequence(DICOMDataObject *DDO, UINT16 element, SCMember *m, int nm, int mark, int *count, const char **why)
+	{
+	VR *vr = DDO->GetVR(0x0008, element);
+	*count = 0;
+	if (!vr) return TRUE;
+	if (!vr->SQObjectArray) { if (vr->Length==0) return TRUE; *why = "sequence item list missing"; return FALSE; }
+	Array<DICOMDataObject*> *A = (Array<DICOMDataObject*>*) vr->SQObjectArray;
+	for (unsigned int i=0; i<A->GetSize(); i++)
+		{
+		SCMember key, *f;
+		char cls[65];
+		// UIDs are refused when not exactly valid, never cut: what is checked is what is used
+		if (!SCVRUID(A->Get(i)->GetVR(0x0008, 0x1155), key.inst)) { *why = "item without valid SOP instance UID"; return FALSE; }
+		if (!SCVRUID(A->Get(i)->GetVR(0x0008, 0x1150), cls))      { *why = "item without valid SOP class UID"; return FALSE; }
+		f = (SCMember *)bsearch(&key, m, nm, sizeof(SCMember), SCMemberCompare);
+		if (!f)            { *why = "instance not part of this transaction"; return FALSE; }
+		if (f->seen)       { *why = "instance listed twice"; return FALSE; }
+		if (strcmp(f->cls, cls)!=0) { *why = "SOP class differs from the one requested"; return FALSE; }
+		f->seen = mark;
+		f->reason = 0;
+		if (mark==2)
+			{
+			VR *r = A->Get(i)->GetVR(0x0008, 0x1197);
+			if (!r || r->Length!=2) { *why = "failed item without failure reason"; return FALSE; }
+			f->reason = (int)A->Get(i)->GetUINT16(0x0008, 0x1197);
+			}
+		(*count)++;
+		}
+	return TRUE;
+	}
+
+// Validate a storage commitment result for a transaction this server started and record it.
+// Nothing is changed unless the whole report is consistent. Returns the DIMSE status to answer.
+UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObject *DDO)
+	{
+	Database DB;
+	char TxUID[68], txae[20], txstate[16], fi[68], fc[68], fo[16], fr[16], where[512], upd[256], aew[64];
+	SQLLEN len;
+	SCMember *m = NULL;
+	int nm = 0, nok = 0, nfail = 0, i;
+	const char *why = NULL;
+	UINT16 status = 0x0110;		// processing failure, unless all checks pass
+
+	TxUID[0] = 0;
+	if (!DB.Open(DataSource, UserName, Password, DataHost))
+		{ OperatorConsole.printf("*** Storage commitment result: no database connection\n"); return 0x0110; }
+	if (!SCEnsureTables(DB)) { DB.Close(); return 0x0110; }
+
+	if (!SCVRUID(DDO->GetVR(0x0008, 0x1195), TxUID))
+		{ why = "no valid transaction UID"; TxUID[0] = 0; goto done; }
+	if (EventTypeID!=1 && EventTypeID!=2)
+		{ why = "event type is not 1 or 2"; status = 0x0113; goto done; }
+
+	// the transaction: must exist, and the result must come from the AE it was sent to
+	txae[0] = txstate[0] = 0;
+	sprintf(where, "TxUID = '%s'", TxUID);
+	if (!DB.Query("SCTransaction", "CalledAE, State", where, NULL)) { why = "database query failed"; goto done; }
+	DB.BindField(1, SQL_C_CHAR, txae, sizeof(txae), &len);
+	DB.BindField(2, SQL_C_CHAR, txstate, sizeof(txstate), &len);
+	if (!DB.NextRecord()) { why = "unknown transaction UID"; goto done; }
+	SCTrim(txae); SCTrim(txstate);
+	if (strcmp(txae, CallingAE)!=0)
+		{ why = "result sent by an AE other than the destination of the request"; goto done; }
+	SCAEWhere(DB, aew, CallingAE);
+
+	// the members of the transaction
+	m = (SCMember *)malloc(sizeof(SCMember)*SC_MAXMEMBERS);
+	if (!m) { why = "out of memory"; goto done; }
+	if (!DB.Query("SCTxMember", "SOPInstUID, SOPClassUID, Outcome, Reason", where, NULL)) { why = "database query failed"; goto done; }
+	fi[0] = fc[0] = fo[0] = fr[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, fi, sizeof(fi), &len);
+	DB.BindField(2, SQL_C_CHAR, fc, sizeof(fc), &len);
+	DB.BindField(3, SQL_C_CHAR, fo, sizeof(fo), &len);
+	DB.BindField(4, SQL_C_CHAR, fr, sizeof(fr), &len);
+	while (DB.NextRecord())
+		{
+		if (nm>=SC_MAXMEMBERS) { why = "transaction too large"; goto done; }
+		SCTrim(fi); SCTrim(fc);
+		strncpy(m[nm].inst, fi, 64); m[nm].inst[64] = 0;
+		strncpy(m[nm].cls, fc, 64);  m[nm].cls[64] = 0;
+		m[nm].seen = 0;
+		m[nm].reason = 0;
+		m[nm].outcome = atoi(fo);
+		m[nm].oreason = atoi(fr);
+		nm++;
+		fi[0] = fc[0] = fo[0] = fr[0] = 0;
+		}
+	if (nm==0) { why = "transaction has no members"; goto done; }
+	qsort(m, nm, sizeof(SCMember), SCMemberCompare);
+	for (i=1; i<nm; i++)
+		if (strcmp(m[i-1].inst, m[i].inst)==0) { why = "transaction lists an instance twice"; goto done; }
+
+	// the result must name exactly the requested set, each once
+	if (!SCCheckSequence(DDO, 0x1199, m, nm, 1, &nok,   &why)) goto done;
+	if (!SCCheckSequence(DDO, 0x1198, m, nm, 2, &nfail, &why)) goto done;
+	if (nok+nfail != nm) { why = "result does not cover all requested instances"; goto done; }
+	if (EventTypeID==1 && nfail)  { why = "event type 1 with failed instances"; goto done; }
+	if (EventTypeID==2 && !nfail) { why = "event type 2 without failed instances"; goto done; }
+
+	// a transaction that is already closed: the same result again is accepted without
+	// changes; a result that differs from the one received then is refused
+	if (strcmp(txstate, "CLOSED")==0)
+		{
+		for (i=0; i<nm; i++)
+			if (m[i].outcome!=m[i].seen || (m[i].seen==2 && m[i].oreason!=m[i].reason))
+				{ why = "repeated result differs from the one recorded for this transaction"; goto done; }
+		OperatorConsole.printf("Storage commitment result for closed transaction %s from %s received again (no change)\n", TxUID, CallingAE);
+		status = 0;
+		goto done;
+		}
+
+	// record: committed always wins; a failure never overwrites a committed object, and a
+	// failure from a replaced (abandoned) transaction is ignored: a newer request is pending
+	for (i=0; i<nm; i++)
+		{
+		if (m[i].seen==1)
+			{
+			sprintf(upd, "State = 'COMMITTED', CommittedAt = %u, FailReason = 0", (unsigned int)time(NULL));
+			sprintf(where, "%s and SOPInstUID = '%s'", aew, m[i].inst);
+			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
+			}
+		}
+
+	if (strcmp(txstate, "OPEN")==0)
+		for (i=0; i<nm; i++)
+			if (m[i].seen==2)
+				{
+				sprintf(upd, "State = 'FAILED', FailReason = %d", m[i].reason);
+				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and TxUID = '%s'", aew, m[i].inst, TxUID);
+				if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
+				}
+
+	// the result as received, per member (used to check a repeated result)
+	for (i=0; i<nm; i++)
+		{
+		sprintf(upd, "Outcome = %d, Reason = %d", m[i].seen, m[i].seen==2 ? m[i].reason : 0);
+		sprintf(where, "TxUID = '%s' and SOPInstUID = '%s'", TxUID, m[i].inst);
+		if (!DB.UpdateRecords((char *)"SCTxMember", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
+		}
+
+	// the transaction is closed last: if the server stops halfway, the objects that were
+	// recorded are correct, and the others are asked again after the report timeout
+	sprintf(upd, "State = 'CLOSED', ClosedAt = %u, Result = '%s'", (unsigned int)time(NULL), nfail ? "PARTIAL" : "OK");
+	sprintf(where, "TxUID = '%s'", TxUID);
+	if (!DB.UpdateRecords((char *)"SCTransaction", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
+
+	OperatorConsole.printf("Storage commitment result from %s for %s: %d committed, %d failed\n", CallingAE, TxUID, nok, nfail);
+	status = 0;
+
+done:
+	if (why)
+		OperatorConsole.printf("*** Storage commitment result from %s refused (%s), transaction %s\n", CallingAE, why, TxUID[0] ? TxUID : "-");
+	if (m) free(m);
+	DB.Close();
+	return status;
+	}
+
+// The AE title of a result can be set by anyone: also require that the connection comes
+// from the address of that AE in acrnema.map. Only a numeric IPv4 address is compared
+// (like CheckIPofRemoteAE): no name lookup, so nothing depends on the resolver. A host
+// name or a wildcard entry never matches; OutgoingSCCheckIP = 0 switches the check off.
+static BOOL SCParseIPv4(const char *s, unsigned int *ip)
+	{
+	unsigned int b[4];
+	int n = 0, dots = 0;
+	for (const char *p=s; *p; p++)
+		{
+		if (*p=='.') dots++;
+		else if (*p<'0' || *p>'9') return FALSE;
+		}
+	if (dots!=3 || sscanf(s, "%u.%u.%u.%u%n", &b[0], &b[1], &b[2], &b[3], &n)!=4 || s[n]) return FALSE;
+	if (b[0]>255 || b[1]>255 || b[2]>255 || b[3]>255) return FALSE;
+	unsigned char bytes[4] = { (unsigned char)b[0], (unsigned char)b[1], (unsigned char)b[2], (unsigned char)b[3] };
+	memcpy(ip, bytes, 4);		// network order, as sin_addr.s_addr (= ConnectedIP)
+	return TRUE;
+	}
+
+static BOOL SCSenderMatchesMap(char *Calling, unsigned int ConnectedIP, const char **why)
+	{
+	ACRNemaAddress	E;
+	unsigned int	a;
+	if (!GetACRNemaEntryByAE(Calling, &E)) { *why = "AE not in acrnema.map"; return FALSE; }
+	if (strchr(E.Name, '*') || strchr(E.IP, '*')) { *why = "map entry is a wildcard"; return FALSE; }
+	if (!SCParseIPv4(E.IP, &a)) { *why = "map entry has no numeric IPv4 address (set OutgoingSCCheckIP = 0 to allow host names)"; return FALSE; }
+	if (a!=ConnectedIP) { *why = "connection not from the map address"; return FALSE; }
+	return TRUE;
+	}
+
+// N-EVENT-REPORT of the storage commitment class on any association: read, check, answer
+BOOL StorageApp ::	SCEventReportSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP)
+	{
+	char Sop[68], Calling[20];
+	UINT16 status;
+	int eventid;
+	const char *why = "";
+	ESCPRQ	EventRequest;
+	ESCPRSP	EventResponse;
+	UID	instance("1.2.840.10008.1.20.1.1");
+
+	if (DCO->GetUINT16(0x0000, 0x0100)!=0x0100) return FALSE;
+	if (!SCVRString(DCO->GetVR(0x0000, 0x0002), Sop, sizeof(Sop)) || strcmp(Sop, "1.2.840.10008.1.20.1")!=0) return FALSE;
+
+	DICOMDataObject DDO;
+	if (!EventRequest.Read(DCO, PDU, &DDO)) return FALSE;
+
+	// statuses used (PS3.7 N-EVENT-REPORT): 0110 processing failure (also for refusals),
+	// 0112 no such SOP instance, 0113 no such event type
+	char Inst[68];
+	if (!SCVRUID(DCO->GetVR(0x0000, 0x1000), Inst) || strcmp(Inst, "1.2.840.10008.1.20.1.1")!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment result refused: affected SOP instance is not the storage commitment instance\n");
+		EventResponse.Write(PDU, DCO, &instance, 0x0112, DCO->GetUINT16(0x0000, 0x1002), NULL);
+		return TRUE;
+		}
+
+	memset(Calling, 0, 20);
+	strncpy(Calling, (char *)(((AAssociateAC *)PDU)->CallingApTitle), 16);
+	SCTrim(Calling);
+
+	eventid = DCO->GetUINT16(0x0000, 0x1002);
+	if (!SCIsAE(Calling))
+		{
+		OperatorConsole.printf("*** Storage commitment result refused: unusable calling AE title\n");
+		status = 0x0110;
+		}
+	else if (OutgoingSCCheckIP && !SCSenderMatchesMap(Calling, ConnectedIP, &why))
+		{
+		unsigned char *b = (unsigned char *)&ConnectedIP;
+		OperatorConsole.printf("*** Storage commitment result from %s refused: connection from %d.%d.%d.%d (%s)\n",
+			Calling, b[0], b[1], b[2], b[3], why);
+		status = 0x0110;
+		}
+	else
+		status = SCProcessEventReport(Calling, eventid, &DDO);
+
+	EventResponse.Write(PDU, DCO, &instance, status, eventid, NULL);
+	return TRUE;
+	}
+
+// N-ACTION of the storage commitment class while only outgoing commitment is enabled:
+// answer 0x0118 (no such SOP class, PS3.7 N-ACTION), no event
+BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO)
+	{
+	char Sop[68];
+	ASCPRQ	ActionRequest;
+	ASCPRSP	ActionResponse;
+	UID	instance("1.2.840.10008.1.20.1.1");
+
+	if (DCO->GetUINT16(0x0000, 0x0100)!=0x0130) return FALSE;
+	if (!SCVRString(DCO->GetVR(0x0000, 0x0003), Sop, sizeof(Sop)) || strcmp(Sop, "1.2.840.10008.1.20.1")!=0) return FALSE;
+
+	DICOMDataObject DDO;
+	if (!ActionRequest.Read(DCO, PDU, &DDO)) return FALSE;
+	OperatorConsole.printf("*** Storage commitment request refused: EnableStorageCommitment is 0 (only outgoing commitment is enabled)\n");
+	ActionResponse.Write(PDU, DCO, &instance, 1, 0x0118, NULL);
+	return TRUE;
+	}
+
 void CloneDB(char *AE)
 { VR *vr1;
   VR *vr;
@@ -24827,8 +25225,9 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP )
 	PDU.AttachRTC(&VRType);
 	PDU.SetTimeOut(TCPIPTimeOut);
 
-	// do not accept storage commitment (if listed in dgatesop.lst) unless it is processed
-	if (!EnableStorageCommitment)
+	// do not accept storage commitment (if listed in dgatesop.lst) unless it is processed:
+	// as SCP (incoming N-ACTION) or as SCU (incoming N-EVENT-REPORT for data we sent)
+	if (!EnableStorageCommitment && !OutgoingStorageCommitment)
 		for (UINT i=0; i<PDU.SOPUIDListCount; i++)
 			if (strcmp(PDU.SOPUIDList[i], "1.2.840.10008.1.20.1")==0)
 				PDU.SOPUIDList[i][0] = 0;
@@ -25469,7 +25868,19 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP )
 			continue;
 			}
 
-		
+				// result of a storage commitment request that this server sent (outgoing)
+		if (OutgoingStorageCommitment && SCEventReportSupport (&PDU, &DCO, ConnectedIP))
+			{
+			continue;
+			}
+
+		// the class is accepted for outgoing results only: refuse a request to commit
+		// data stored here clearly (instead of ending the association)
+		if (OutgoingStorageCommitment && !EnableStorageCommitment && SCRefuseActionSupport (&PDU, &DCO))
+			{
+			continue;
+			}
+
 		if (EnableStorageCommitment)
 			{
 			DICOMDataObject *CommitData = NULL;
@@ -25672,6 +26083,12 @@ void ConfigDgate(void)
 
 	MyGetPrivateProfileString(szRootSC, "EnableStorageCommitment", "0", szTemp, 32, ConfigFile);
 	EnableStorageCommitment = atoi(szTemp);
+
+	MyGetPrivateProfileString(szRootSC, "OutgoingStorageCommitment", "0", szTemp, 32, ConfigFile);
+	OutgoingStorageCommitment = atoi(szTemp);
+
+	MyGetPrivateProfileString(szRootSC, "OutgoingSCCheckIP", "1", szTemp, 32, ConfigFile);
+	OutgoingSCCheckIP = atoi(szTemp);
 
 	MyGetPrivateProfileString(szRootSC, "PadAEWithZeros", "0", szTemp, 32, ConfigFile);
         ConfigPadAEWithZeros = atoi(szTemp);

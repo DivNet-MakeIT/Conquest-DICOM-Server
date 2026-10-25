@@ -100,7 +100,17 @@ typedef	struct	_ACRNemaAddress
 		char	IP[128];
 		char	Port[64];
 		char	Compress[32];
+		char	Options[128];	// text after the compression column, kept as read (may be empty)
+		int	Flags;		// ACR_* bits from the first token of Options
+		int	ResendLimit;	// R option: ACR_RESEND_INI, n (1..999) or ACR_RESEND_ALWAYS
 	}	ACRNemaAddress;
+
+// options in the 5th column of acrnema.map (T, SC, R, Rn, RI); none = as before
+#define	ACR_TLS			1
+#define	ACR_SC			2
+#define	ACR_RESEND		4
+#define	ACR_RESEND_INI		-1	// R without number: limit from dicom.ini
+#define	ACR_RESEND_ALWAYS	0x7fffffff	// RI: until committed
 
 enum
 	{
@@ -190,7 +200,9 @@ BOOL	InitACRNemaAddressArray();
 BOOL	CloseACRNemaAddressArray();
 UINT	GetACRNemaCount(void);
 BOOL	GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry);
-BOOL	PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress);
+BOOL	PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress, const char *Options=NULL);
+BOOL	GetACRNemaEntryByAE(char *ACRNema, ACRNemaAddress *Entry);
+int	ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn);
 BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);

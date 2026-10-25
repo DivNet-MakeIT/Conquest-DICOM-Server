@@ -49,7 +49,6 @@ extern lua_All_functions LuaFunctions;
 #include "lua.hpp"
 #endif
 
-extern	Array < ACRNemaAddress * > ACRNemaAddressArray;
 	
 class	ExtendedPDU_Service	:
 	public		CheckedPDU_Service
@@ -84,9 +83,10 @@ class	ExtendedPDU_Service	:
                	  if (!MyGetPrivateProfileString(szRootSC, "AllowOnlyMappedLocalAE", "0",
                			szTemp, 32, ConfigFile)) return TRUE;
 		  if (atoi(szTemp)==0) return TRUE;
-		  int Index=0;
-		  while ( Index < ACRNemaAddressArray.GetSize() )
-                  { ACRNemaAddress *AAPtr = ACRNemaAddressArray.Get(Index);
+		  UINT Index=0;
+		  ACRNemaAddress AAEntry, *AAPtr = &AAEntry;
+		  while ( GetACRNemaEntry(Index, &AAEntry) )
+                  {
                     if (strchr(AAPtr->IP, '*')==NULL) 
 		    { if (strcmp(AAPtr->IP, "127.0.0.1")==0 || strcmp(AAPtr->IP, "localhost")==0)
 			if (atoi(AAPtr->Port)==atoi((char *)Port))
@@ -108,9 +108,10 @@ class	ExtendedPDU_Service	:
                	  if (!MyGetPrivateProfileString(szRootSC, "AllowOnlyMappedRemoteAE", "0",
                			szTemp, 32, ConfigFile)) return TRUE;
 		  if (atoi(szTemp)==0) return TRUE;
-		  int Index=0;
-		  while ( Index < ACRNemaAddressArray.GetSize() )
-                  { ACRNemaAddress *AAPtr = ACRNemaAddressArray.Get(Index);
+		  UINT Index=0;
+		  ACRNemaAddress AAEntry, *AAPtr = &AAEntry;
+		  while ( GetACRNemaEntry(Index, &AAEntry) )
+                  {
                     if (strchr(AAPtr->IP, '*')==NULL) 
 		    { if (strcmp((char *)A, AAPtr->Name)==0) 
 		      { if (CheckIP)

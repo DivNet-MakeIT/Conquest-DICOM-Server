@@ -1291,6 +1291,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			accepted when enabled; event on new association was sent without data (writing empties 
 			the object: now a copy is written first) and now proposes the SCP role
 20261019	mmd	StorageCommitment: refuse N-ACTION (0x0124) from a calling AE that is not in acrnema.map
+20261025	mmd	acrnema.map access goes through amap.cpp under a lock; read_amap swaps in the new map
+			in one step (results unchanged, no half-built map seen by other threads)
 
 ENDOFUPDATEHISTORY
 */
@@ -1427,7 +1429,6 @@ char	AutoRoutePipe[128] = "/tmp/AutoRoutePipe";
 char	AutoRouteExec[128] = "aroute";
 #endif
 
-extern	Array < ACRNemaAddress * > ACRNemaAddressArray; // for -a listing
 int	DebugLevel = 0;					// increased after error
 RTC	VRType(TRUE);					// VR translation table
 extern	int FileCompressMode;
@@ -2026,9 +2027,9 @@ void getmap(char *map, int size)
   if (map[0]) return;
 
   map[0]=0;
-  while ( Index < ACRNemaAddressArray.GetSize() )
-  { ACRNemaAddress *AAPtr = ACRNemaAddressArray.Get(Index);
-    if (strchr(AAPtr->IP, '*')==NULL) 
+  ACRNemaAddress AAEntry, *AAPtr = &AAEntry;
+  while ( GetACRNemaEntry(Index, &AAEntry) )
+  { if (strchr(AAPtr->IP, '*')==NULL) 
     { if (strlen(map)>size-strlen(AAPtr->IP)-2)
       { OperatorConsole.printf("*** checkaccess: too many IP addresses in ACRNEMA.MAP\n");
         break;
@@ -2662,10 +2663,9 @@ PrintAMap()
 	OperatorConsole.printf("\n");
 
 
-	while ( Index < ACRNemaAddressArray.GetSize() )
+	ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+	while ( GetACRNemaEntry(Index, &AAEntry) )
 		{
-		ACRNemaAddress	*AAPtr = ACRNemaAddressArray.Get(Index);
-
 		OperatorConsole.printf("%-17s %-30s %-10s %-16s\n",
 			AAPtr->Name,
 			AAPtr->IP,
@@ -7195,9 +7195,9 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
   }
   static int luaget_amap(lua_State *L)
   { int r = lua_tointeger(L, 1);
-    if (r < ACRNemaAddressArray.GetSize())
-    { ACRNemaAddress	*AAPtr = ACRNemaAddressArray.Get(r);
-      lua_pushstring(L, AAPtr->Name);
+    ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+    if (r >= 0 && GetACRNemaEntry(r, &AAEntry))
+    { lua_pushstring(L, AAPtr->Name);
       lua_pushstring(L, AAPtr->IP);
       lua_pushstring(L, AAPtr->Port);
       lua_pushstring(L, AAPtr->Compress);
@@ -23093,8 +23093,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 	if (memcmp(SilentText, "read_amap:", 10)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
-		CloseACRNemaAddressArray();
-		if(!InitACRNemaAddressArray())
+		if(!InitACRNemaAddressArray())	// replaces the map in one step
 			{
 			OperatorConsole.printf("***Error loading acr-nema map file:%s\n",ACRNEMAMAP);
 			}
@@ -23296,9 +23295,9 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		if (p) *p++=0;				// points after 1st comma
 		unsigned int r = atoi(SilentText+9);
 		if (p==NULL) p = pq;
-		if (r < ACRNemaAddressArray.GetSize() )
+		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+		if (GetACRNemaEntry(r, &AAEntry))
 			{
-			ACRNemaAddress	*AAPtr = ACRNemaAddressArray.Get(r);
 			sprintf(Response, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 					     AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 					     AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
@@ -23315,9 +23314,9 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		if (*p==0) p = pq;
 		NewTempFile(tempfile, ".txt");
 		g = fopen(tempfile, "wt");
-		for (unsigned int r=0; r< ACRNemaAddressArray.GetSize(); r++ )
+		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+		for (unsigned int r=0; GetACRNemaEntry(r, &AAEntry); r++ )
 			{
-			ACRNemaAddress	*AAPtr = ACRNemaAddressArray.Get(r);
 			if (strchr(AAPtr->Name, '*')==NULL)
 			fprintf(g, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 				      AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
@@ -23366,9 +23365,9 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		fprintf(f, " *                                                          *\n");
 		fprintf(f, " ********************************************************** */\n");
 		fprintf(f, "\n");
-		while (r < ACRNemaAddressArray.GetSize() )
+		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+		while (GetACRNemaEntry(r, &AAEntry))
 			{
-			ACRNemaAddress	*AAPtr = ACRNemaAddressArray.Get(r);
 			fprintf(f, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
 			r++;
 			}
@@ -23381,7 +23380,6 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		int i, n=1, L;
 		char *items[5];
-		ACRNemaAddress	*AAPtr;
 
 		memset(items, 0, sizeof(items));
 
@@ -23399,38 +23397,15 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 			}
 
 		unsigned int r = atoi(items[0]);
-		if (r < ACRNemaAddressArray.GetSize() )
-			AAPtr = ACRNemaAddressArray.Get(r);
-		else
-			{
-			AAPtr = new ACRNemaAddress;
-			strcpy(AAPtr->Name, "");
-			strcpy(AAPtr->IP, "");
-			strcpy(AAPtr->Port, "");
-			strcpy(AAPtr->Compress, "un");
-			ACRNemaAddressArray.Add(AAPtr);
-			r = ACRNemaAddressArray.GetSize()-1;
-			}
-			
-		if (items[1]) strcpy(AAPtr->Name,     items[1]);
-		if (items[2]) strcpy(AAPtr->IP,       items[2]);
-		if (items[3]) strcpy(AAPtr->Port,     items[3]);
-		if (items[4]) strcpy(AAPtr->Compress, items[4]);				
+		PutACRNemaEntry(r, items[1], items[2], items[3], items[4]);
 		return true;
 		}
 
 	if (memcmp(SilentText, "delete_amap:", 12)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
-		ACRNemaAddress	*AAPtr;
-
 		unsigned int r = atoi(SilentText+12);
-		if (r < ACRNemaAddressArray.GetSize() )
-			{
-			AAPtr = ACRNemaAddressArray.Get(r);
-			delete AAPtr;
-			ACRNemaAddressArray.RemoveAt(r);
-			}
+		DeleteACRNemaEntry(r);
 		return true;
 		}
 

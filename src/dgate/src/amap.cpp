@@ -8,6 +8,8 @@
    ljz  20030711: Fixed trailing spaces in acrnema.map
    ljz  20031118: Fixed leak InitACRNemaAddressArray
    mvh  20261005: Protect against too long passed AEs; limit reading of amap fields to 32-128-64-32
+   mmd  20261025: Map access under a lock; the map is built aside and swapped in (same result as before);
+                  entry copy/put/delete functions so that other files do not touch the array
 */
    
 
@@ -19,12 +21,61 @@
 
 
 BYTE	ACRNEMAMAP [ 256 ] = "acrnema.map";
-Array < ACRNemaAddress * >	ACRNemaAddressArray;
+static Array < ACRNemaAddress * >	ACRNemaAddressArray;
+
+#ifdef UNIX
+#ifndef EnterCriticalSection
+#	define EnterCriticalSection(a) pthread_mutex_lock(a)
+#endif
+#ifndef LeaveCriticalSection
+#	define LeaveCriticalSection(a) pthread_mutex_unlock(a)
+#endif
+#ifndef CRITICAL_SECTION
+#	define CRITICAL_SECTION pthread_mutex_t
+#endif
+#ifndef InitializeCriticalSection
+#	define InitializeCriticalSection(a) pthread_mutex_init(a, NULL);
+#endif
+#endif
+
+// One lock for every access to the map. It is initialised by a static object,
+// i.e. before main() starts any thread (the incoming-folder monitor thread can
+// run before the map is first loaded).
+static CRITICAL_SECTION	AMapCritical;
+static struct AMapCriticalInit
+	{
+	AMapCriticalInit() { InitializeCriticalSection(&AMapCritical); }
+	}	AMapCriticalInitObject;
+
+static void AMapLock(void)
+	{
+	EnterCriticalSection(&AMapCritical);
+	}
+
+static void AMapUnlock(void)
+	{
+	LeaveCriticalSection(&AMapCritical);
+	}
+
+static void AMapClear(Array < ACRNemaAddress * > &A)
+	{
+	while ( A.GetSize() )
+		{
+		delete A.Get(0);
+		A.RemoveAt(0);
+		}
+	}
+
+static void AMapCopyField(char *dest, const char *src, int size)
+	{
+	strncpy(dest, src, size-1);
+	dest[size-1] = 0;
+	}
 
 
 
-BOOL
-InitACRNemaAddressArray(void)
+static BOOL
+ParseACRNemaMap(Array < ACRNemaAddress * > &NewArray)
 { FILE*			f;
   char*			pBuffer;
   int			i, iSize;
@@ -178,7 +229,7 @@ InitACRNemaAddressArray(void)
 	pACR->Port,
 	pACR->Compress);
 
-    ACRNemaAddressArray.Add(pACR);
+    NewArray.Add(pACR);
     pDest = pDest + strlen(pDest) + 1;
   }
 
@@ -186,16 +237,107 @@ InitACRNemaAddressArray(void)
   return TRUE;
 }
 
+// Load (or reload) the map. The new map is built aside and swapped in under
+// the lock, so a thread looking up an AE never sees a half-built map. As
+// before, a file that cannot be read leaves an empty map.
+BOOL
+InitACRNemaAddressArray(void)
+	{
+	Array < ACRNemaAddress * >	NewArray;
+	BOOL				ok;
+
+	ok = ParseACRNemaMap(NewArray);
+	if (!ok) AMapClear(NewArray);
+
+	AMapLock();
+	AMapClear(ACRNemaAddressArray);
+	while ( NewArray.GetSize() )
+		{
+		ACRNemaAddressArray.Add(NewArray.Get(0));
+		NewArray.RemoveAt(0);
+		}
+	AMapUnlock();
+	return ok;
+	}
+
 
 BOOL
 CloseACRNemaAddressArray()
 	{
-	while ( ACRNemaAddressArray.GetSize() )
-		{
-		delete ACRNemaAddressArray.Get(0);
-		ACRNemaAddressArray.RemoveAt(0);
-		}
+	AMapLock();
+	AMapClear(ACRNemaAddressArray);
+	AMapUnlock();
 	return ( TRUE );
+	}
+
+// Number of entries in the map
+UINT
+GetACRNemaCount(void)
+	{
+	UINT	n;
+	AMapLock();
+	n = ACRNemaAddressArray.GetSize();
+	AMapUnlock();
+	return n;
+	}
+
+// Copy entry Index into *Entry; FALSE if there is no such entry
+BOOL
+GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry)
+	{
+	BOOL	ok = FALSE;
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		{
+		*Entry = *ACRNemaAddressArray.Get(Index);
+		ok = TRUE;
+		}
+	AMapUnlock();
+	return ok;
+	}
+
+// Change entry Index, or append a new entry when Index is past the end.
+// A NULL field keeps its value (a new entry starts as "" "" "" "un").
+// Fields are cut to the size of the map structure.
+BOOL
+PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress)
+	{
+	ACRNemaAddress	*AAPtr;
+
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		AAPtr = ACRNemaAddressArray.Get(Index);
+	else
+		{
+		AAPtr = new ACRNemaAddress;
+		strcpy(AAPtr->Name, "");
+		strcpy(AAPtr->IP, "");
+		strcpy(AAPtr->Port, "");
+		strcpy(AAPtr->Compress, "un");
+		ACRNemaAddressArray.Add(AAPtr);
+		}
+	if (Name)     AMapCopyField(AAPtr->Name,     Name,     sizeof(AAPtr->Name));
+	if (IP)       AMapCopyField(AAPtr->IP,       IP,       sizeof(AAPtr->IP));
+	if (Port)     AMapCopyField(AAPtr->Port,     Port,     sizeof(AAPtr->Port));
+	if (Compress) AMapCopyField(AAPtr->Compress, Compress, sizeof(AAPtr->Compress));
+	AMapUnlock();
+	return TRUE;
+	}
+
+// Remove entry Index; FALSE if there is no such entry
+BOOL
+DeleteACRNemaEntry(UINT Index)
+	{
+	BOOL	ok = FALSE;
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		{
+		delete ACRNemaAddressArray.Get(Index);
+		ACRNemaAddressArray.RemoveAt(Index);
+		ok = TRUE;
+		}
+	AMapUnlock();
+	return ok;
 	}
 
 
@@ -238,6 +380,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 		}
 
 
+	AMapLock();
 	Index = 0;
 	while ( Index < ACRNemaAddressArray.GetSize())
 		{
@@ -246,7 +389,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 		// try wildcard mapping, e.g., s=NG12, t=NG*, IP=101.11.11.*, Port=56*
 		if (t[strlen(t)-1] == '*')
 			{
-			if (!memicmp(t, s, strlen(t)-1))
+			if (strlen(t)-1 <= strlen(s) && !memicmp(t, s, strlen(t)-1))	// do not compare past the end of s
 				{
 				strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 				if (ip[strlen(ip)-1]=='*')
@@ -256,6 +399,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 				if (port[strlen(port)-1]=='*')
 					strcpy(port+strlen(port)-1, s+strlen(t)-1);
 				strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+				AMapUnlock();
 				return ( TRUE );
 				}
 			}
@@ -266,6 +410,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 			strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 			strcpy(port, ACRNemaAddressArray.Get(Index)->Port);
 			strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+			AMapUnlock();
 			return ( TRUE );
 			}
 		++Index;
@@ -282,11 +427,13 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 			strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 			strcpy(port, ACRNemaAddressArray.Get(Index)->Port);
 			strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+			AMapUnlock();
 			return ( TRUE );
 			}
 		++Index;
 		}
 
+	AMapUnlock();
 	return ( FALSE );
 	}
 

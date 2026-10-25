@@ -1293,6 +1293,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261019	mmd	StorageCommitment: refuse N-ACTION (0x0124) from a calling AE that is not in acrnema.map
 20261025	mmd	acrnema.map access goes through amap.cpp under a lock; read_amap swaps in the new map
 			in one step (results unchanged, no half-built map seen by other threads)
+20261025	mmd	acrnema.map optional 5th column (T, SC, R, Rn, RI); kept by write_amap, put_amap (6th item),
+			get_amap/get_amaps (13th argument), Lua get_amap (5th value) and the -m listing
 
 ENDOFUPDATEHISTORY
 */
@@ -2666,6 +2668,14 @@ PrintAMap()
 	ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
 	while ( GetACRNemaEntry(Index, &AAEntry) )
 		{
+		if (AAPtr->Options[0])
+		OperatorConsole.printf("%-17s %-30s %-10s %-16s %s\n",
+			AAPtr->Name,
+			AAPtr->IP,
+			AAPtr->Port,
+			AAPtr->Compress,
+			AAPtr->Options);
+		else
 		OperatorConsole.printf("%-17s %-30s %-10s %-16s\n",
 			AAPtr->Name,
 			AAPtr->IP,
@@ -7201,6 +7211,10 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
       lua_pushstring(L, AAPtr->IP);
       lua_pushstring(L, AAPtr->Port);
       lua_pushstring(L, AAPtr->Compress);
+      if (AAPtr->Options[0])			// 5th value only when the map line has one
+      { lua_pushstring(L, AAPtr->Options);
+        return 5;
+      }
       return 4;
     }
     return 0;
@@ -23300,7 +23314,8 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 			{
 			sprintf(Response, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 					     AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
-					     AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
+					     AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
+					     AAPtr->Options);	// 13th argument, unused by existing formats
 			}
 		return true;
 		}
@@ -23320,7 +23335,8 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 			if (strchr(AAPtr->Name, '*')==NULL)
 			fprintf(g, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 				      AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
-				      AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
+				      AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
+				      AAPtr->Options);	// 13th argument, unused by existing formats
 			}
 		fclose(g);
 		return true;
@@ -23355,6 +23371,20 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		fprintf(f, " *                                                          *\n");
 		fprintf(f, " * The syntax for each entry is :                           *\n");
 		fprintf(f, " *   AE   <IP adress|Host name>   port number   compression *\n");
+		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
+		BOOL		anyoptions = FALSE;	// describe the 5th column only when a line uses it
+		for (unsigned int k=0; GetACRNemaEntry(k, &AAEntry); k++)
+			if (AAPtr->Options[0]) anyoptions = TRUE;
+		if (anyoptions)
+		{
+		fprintf(f, " *   [options]                                              *\n");
+		fprintf(f, " *                                                          *\n");
+		fprintf(f, " * Options (optional 5th column): T=TLS, SC=storage commit- *\n");
+		fprintf(f, " * ment for data sent to the node, TSC=both; R=re-send      *\n");
+		fprintf(f, " * missing objects (limit from dicom.ini), Rn=n times,      *\n");
+		fprintf(f, " * RI=until committed, e.g. SCR5 or TSCRI. No options = as  *\n");
+		fprintf(f, " * in previous versions.                                    *\n");
+		}
 		fprintf(f, " *                                                          *\n");
 		fprintf(f, " * For compression see manual. Values are un=uncompressed;  *\n");
 		fprintf(f, " * ul=littleendianexplicit,ub=bigendianexplicit,ue=both     *\n");
@@ -23365,10 +23395,12 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		fprintf(f, " *                                                          *\n");
 		fprintf(f, " ********************************************************** */\n");
 		fprintf(f, "\n");
-		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
 		while (GetACRNemaEntry(r, &AAEntry))
 			{
-			fprintf(f, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
+			if (AAPtr->Options[0])		// keep the 5th column and anything after it
+				fprintf(f, "%-17s %-30s %-10s %-16s %s\n", AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress, AAPtr->Options);
+			else
+				fprintf(f, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
 			r++;
 			}
 		fclose(f);
@@ -23379,7 +23411,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		int i, n=1, L;
-		char *items[5];
+		char *items[6];
 
 		memset(items, 0, sizeof(items));
 
@@ -23392,12 +23424,12 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 				{
 				p[i]=0;
 				items[n++] = p+i+1;
-				if(n==5) break;
+				if(n==6) break;
 				}
 			}
 
 		unsigned int r = atoi(items[0]);
-		PutACRNemaEntry(r, items[1], items[2], items[3], items[4]);
+		PutACRNemaEntry(r, items[1], items[2], items[3], items[4], items[5]);	// items[5] = options, optional
 		return true;
 		}
 

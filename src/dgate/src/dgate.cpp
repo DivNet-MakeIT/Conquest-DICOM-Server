@@ -20492,12 +20492,26 @@ static	void	*TLSClientContext(void)
 // Once per node and process: a TLS node with neither TLSPin_<AE> nor TLSVerifyHostname
 // is accepted on any certificate from TLSCAFile, so that file should hold a dedicated
 // DICOM CA (or the node certificates) only
+// (the list is shared by all connection threads: read and changed under a lock,
+// the console line is written after the lock is released)
+static	CRITICAL_SECTION	TLSWarnCritical;
+static	struct	TLSWarnCriticalInit
+	{
+	TLSWarnCriticalInit() { InitializeCriticalSection(&TLSWarnCritical); }
+	}	TLSWarnCriticalInitObject;
 static	void	TLSWarnUnbound(const char *AE)
 	{
 	static char	warned[64][20];
 	static int	nwarned = 0;
-	for (int i=0; i<nwarned; i++) if (strcmp(warned[i], AE)==0) return;
-	if (nwarned<64) { strncpy(warned[nwarned], AE, 19); warned[nwarned][19] = 0; nwarned++; }
+	BOOL		known = FALSE;
+
+	EnterCriticalSection(&TLSWarnCritical);
+	for (int i=0; i<nwarned && !known; i++)
+		if (strcmp(warned[i], AE)==0) known = TRUE;
+	if (!known && nwarned<64) { strncpy(warned[nwarned], AE, 19); warned[nwarned][19] = 0; nwarned++; }
+	LeaveCriticalSection(&TLSWarnCritical);
+	if (known)
+		return;
 	OperatorConsole.printf("*** TLS: %s is accepted on any certificate signed by a CA in TLSCAFile (no TLSPin_%s, TLSVerifyHostname = 0); use a dedicated DICOM CA or set a pin\n", AE, AE);
 	}
 

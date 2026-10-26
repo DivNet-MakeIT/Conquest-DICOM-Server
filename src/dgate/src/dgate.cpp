@@ -1389,6 +1389,7 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			asked again, at most 3 times, then 0); 0 while a rewrite of a sent object is in progress
 20261026	mmd	Outgoing storage commitment: the watchdog's duplicate descriptor is taken at 1 or above (never 0,
 			which the socket layer reads as "no socket"); every non-negative duplicate is used and closed
+20261026	mmd	Status display reads the gpps statistics through GppsStatistics (under the ini cache lock)
 
 ENDOFUPDATEHISTORY
 */
@@ -2249,8 +2250,10 @@ void StatusDisplay(FILE *f)
   int libjasper=0;
   int libjpeg=0;
   int intjpeg=1;
+  int gppscount=0, gppsseconds=0;
 	
   UNUSED_ARGUMENT(buf);// Added for unused variable warning. bcb
+  GppsStatistics(&gppscount, &gppsseconds);	// under the ini cache lock (other threads count)
 
 #ifdef HAVE_J2K
   libjasper=1;
@@ -2269,11 +2272,11 @@ void StatusDisplay(FILE *f)
   fprintf(f, "DICOM server '%s' (version %s, port %s, bits %d) was started on %s\n", MYACRNEMA, DGATE_VERSION, Port, (int)(8*sizeof(void *)), TimeString);
   fprintf(f, "Old JPEG decoder=%d, JPEGLIB jpeg codec=%d, LIBJASPER jpeg2000 codec=%d\n", intjpeg, libjpeg, libjasper);
 
-  fprintf(f, "Run time (s) total %d, query %d, load %d, save %d, compress %d, process %d, gpps %d\n", TotalTime, QueryTime/1000, LoadTime, SaveTime, RecompressTime, ProcessTime, gppstime);
+  fprintf(f, "Run time (s) total %d, query %d, load %d, save %d, compress %d, process %d, gpps %d\n", TotalTime, QueryTime/1000, LoadTime, SaveTime, RecompressTime, ProcessTime, gppsseconds);
   fprintf(f, "Associations=%d; Threads=%d (%d open); Images sent=%d, recieved=%d, forwarded=%d\n", IncomingAssociations, ThreadCount, OpenThreadCount, ImagesSent, ImagesReceived, ImagesForwarded);
   fprintf(f, "Images printed=%d, in color=%d\n", SetBasicGrayScaleImageBox+SetBasicColorImageBox, SetBasicColorImageBox);
   fprintf(f, "Activity: Echo:%d, Find:%d, Move:%d, Unknown:%d, gpps:%d\n", EchoRequest, C_Find_PatientRoot+C_Find_StudyRoot+C_Find_PatientStudyOnly+C_Find_ModalityWorkList,
-  	C_Move_PatientRootNKI+C_Move_PatientRoot+C_Move_StudyRootNKI+C_Move_StudyRoot+C_Move_PatientStudyOnlyNKI+C_Move_PatientStudyOnly, UnknownRequest, gpps);
+  	C_Move_PatientRootNKI+C_Move_PatientRoot+C_Move_StudyRootNKI+C_Move_StudyRoot+C_Move_PatientStudyOnlyNKI+C_Move_PatientStudyOnly, UnknownRequest, gppscount);
   fprintf(f, "Images (de)compressed: NKI %d, JPEG %d, JPEG2000 %d, RLE %d, Planes removed %d, Palettes removed %d, Downsize %d\n",
 	NKIPrivateCompress+NKIPrivateDecompress, DecompressJpeg+CompressJpeg, DecompressJpeg2000+CompressJpeg2000,
 	DecompressedRLE, DePlaned, DePaletted, DownSizeImage);

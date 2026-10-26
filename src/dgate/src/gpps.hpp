@@ -23,5 +23,6 @@ MyGetPrivateProfileString(const char *theSection,   // section name
     char *theIniFileName);                  // pathname of ini file to search
 
 void FlushPrivateProfileStringCache(void);
+void GppsStatistics(int *count, int *seconds);	// gpps, gppstime under the cache lock
 
 #endif

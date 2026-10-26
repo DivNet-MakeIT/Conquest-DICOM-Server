@@ -1419,6 +1419,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			SHA-1 signatures only for a node in TLSNodeCertsFile or with TLSAcceptSelfSigned = 1
 20261026	mmd	TLS log: one operator console line per TLS connection, incoming and outgoing, strict and
 			legacy: AE, peer IP, protocol, cipher, profile and node certificate result
+20261026	mmd	write_amap always writes the description of the 5th-column options (T, L, SC, R, Rn, RI)
+			in the map header comment
 
 ENDOFUPDATEHISTORY
 */
@@ -29618,19 +29620,22 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		fprintf(f, " * The syntax for each entry is :                           *\n");
 		fprintf(f, " *   AE   <IP adress|Host name>   port number   compression *\n");
 		ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
-		BOOL		anyoptions = FALSE;	// describe the 5th column only when a line uses it
-		for (unsigned int k=0; GetACRNemaEntry(k, &AAEntry); k++)
-			if (AAPtr->Options[0]) anyoptions = TRUE;
-		if (anyoptions)
-		{
+		// the 5th-column options, always described (only a comment)
 		fprintf(f, " *   [options]                                              *\n");
 		fprintf(f, " *                                                          *\n");
-		fprintf(f, " * Options (optional 5th column): T=TLS, SC=storage commit- *\n");
-		fprintf(f, " * ment for data sent to the node, TSC=both; R=re-send      *\n");
-		fprintf(f, " * missing objects (limit from dicom.ini), Rn=n times,      *\n");
-		fprintf(f, " * RI=until committed, e.g. SCR5 or TSCRI. No options = as  *\n");
-		fprintf(f, " * in previous versions.                                    *\n");
-		}
+		fprintf(f, " * Options (optional 5th column, letters in this order):    *\n");
+		fprintf(f, " *   T   = DICOM TLS to this node (TLSCertificate etc.)     *\n");
+		fprintf(f, " *   L   = with T: legacy TLS profile (TLS 1.0-1.2,         *\n");
+		fprintf(f, " *         AES-CBC) for older stations, e.g. OsiriX;        *\n");
+		fprintf(f, " *         incoming: TLSLegacyPort. Keys >= 2048 bit,       *\n");
+		fprintf(f, " *         no MD5; SHA-1 only for pinned nodes              *\n");
+		fprintf(f, " *   SC  = storage commitment for data sent to this node    *\n");
+		fprintf(f, " *   R   = re-send missing objects, limit from dicom.ini    *\n");
+		fprintf(f, " *         (OutgoingSCResendMax); R needs SC                *\n");
+		fprintf(f, " *   Rn  = re-send at most n times (n = 1..999), e.g. R5    *\n");
+		fprintf(f, " *   RI  = re-send until committed (I = infinite)           *\n");
+		fprintf(f, " * Examples: SC  TSC  TLSC  SCR5  TSCRI  TLSCR5             *\n");
+		fprintf(f, " * No options = as in previous versions.                    *\n");
 		fprintf(f, " *                                                          *\n");
 		fprintf(f, " * For compression see manual. Values are un=uncompressed;  *\n");
 		fprintf(f, " * ul=littleendianexplicit,ub=bigendianexplicit,ue=both     *\n");

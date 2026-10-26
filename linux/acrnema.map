@@ -11,6 +11,21 @@
  *                                                          *
  * The syntax for each entry is :                           *
  *   AE   <IP adress|Host name>   port number   compression *
+ *   [options]                                              *
+ *                                                          *
+ * Options (optional 5th column, letters in this order):    *
+ *   T   = DICOM TLS to this node (TLSCertificate etc.)     *
+ *   L   = with T: legacy TLS profile (TLS 1.0-1.2,         *
+ *         AES-CBC) for older stations, e.g. OsiriX;        *
+ *         incoming: TLSLegacyPort. Keys >= 2048 bit,       *
+ *         no MD5; SHA-1 only for pinned nodes              *
+ *   SC  = storage commitment for data sent to this node    *
+ *   R   = re-send missing objects, limit from dicom.ini    *
+ *         (OutgoingSCResendMax); R needs SC                *
+ *   Rn  = re-send at most n times (n = 1..999), e.g. R5    *
+ *   RI  = re-send until committed (I = infinite)           *
+ * Examples: SC  TSC  TLSC  SCR5  TSCRI  TLSCR5             *
+ * No options = as in previous versions.                    *
  *                                                          *
  * For compression see manual. Values are un=uncompressed;  *
  * ul=littleendianexplicit,ub=bigendianexplicit,ue=both     *

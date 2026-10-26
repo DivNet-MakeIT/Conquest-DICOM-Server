@@ -1343,6 +1343,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: NoResend also for C-MOVE with scrub (9999,0202), downsizing
 			(9999,0200), frame extraction (9999,0201), RetrieveResultConverter0, and for any send
 			or re-send whose compression may change the pixel data (lossy, NKI, clip, downsize)
+20261026	mmd	Outgoing storage commitment: RI nodes keep cycling (re-send and new requests after the
+			requests are used up) with OutgoingSCResendMissing 1 as well as 2; never TIMEOUT
 
 ENDOFUPDATEHISTORY
 */
@@ -23855,11 +23857,12 @@ static int SCResendLimit(const char *ae, ACRNemaAddress *E)
 	return E->ResendLimit;
 	}
 
-// SQL condition for objects waiting for a re-send
-static void SCQueuedWhere(char *out)
+// SQL condition for objects waiting for a re-send; noresult: also those without result after all
+// requests (OutgoingSCResendMissing = 2, or an RI node in mode 1 or 2)
+static void SCQueuedWhere(char *out, BOOL noresult)
 	{
 	sprintf(out, "State = 'FAILED' and NoResend = 0 and FailReason in (272, 274, 531%s)",
-		OutgoingSCResendMissing==2 ? ", 65536" : "");
+		noresult ? ", 65536" : "");
 	}
 
 // delay before trying again after re-send number n (1 = first) did not succeed:
@@ -24102,9 +24105,29 @@ static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned 
 
 	SCAEWhere(DB, aew, ae);
 
-	// OutgoingSCResendMissing = 2 and R: requests used up before the deadline (RI: any time)
+	// RI (OutgoingSCResendMissing 1 or 2; 0 = off: rlimit is 0): requests used up -> a new cycle,
+	// never TIMEOUT: an object that may be re-sent is re-sent and then asked again; one with
+	// NoResend is asked again with a new series of requests
+	if (rlimit==ACR_RESEND_ALWAYS)
+		{
+		sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts > %d and NoResend <> 0", aew, TxUID, OutgoingSCRetries);
+		if (!DB.Query("SCObject", "COUNT(*)", where, NULL)) return FALSE;
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		n = 0;
+		if (DB.NextRecord()) n = atoi(cnt);
+		if (n)
+			{
+			sprintf(upd, "State = 'NOTED', Attempts = 0, NextTry = %u", now + SCRetryDelay(OutgoingSCRetryDelayCount));
+			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) return FALSE;
+			OperatorConsole.printf("*** Storage commitment: %d object(s) for %s (RI, not re-sent: NoResend) without result after all requests: asked again (transaction %s)\n",
+				n, ae, TxUID);
+			}
+		}
+
+	// OutgoingSCResendMissing = 2 and R, or RI: requests used up before the deadline (RI: any time)
 	// -> FAILED without result, re-sent after OutgoingSCResendDelay instead of TIMEOUT
-	if (rlimit && OutgoingSCResendMissing==2)
+	if (rlimit && (OutgoingSCResendMissing==2 || rlimit==ACR_RESEND_ALWAYS))
 		{
 		if (rlimit==ACR_RESEND_ALWAYS)
 			sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts > %d", aew, TxUID, OutgoingSCRetries);
@@ -24860,7 +24883,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 // a destination that is no longer allowed is skipped (its objects stay FAILED)
 static void SCProcessResends(Database &DB, unsigned int now)
 	{
-	char where[512], qw[160], cols[160], ae[24], cnt[32], aew[64], upd[96];
+	char where[512], qw[160], qwall[160], cols[160], ae[24], cnt[32], aew[64], upd[96];
 	char inst[72], cls[72], study[72], ip[132], port[68], tls[16], res[32], first[32];
 	SQLLEN len;
 	char (*aes)[20];
@@ -24870,14 +24893,14 @@ static void SCProcessResends(Database &DB, unsigned int now)
 	long long limit = (long long)now - OutgoingSCDeadline;
 
 	if (!OutgoingStorageCommitment || OutgoingSCResendMissing<=0) return;
-	SCQueuedWhere(qw);
+	SCQueuedWhere(qwall, TRUE);
 
 	aes = (char (*)[20])malloc(20*SC_WARNMAX);
 	it = (SCResendItem *)malloc(sizeof(SCResendItem)*SC_RESENDROWS);
 	if (!aes || !it) { if (aes) free(aes); if (it) free(it); return; }
 
 	sprintf(cols, "%s, COUNT(*)", SCAEGroup(DB));
-	sprintf(where, "%s GROUP BY %s", qw, SCAEGroup(DB));
+	sprintf(where, "%s GROUP BY %s", qwall, SCAEGroup(DB));
 	if (!DB.Query("SCObject", cols, where, NULL))
 		{ OperatorConsole.printf("*** Storage commitment: database query failed (re-send)\n"); free(aes); free(it); return; }
 	ae[0] = cnt[0] = 0;
@@ -24894,6 +24917,7 @@ static void SCProcessResends(Database &DB, unsigned int now)
 		rlimit = SCResendLimit(aes[j], &E);
 		if (!rlimit) continue;			// no R (any more), or switched off: stays FAILED
 		SCAEWhere(DB, aew, aes[j]);
+		SCQueuedWhere(qw, OutgoingSCResendMissing==2 || rlimit==ACR_RESEND_ALWAYS);
 
 		if (rlimit!=ACR_RESEND_ALWAYS)
 			{
@@ -24981,7 +25005,7 @@ static void SCCheckOverdue(Database &DB, unsigned int now)
 	int nfound = 0;
 
 	if (OutgoingSCResendMissing<=0) return;
-	SCQueuedWhere(qw);
+	SCQueuedWhere(qw, TRUE);
 	sprintf(cols, "%s, COUNT(*)", SCAEGroup(DB));
 	sprintf(where, "(State in ('NOTED', 'REQUESTED') or (%s)) and FirstSent < %lld GROUP BY %s", qw, limit, SCAEGroup(DB));
 	if (!DB.Query("SCObject", cols, where, NULL)) return;
@@ -25152,7 +25176,7 @@ static void SCStatusText(char *out, int size)
 
 	// re-send: resends (successful C-STOREs), reserved (re-send attempts), resend_queued (nodes
 	// with R now), resend_limit and not_local (FAILED), overdue (RI nodes only: past the deadline)
-	SCQueuedWhere(qw);
+	SCQueuedWhere(qw, TRUE);
 	for (int q=0; q<5; q++)
 		{
 		const char *cnts = "COUNT(*)";

@@ -20282,17 +20282,15 @@ BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE
 	return SCPrepareTLS(PDU, EE);
 	}
 
-// A TLS key from the dicom.ini server section. MyGetPrivateProfileString answers a
-// key it has seen before from its cache, copying up to 1023 characters WITHOUT the
-// caller's length (gpps.cpp). Another reader of the same key with a larger buffer
-// (Lua gpps, get_param:) can fill that cache, so every TLS key is read here into a
-// buffer as large as the cache value and then cut to the caller's size. Key names are
-// compared without regard to case (gpps.cpp stricmp, as GetPrivateProfileString).
+// A TLS key from the dicom.ini server section, read into a buffer as large as an ini
+// cache value and then cut to the caller's size (gpps.cpp now bounds its cache copies;
+// this keeps long values, e.g. two pins with colons, whole). Key names are compared
+// without regard to case (gpps.cpp stricmp, as GetPrivateProfileString).
 #define	TLS_INI_VALUE	1024		// = IniValues[][1024] in gpps.cpp
 static	void	TLSIni(const char *key, const char *def, char *out, int outlen)
 	{
-	char	sc[TLS_INI_VALUE+8], buf[TLS_INI_VALUE+8];
-	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, TLS_INI_VALUE, ConfigFile);
+	char	sc[64], buf[TLS_INI_VALUE+8];
+	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, 64, ConfigFile);	// as everywhere in dgate
 	MyGetPrivateProfileString(sc, key, def, buf, TLS_INI_VALUE, ConfigFile);
 	snprintf(out, outlen, "%s", buf);
 	}

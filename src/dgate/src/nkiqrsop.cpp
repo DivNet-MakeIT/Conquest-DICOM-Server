@@ -470,6 +470,11 @@ StandardRetrieveNKI::StandardRetrieveNKI()
 void
 IARQ (AAssociateRQ	&ARQ, BOOL showall);
 
+// outgoing storage commitment (dgate.cpp): note objects sent by C-MOVE
+extern	int	OutgoingStorageCommitment;
+void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID);
+void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
+
 BOOL	StandardRetrieveNKI	::	Read (
 	ExtendedPDU_Service		*PDU,
 	DICOMCommandObject		*DCO,
@@ -849,6 +854,12 @@ BOOL	StandardRetrieveNKI	::	Read (
 //if (Index==100) 
 //{ UsedPDU->Link.Close();return (FALSE);}
 
+				// outgoing storage commitment: C-MOVE only (C-GET sends back on the
+				// requesting association); UIDs as sent, Write empties the object
+				char scCls[68], scInst[68], scStudy[68];
+				int scOn = OutgoingStorageCommitment && !cget;
+				if (scOn) SCCaptureUIDs(iDDO, scCls, scInst, scStudy);
+
 				if(!SStorage->Write(UsedPDU, iDDO, DCO->GetVR(0x0000, 0x0110), (unsigned char *)Calling))
 					{
 					//++Failed;
@@ -867,6 +878,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
+				if (scOn) SCNoteSent((char *)ACRNema, scCls, scInst, scStudy);
 				delete iDDO;
 				}
 			}

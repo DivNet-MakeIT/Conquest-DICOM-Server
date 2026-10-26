@@ -38,6 +38,7 @@
 20261008	mvh	Fix above for passed *A having spaces after the AE
 20261010	mvh	Call now with IP passed and *A without spaces
 20261010	mvh	Added CheckIPofRemoteAE; for now only works for numeric IP4 address in acrnema.map
+20261026	mmd	ShouldIAcceptRemoteTransport: incoming TLS pin and plain port enforcement (dgate.cpp)
 */
 
 #ifdef LUA51EXTERN
@@ -125,6 +126,12 @@ class	ExtendedPDU_Service	:
                     ++Index;
 		  };
 		  return FALSE;
+		};
+
+		// incoming TLS (20261026 mmd): TLSPin_<AE> on the TLS port, T nodes refused on
+		// the plain port (TLSEnforceForMappedNodes); see TLSCheckCallingAE in dgate.cpp
+		BOOL	ShouldIAcceptRemoteTransport(BYTE	*A)
+		{ return TLSCheckCallingAE(this, A);
 		};
 
 		~ExtendedPDU_Service () 

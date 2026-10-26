@@ -10,6 +10,7 @@ Spectra 0014 - Wed, 12 Feb 2014 15:48:27 -0200: Patch mismatches new/delete in f
 20140528        lsp     Kept member initialization only in constructor and removed
                         InitializeFrom(): not GNUC specific
 20261005	mvh	Call virtual ShouldIAcceptLocalMapped, ShouldIAcceptRemoteMapped
+20261026	mmd	Call virtual ShouldIAcceptRemoteTransport (incoming TLS checks)
 */
 
 /****************************************************************************
@@ -563,6 +564,9 @@ CheckedPDU_Service	::	ShouldIAcceptRemoteApTitle (
 	char	s[64];
 
 	if (!ShouldIAcceptRemoteMapped(ApTitle))
+		return ( FALSE );
+
+	if (!ShouldIAcceptRemoteTransport(ApTitle))
 		return ( FALSE );
 
 	if ( ! RemoteAEListCount )

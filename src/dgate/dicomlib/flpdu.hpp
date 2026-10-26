@@ -6,6 +6,7 @@
 20110118	mvh	Added unchecked CheckedPDU_Service () using NULL default
 20140528        lsp     Private copy constructor of CheckedPDU_Service not GNUC specific
 20261005	mvh	Added virtual ShouldIAcceptLocalMapped, ShouldIAcceptRemoteMapped
+20261026	mmd	Added virtual ShouldIAcceptRemoteTransport (incoming TLS checks)
 */
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -54,6 +55,10 @@ class	CheckedPDU_Service	:
 		virtual	BOOL	ShouldIAcceptLocalMapped(BYTE	*)
 			{ return ( TRUE ); };
 		virtual	BOOL	ShouldIAcceptRemoteMapped(BYTE	*)
+			{ return ( TRUE ); };
+		// calling AE against the transport (plain or TLS) of this association;
+		// FALSE = A-ASSOCIATE-RJ (calling AE not recognized) before any data
+		virtual	BOOL	ShouldIAcceptRemoteTransport(BYTE	*)
 			{ return ( TRUE ); };
 
 	public:

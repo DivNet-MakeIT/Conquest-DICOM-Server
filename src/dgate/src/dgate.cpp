@@ -1327,6 +1327,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: objects whose sent copy may differ from the archive copy
 			(forward script clause, RetrieveConverter0 or C-MOVE script, Lua dicomstore) are marked
 			NoResend: never re-sent automatically
+20261026	mmd	Incoming DICOM TLS (build with HAVE_OPENSSL): second listener on TLSPort (default
+			empty = none) with a per-connection context; SSL_accept in the child before the
+			association is parsed; TLSVerifyPeer for client certificates; TLSPin_<AE> checked
+			for the calling AE; TLSEnforceForMappedNodes (default 1, only with TLSPort set)
+			rejects calling AEs with T in acrnema.map on the plain port
 
 ENDOFUPDATEHISTORY
 */
@@ -15359,10 +15364,12 @@ ParseArgs (int	argc, char	*argv[], ExtendedPDU_Service *PDU)
 class	DriverApp
 	{
 	public:
-		virtual	BOOL	ServerChild ( int, unsigned int ) = 0;
+		// Transport: 0 = plain (as before), DRIVER_TRANSPORT_TLS = incoming TLS port
+		virtual	BOOL	ServerChild ( int, unsigned int, int Transport = 0 ) = 0;
 	public:
 		BOOL		ServerChildThread ( int, unsigned int);
 		BOOL		Server ( BYTE * );
+		BOOL		ServerTLS ( BYTE * );	// incoming TLS listener (per-connection handoff)
 		int		ChildSocketfd;
 		volatile int	Lock;
 		unsigned int    ConnectedIP;
@@ -15372,6 +15379,18 @@ class	DriverApp
 		DriverApp ():ChildSocketfd(0), Lock(0) {};
 		virtual ~DriverApp() {};
 #endif
+	};
+
+// Incoming TLS (20261026 mmd): what the TLS listener hands to each child thread.
+// One context per connection, made by the listener and freed by the child, so the
+// shared ChildSocketfd/ConnectedIP/Lock of the plain listener are not used.
+#define	DRIVER_TRANSPORT_TLS	1
+struct	DriverConnection
+	{
+	DriverApp	*App;
+	int		Socketfd;
+	unsigned int	ConnectedIP;
+	int		Transport;
 	};
 
 // Query / Retrieve Engine
@@ -15786,7 +15805,7 @@ class	StorageApp	:
 
 		//MyModalityWorkListQuery			SOPModalityWorkListQuery;
 	public:
-		BOOL	ServerChild ( int, unsigned int );
+		BOOL	ServerChild ( int, unsigned int, int Transport = 0 );
 		void FailSafeStorage(CheckedPDU_Service *PDU);
 		BOOL PrinterSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject *PrintData[], int Thread, char *lua);
 		BOOL StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject **CommitData);
@@ -20109,7 +20128,14 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 // acrnema.map are connected with TLS; every other connection stays exactly as
 // before. A failed handshake or certificate check is a failed connection: there
 // is never a plain fallback. A dgate built without HAVE_OPENSSL refuses T nodes.
-// Incoming TLS is not part of this step.
+//
+// Incoming DICOM TLS (step 4b): with TLSPort set, a second listener accepts TLS
+// on that port only (the DICOM port TCPPort stays exactly as it was). The TLS
+// handshake runs in the child thread, with a time limit, before the association
+// is parsed. Client certificates are checked with TLSCAFile and TLSVerifyPeer;
+// after the A-ASSOCIATE-RQ, TLSPin_<calling AE> (if set) must match the client
+// certificate. With TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
+// calling AE with T in acrnema.map is rejected on the plain port.
 //
 // dicom.ini [sscscp] keys (all optional). The first five are read when the first
 // TLS connection is made (a change needs a restart); TLSVerifyHostname and
@@ -20126,6 +20152,17 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //                      address of the node in acrnema.map
 //   TLSPin_<AE>        one or two SHA-256 certificate fingerprints for node AE (hex, colons
 //                      optional, comma separated); when set, the certificate must match one
+//                      (outgoing: the server certificate of AE; incoming: the client
+//                      certificate of calling AE AE)
+// Incoming (step 4b):
+//   TLSPort            port of the TLS listener, read like TCPPort; empty (default) = none;
+//                      equal to TCPPort = startup error, no TLS listener
+//   TLSEnforceForMappedNodes  1 (default) | 0: with TLSPort set, a calling AE with T in
+//                      acrnema.map is rejected (A-ASSOCIATE-RJ) on the plain port
+//   TLSCertificate/TLSPrivateKey are the server certificate (required for TLSPort),
+//   TLSCAFile checks client certificates, TLSVerifyPeer: require (default) = client
+//   certificate required, verify = checked when sent, ignore = not asked for (a
+//   TLSPin_<AE> then refuses that AE: there is no certificate to compare)
 ////////////////////////////////////////////////////////////////////////////////
 
 // Set the transport of PDU for a connection to the map entry E: TLS when E has
@@ -20185,6 +20222,7 @@ static	struct	TLSCtxCriticalInit
 	TLSCtxCriticalInit() { InitializeCriticalSection(&TLSCtxCritical); }
 	}	TLSCtxCriticalInitObject;
 static	SSL_CTX	*TLSClientCtx = NULL;		// made once, on the first TLS connection
+static	SSL_CTX	*TLSServerCtx = NULL;		// incoming: made once, when the TLS listener starts
 static	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore
 
 // the dicom.ini section with the server settings
@@ -20253,10 +20291,12 @@ static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
 	return TRUE;
 	}
 
-// Make the client SSL_CTX from dicom.ini. Returns NULL (with a console line) on
-// any configuration problem, so that T nodes are refused rather than half secured.
-static	SSL_CTX	*TLSMakeClientContext(void)
+// Make the client (server=FALSE) or server (server=TRUE, incoming TLSPort) SSL_CTX
+// from dicom.ini. Returns NULL (with a console line) on any configuration problem,
+// so that T nodes are refused, or no TLS listener started, rather than half secured.
+static	SSL_CTX	*TLSMakeContext(BOOL server)
 	{
+	const char	*side = server ? "server" : "client";
 	char	sc[64], cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
@@ -20283,10 +20323,10 @@ static	SSL_CTX	*TLSMakeClientContext(void)
 	else if (strcmp(minv, "1.2")!=0)
 		OperatorConsole.printf("*** TLS: TLSMinVersion = %s not supported, using 1.2\n", minv);
 
-	ctx = SSL_CTX_new(TLS_client_method());
+	ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
 	if (!ctx)
 		{
-		OperatorConsole.printf("*** TLS: cannot create client context: %s\n", TLSErrorText(err, sizeof(err)));
+		OperatorConsole.printf("*** TLS: cannot create %s context: %s\n", side, TLSErrorText(err, sizeof(err)));
 		return NULL;
 		}
 	if (SSL_CTX_set_min_proto_version(ctx, minversion)!=1)
@@ -20313,6 +20353,12 @@ static	SSL_CTX	*TLSMakeClientContext(void)
 			return NULL;
 			}
 		}
+	else if (server)
+		{
+		OperatorConsole.printf("*** TLS: TLSPort needs TLSCertificate (and TLSPrivateKey)\n");
+		SSL_CTX_free(ctx);
+		return NULL;
+		}
 	else
 		SystemDebug.printf("TLS: no TLSCertificate, no client certificate is sent\n");
 
@@ -20324,6 +20370,12 @@ static	SSL_CTX	*TLSMakeClientContext(void)
 			SSL_CTX_free(ctx);
 			return NULL;
 			}
+		// server: tell clients which CAs are accepted for their certificate
+		if (server)
+			{
+			STACK_OF(X509_NAME)	*names = SSL_load_client_CA_file(ca);
+			if (names) SSL_CTX_set_client_CA_list(ctx, names);
+			}
 		}
 	else if (TLSVerifyMode)
 		{
@@ -20332,10 +20384,27 @@ static	SSL_CTX	*TLSMakeClientContext(void)
 		return NULL;
 		}
 
-	SSL_CTX_set_verify(ctx, TLSVerifyMode ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
-	if (!TLSVerifyMode)
-		OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: server certificates are not verified\n");
-	OperatorConsole.printf("TLS: client context ready (minimum TLS %s, verify %s)\n", minversion==TLS1_3_VERSION ? "1.3" : "1.2",
+	if (server)
+		{
+		// client certificate: require = must be sent and valid, verify = valid when sent
+		SSL_CTX_set_verify(ctx, TLSVerifyMode==2 ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT :
+					TLSVerifyMode==1 ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+		// every association is a full handshake: no session cache, no TLS 1.3 tickets
+		SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+		SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"dgate", 5);
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+		SSL_CTX_set_num_tickets(ctx, 0);
+#endif
+		if (!TLSVerifyMode)
+			OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: client certificates are not asked for\n");
+		}
+	else
+		{
+		SSL_CTX_set_verify(ctx, TLSVerifyMode ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+		if (!TLSVerifyMode)
+			OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: server certificates are not verified\n");
+		}
+	OperatorConsole.printf("TLS: %s context ready (minimum TLS %s, verify %s)\n", side, minversion==TLS1_3_VERSION ? "1.3" : "1.2",
 		TLSVerifyMode==2 ? "require" : TLSVerifyMode==1 ? "verify" : "ignore");
 	return ctx;
 	}
@@ -20346,7 +20415,7 @@ static	void	*TLSClientContext(void)
 	SSL_CTX	*ctx;
 	EnterCriticalSection(&TLSCtxCritical);
 	if (!TLSClientCtx)
-		TLSClientCtx = TLSMakeClientContext();
+		TLSClientCtx = TLSMakeContext(FALSE);
 	ctx = TLSClientCtx;
 	LeaveCriticalSection(&TLSCtxCritical);
 	return ctx;
@@ -20401,17 +20470,57 @@ static	BOOL	TLSCertMatchesHost(X509 *cert, const char *host)
 	return r == 1;
 	}
 
+// Compare the SHA-256 fingerprint of cert with pins, the value of dicom.ini key
+// (one or two fingerprints, comma separated, colons and blanks ignored). hex gets
+// the certificate's fingerprint (2*EVP_MAX_MD_SIZE+1 bytes). Returns 1 when one
+// matches, 0 when none does, -1 without a certificate (or digest).
+static	int	TLSCertMatchesPins(X509 *cert, const char *key, const char *pins, char *hex)
+	{
+	char		pin[2*EVP_MAX_MD_SIZE+1];
+	unsigned char	md[EVP_MAX_MD_SIZE];
+	unsigned int	n = 0, i;
+	int		k, good = 0;
+	const char	*q;
+
+	hex[0] = 0;
+	if (!cert || X509_digest(cert, EVP_sha256(), md, &n)!=1)
+		return -1;
+	for (i=0; i<n; i++)
+		sprintf(hex+2*i, "%02x", md[i]);
+	hex[2*n] = 0;
+
+	q = pins;
+	while (*q)
+		{
+		k = 0;
+		while (*q && *q!=',')
+			{
+			if (isxdigit((unsigned char)*q) && k < (int)sizeof(pin)-1)
+				pin[k++] = tolower((unsigned char)*q);
+			else if (*q!=':' && *q!=' ' && *q!='\t')
+				k = sizeof(pin);		// not a fingerprint
+			q++;
+			}
+		if (*q==',') q++;
+		if (k == (int)(2*n))
+			{
+			pin[k] = 0;
+			if (strcmp(pin, hex)==0) good = 1;
+			}
+		else if (k)
+			OperatorConsole.printf("*** TLS: %s contains an entry that is not a SHA-256 fingerprint\n", key);
+		}
+	return good;
+	}
+
 // Socket hook after the handshake: the host name check when certificates are not
 // verified (TLSVerifyPeer = ignore), and the certificate pin TLSPin_<AE>
 static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	{
 	SSL		*ssl = (SSL *) s;
 	X509		*cert;
-	char		sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1], pin[2*EVP_MAX_MD_SIZE+1];
-	unsigned char	md[EVP_MAX_MD_SIZE];
-	unsigned int	n = 0, i;
-	int		k, good = 0;
-	const char	*q;
+	char		sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1];
+	int		good = 0;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 	cert = SSL_get1_peer_certificate(ssl);
@@ -20437,38 +20546,12 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		return TRUE;
 		}
 
-	if (!cert || X509_digest(cert, EVP_sha256(), md, &n)!=1)
+	good = TLSCertMatchesPins(cert, key, pins, hex);
+	if (cert) X509_free(cert);
+	if (good < 0)
 		{
 		OperatorConsole.printf("*** TLS: no certificate of %s to compare with %s; connection refused\n", AE, key);
-		if (cert) X509_free(cert);
 		return FALSE;
-		}
-	X509_free(cert);
-	for (i=0; i<n; i++)
-		sprintf(hex+2*i, "%02x", md[i]);
-	hex[2*n] = 0;
-
-	// compare with each comma separated fingerprint (colons and blanks ignored)
-	q = pins;
-	while (*q)
-		{
-		k = 0;
-		while (*q && *q!=',')
-			{
-			if (isxdigit((unsigned char)*q) && k < (int)sizeof(pin)-1)
-				pin[k++] = tolower((unsigned char)*q);
-			else if (*q!=':' && *q!=' ' && *q!='\t')
-				k = sizeof(pin);		// not a fingerprint
-			q++;
-			}
-		if (*q==',') q++;
-		if (k == (int)(2*n))
-			{
-			pin[k] = 0;
-			if (strcmp(pin, hex)==0) good = 1;
-			}
-		else if (k)
-			OperatorConsole.printf("*** TLS: %s contains an entry that is not a SHA-256 fingerprint\n", key);
 		}
 
 	if (!good)
@@ -20480,6 +20563,105 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	return TRUE;
 	}
 
+// Socket hook (incoming): the server SSL_CTX, made when the TLS listener starts
+static	void	*TLSServerContext(void)
+	{
+	SSL_CTX	*ctx;
+	EnterCriticalSection(&TLSCtxCritical);
+	ctx = TLSServerCtx;
+	LeaveCriticalSection(&TLSCtxCritical);
+	return ctx;
+	}
+
+// Incoming TLS: TLSPin_<calling AE> against the client certificate of this
+// connection. TRUE without a pin (identity rests on TLSCAFile and TLSVerifyPeer).
+static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *peer)
+	{
+	SSL	*ssl = (SSL *) PDU->Link.TLSHandle;
+	X509	*cert;
+	char	sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1];
+	int	good;
+
+	TLSIniSection(sc);
+	snprintf(key, sizeof(key), "TLSPin_%s", AE);
+	MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+	if (!pins[0])
+		return TRUE;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	cert = SSL_get1_peer_certificate(ssl);
+#else
+	cert = SSL_get_peer_certificate(ssl);
+#endif
+	good = TLSCertMatchesPins(cert, key, pins, hex);
+	if (cert) X509_free(cert);
+	if (good < 0)
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: no client certificate to compare with %s\n", AE, peer, key);
+		return FALSE;
+		}
+	if (!good)
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: client certificate does not match %s (its SHA-256 is %s)\n", AE, peer, key, hex);
+		return FALSE;
+		}
+	SystemDebug.printf("TLS: client certificate of %s matches %s\n", AE, key);
+	return TRUE;
+	}
+
+// Startup of the incoming TLS listener (server, threaded mode): only when TLSPort
+// is set; refused when it equals TCPPort or the server configuration is not usable.
+static	BOOL WINAPI TLSListenerThread(void)
+	{
+	static StorageApp	TLSServerApp;		// own DriverApp, apart from ServerApp
+	TLSServerApp.ServerTLS(TLSPort);
+	return FALSE;
+	}
+
+static	BOOL	TLSPortSameAsTCPPort(void)
+	{
+	if (atoi((char *)TLSPort) && atoi((char *)Port))
+		return atoi((char *)TLSPort) == atoi((char *)Port);
+	return strcmp((char *)TLSPort, (char *)Port) == 0;
+	}
+
+void	StartTLSListener(void)
+	{
+	SSL_CTX	*ctx;
+
+	if (!TLSPort[0])
+		return;					// default: no TLS listener, nothing changes
+	if (TLSPortSameAsTCPPort())
+		{
+		OperatorConsole.printf("*** TLS: TLSPort %s is the same as TCPPort: no TLS listener (DICOM port unchanged)\n", (char *)TLSPort);
+		return;
+		}
+	if (NoThread)
+		{
+		OperatorConsole.printf("*** TLS: no TLS listener on TLSPort %s in non-threaded debug mode\n", (char *)TLSPort);
+		return;
+		}
+	ctx = TLSMakeContext(TRUE);
+	if (!ctx)
+		{
+		OperatorConsole.printf("*** TLS: no usable TLS server configuration: no TLS listener on TLSPort %s\n", (char *)TLSPort);
+		return;
+		}
+	EnterCriticalSection(&TLSCtxCritical);
+	TLSServerCtx = ctx;
+	LeaveCriticalSection(&TLSCtxCritical);
+#ifdef WIN32
+	unsigned long ThreadID;
+	CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) TLSListenerThread, NULL, 0, &ThreadID);
+#else
+	pthread_t ThreadID;
+	if (pthread_create(&ThreadID, NULL, (void*(*)(void*))TLSListenerThread, (void *)NULL)==0)
+		pthread_detach(ThreadID);
+	else
+		OperatorConsole.printf("*** TLS: cannot start the TLS listener thread\n");
+#endif
+	}
+
 // install the socket hooks before main() runs
 static	struct	TLSHooksInit
 	{
@@ -20489,10 +20671,18 @@ static	struct	TLSHooksInit
 		SocketTLS.BeforeHandshake = TLSBeforeHandshake;
 		SocketTLS.AfterHandshake  = TLSAfterHandshake;
 		SocketTLS.Log             = TLSLogLine;
+		SocketTLS.ServerContext   = TLSServerContext;
 		}
 	}	TLSHooksInitObject;
 
 #else
+
+// without OpenSSL: TLSPort set only gives a console line, there is no TLS listener
+void	StartTLSListener(void)
+	{
+	if (TLSPort[0])
+		OperatorConsole.printf("*** TLS: TLSPort %s is set but this dgate was built without TLS support: no TLS listener\n", (char *)TLSPort);
+	}
 
 // without OpenSSL only the log hook: the refusal of T nodes reaches the console
 static	struct	TLSHooksInit
@@ -20501,6 +20691,93 @@ static	struct	TLSHooksInit
 	}	TLSHooksInitObject;
 
 #endif
+
+// Incoming association, called from ExtendedPDU_Service::ShouldIAcceptRemoteTransport
+// when the A-ASSOCIATE-RQ has been read and before anything is answered; FALSE =
+// A-ASSOCIATE-RJ (calling AE not recognized).
+//  - TLS port: TLSPin_<calling AE>, when set, must match the client certificate.
+//  - plain port: with TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
+//    calling AE with T in acrnema.map is rejected. With TLSPort empty (default)
+//    nothing is checked, as before.
+BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
+	{
+	char		ae[20], peer[24], sc[64], tmp[32];
+	ACRNemaAddress	E;
+	struct sockaddr_in	sa;
+#ifdef	UNIX
+	socklen_t	len = sizeof(sa);
+#else
+	int		len = sizeof(sa);
+#endif
+	int		i;
+
+	if (!PDU->Link.TLSHandle && !TLSPort[0])
+		return TRUE;				// no incoming TLS configured: as before
+
+	// calling AE without padding
+	memset(ae, 0, sizeof(ae));
+	memcpy(ae, CallingAE, 16);
+	for (i=strlen(ae)-1; i>=0 && ae[i]==' '; i--) ae[i] = 0;
+	for (i=0; ae[i]==' '; i++) ;
+	if (i) memmove(ae, ae+i, strlen(ae+i)+1);
+
+	strcpy(peer, "?");
+	memset(&sa, 0, sizeof(sa));
+	if (getpeername(PDU->Link.Socketfd, (struct sockaddr *)&sa, &len)==0 && sa.sin_family==AF_INET)
+		{
+		unsigned int ip = sa.sin_addr.s_addr;
+		sprintf(peer, "%d.%d.%d.%d", ip&255, (ip>>8)&255, (ip>>16)&255, (ip>>24)&255);
+		}
+
+	if (PDU->Link.TLSHandle)
+		{
+#ifdef	HAVE_OPENSSL
+		// only printable AE titles over TLS (no control characters to play with the lookups):
+		// all 16 received bytes are checked; after the title only padding (NUL or space)
+		BOOL	pad = FALSE, bad = FALSE;
+		for (i=0; i<16; i++)
+			{
+			BYTE c = CallingAE[i];
+			if (c==0) pad = TRUE;
+			else if (pad && c!=' ') bad = TRUE;
+			else if (c<32 || c>126) bad = TRUE;
+			}
+		if (bad) ae[0] = 1;	// refused just below
+		for (i=0; ae[i]; i++)
+			if (ae[i]<32 || ae[i]>126)
+				{
+				OperatorConsole.printf("*** TLS: association from %s rejected: calling AE title has control characters\n", peer);
+				return FALSE;
+				}
+
+		// the pin of this AE: TLSPin_<calling AE>, else the pin of the acrnema.map entry the
+		// calling AE resolves to (map lookups ignore case), so another spelling of a pinned
+		// AE does not escape its pin
+		char	pinae[20], key[64], pins[512];	// full size: the ini cache copies without a limit
+		strcpy(pinae, ae);
+		TLSIniSection(sc);
+		snprintf(key, sizeof(key), "TLSPin_%s", ae);
+		MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+		if (!pins[0] && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
+			strcpy(pinae, E.Name);
+		return TLSCheckIncomingPin(PDU, pinae, peer);
+#else
+		return FALSE;				// cannot happen: no TLS in this build
+#endif
+		}
+
+	// plain port with TLSPort set
+	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, 64, ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSEnforceForMappedNodes", "1", tmp, sizeof(tmp), ConfigFile);
+	if (atoi(tmp)==0)
+		return TRUE;
+	if (ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS))
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) on the plain port rejected: %s has T in acrnema.map, use TLSPort %s\n", ae, peer, ae, (char *)TLSPort);
+		return FALSE;
+		}
+	return TRUE;
+	}
 
 BOOL
 QualifyOn(
@@ -20816,6 +21093,75 @@ ThreadRoutineType DriverHelper(void *theApp)
 	// ODBC is used)
 //	ExitThread(0x00);
 	return ( THREAD_RETURN_FALSE );
+	}
+
+// Incoming TLS (20261026 mmd): child thread of the TLS listener. It owns the
+// connection context: copies it, frees it, then runs the normal child with
+// the transport (the TLS handshake happens there, before Multiplex).
+#ifndef UNIX
+static BOOL WINAPI DriverConnectionHelper (DriverConnection *c)
+	{
+#else
+static ThreadRoutineType DriverConnectionHelper (void *arg)
+	{
+	DriverConnection *c = (DriverConnection *)arg;
+#endif
+	DriverConnection	mine = *c;
+	delete c;
+	mine.App->ServerChild ( mine.Socketfd, mine.ConnectedIP, mine.Transport );
+	return ( THREAD_RETURN_FALSE );
+	}
+
+// Incoming TLS (20261026 mmd): the listener on TLSPort, run in its own thread on
+// its own DriverApp object. Each accepted connection is passed to a new child
+// thread in its own DriverConnection; the plain Server() above is not involved.
+BOOL	DriverApp	::	ServerTLS ( BYTE	*port )
+	{
+	Socket			MSocket;
+	DriverConnection	*c;
+	BOOL			started;
+#ifndef UNIX
+	DWORD		ThreadID;
+	HANDLE		ThreadHandle;
+#else
+	pthread_t 	ThreadID;
+#endif
+
+	MSocket.SetTimeOut(TCPIPTimeOut);
+	if (!MSocket.Listen ((char*) port ))
+		{
+		OperatorConsole.printf("*** TLS: cannot listen on TLSPort %s (port in use or not allowed): no TLS listener; DICOM port %s is not affected\n", (char *)port, (char *)Port);
+		return ( FALSE );
+		}
+	OperatorConsole.printf("DICOM TLS listener on TLSPort %s (DICOM port %s unchanged)\n", (char *)port, (char *)Port);
+
+	while (MSocket.Accept() )
+		{
+		c = new DriverConnection;
+		c->App         = this;
+		c->Socketfd    = MSocket.Socketfd;
+		c->ConnectedIP = MSocket.sa.sin_addr.s_addr;
+		c->Transport   = DRIVER_TRANSPORT_TLS;
+		MSocket.Socketfd = 0;
+		MSocket.Connected = FALSE;
+
+#ifndef UNIX
+		ThreadHandle = CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) DriverConnectionHelper, c, 0, &ThreadID);
+		started = ThreadHandle != NULL;
+		if (started) CloseHandle(ThreadHandle);
+#else
+		started = pthread_create(&ThreadID, NULL, DriverConnectionHelper, (void *)c) == 0;
+		if (started) pthread_detach(ThreadID);
+#endif
+		if (!started)
+			{
+			OperatorConsole.printf("***Failed to create thread for TLS child\n");
+			closesocket ( c->Socketfd );
+			delete c;
+			}
+		}
+	OperatorConsole.printf("*** TLS: listener on TLSPort %s stopped (accept failed)\n", (char *)port);
+	return ( FALSE );
 	}
 
 // Log some user information
@@ -27692,7 +28038,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 	return false;
 	}
 	
-BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP )
+BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP, int Transport )
 	{
 	ExtendedPDU_Service	PDU ( SOPClassFile );
 	DICOMCommandObject	DCO;
@@ -27756,6 +28102,16 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP )
 	struct 	ReadAheadThreadData ratd;
 
 	WipeStack();
+
+	// incoming TLS port: the TLS handshake first, nothing is parsed before it (20261026 mmd)
+	if (Transport == DRIVER_TRANSPORT_TLS)
+		{
+		char peer[20];
+		sprintf(peer, "%d.%d.%d.%d", ConnectedIP&255, (ConnectedIP>>8)&255, (ConnectedIP>>16)&255, (ConnectedIP>>24)&255);
+		if (!PDU.Link.TLSAccept(socketfd, peer))
+			return ( FALSE );
+		}
+
 	if(!PDU.Multiplex ( socketfd ))
 		{
 		OperatorConsole.printf("*** multiplex: connection terminated\n");
@@ -28971,6 +29327,9 @@ main ( int	argc, char	*argv[] )
 			if (OutgoingStorageCommitment && !NoThread)
 				StartSCWorkerThread();
 
+			// incoming DICOM TLS listener: only when TLSPort is set in dicom.ini
+			StartTLSListener();
+
 			if (NoThread)
 				while ( TRUE )
 					ServerApp.Server(Port);
@@ -30122,6 +30481,7 @@ static void DgateCgi(char *ext, char *argv0, int argc, char **argv)
     HTML("<TR><TD>File<TD>Parameter<TD>Value<TD>Description</TR>");
     Tabulate("dicom.ini", "get_param:MyACRNema", "DICOM name of server", !ReadOnly);
     Tabulate("dicom.ini", "get_param:TCPPort",   "TCP/IP port where server listens", !ReadOnly);
+    Tabulate("dicom.ini", "get_param:TLSPort",   "TCP/IP port for DICOM TLS (empty = none)", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FileNameSyntax", "Determines name for new files", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FixPhilips", "Strip leading zeros from 10 digit patient ID", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FixKodak", "Strip leading zeros from 8 digit patient ID", !ReadOnly);

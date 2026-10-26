@@ -29,6 +29,8 @@
 			connect with a time limit, full write loop, read uses data buffered in
 			OpenSSL before select(), bounded close_notify. Never falls back to plain;
 			without HAVE_OPENSSL a TLS connection is refused. Plain sockets unchanged.
+20261026	mmd	Incoming TLS: TLSAccept (server handshake with a time limit on an
+			accepted socket) and the ServerContext hook
 
 */
 
@@ -85,7 +87,7 @@
 #endif
 
 // outgoing TLS hooks, set by the application (all NULL: TLS is refused)
-SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL };
+SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL, NULL };
 
 // TLS message to the application log (level 0 operator, 1 debug)
 static	void	SocketTLSPrint(int level, const char *fmt, ...)
@@ -948,6 +950,85 @@ BOOL	Socket	::	TLSOpen(char *host)
 	return ( TRUE );
 	}
 
+// Server side TLS handshake on the accepted socket fd (incoming TLS port), with
+// the same time limit as TLSOpen: 30 s, or TimeOut if that is shorter. Nothing
+// is read from the connection before it succeeds. On success the SSL object is
+// kept in TLSHandle and Socketfd = fd (Connected is not changed); on failure the
+// SSL object is freed, fd is closed and FALSE returned.
+BOOL	Socket	::	TLSAccept(int fd, const char *peer)
+	{
+	SSL_CTX	*ctx;
+	SSL	*ssl;
+	char	why[256];
+	int	limit, r, e, w, left;
+	time_t	end;
+
+	if ( TLSHandle )
+		TLSFree(FALSE);
+	TLSMode = 0;			// TLSMode only steers Open (outgoing)
+	TLSPeerAE[0] = 0;		// calling AE: not known before the A-ASSOCIATE-RQ
+	Socketfd = fd;
+
+	ctx = SocketTLS.ServerContext ? (SSL_CTX *) SocketTLS.ServerContext() : NULL;
+	ssl = ctx ? SSL_new(ctx) : NULL;
+	if (!ssl)
+		{
+		SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: no usable TLS server configuration", peer);
+		closesocket(fd);
+		Socketfd = 0;
+		return ( FALSE );
+		}
+
+	// non-blocking from here: every wait below has a time limit
+#ifdef	WINDOWS
+	u_long	nb = 1;
+	ioctlsocket(Socketfd, FIONBIO, &nb);
+#else
+	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+	SSL_set_fd(ssl, Socketfd);
+	SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+	TLSHandle = ssl;
+
+	limit = TLS_HANDSHAKE_SECONDS;
+	if (TimeOut > 0 && TimeOut < limit)
+		limit = TimeOut;
+	end = time(NULL) + limit;
+	for (;;)
+		{
+		ERR_clear_error();
+		r = SSL_accept(ssl);
+		if (r == 1)
+			break;
+		e = SSL_get_error(ssl, r);
+		if (e == SSL_ERROR_WANT_READ) w = 0;
+		else if (e == SSL_ERROR_WANT_WRITE) w = 1;
+		else
+			{
+			SocketTLSErrorText(ssl, e, why, sizeof(why));
+			SocketTLSPrint(0, "*** TLS: incoming handshake from %s failed: %s", peer, why);
+			SSL_set_quiet_shutdown(ssl, 1);
+			TLSFree(FALSE);
+			closesocket(fd);
+			Socketfd = 0;
+			return ( FALSE );
+			}
+		left = (int)(end - time(NULL));
+		if (left <= 0 || TLSWait(w, left) <= 0)
+			{
+			SocketTLSPrint(0, "*** TLS: incoming handshake from %s timed out after %d s", peer, limit);
+			SSL_set_quiet_shutdown(ssl, 1);
+			TLSFree(FALSE);
+			closesocket(fd);
+			Socketfd = 0;
+			return ( FALSE );
+			}
+		}
+
+	SocketTLSPrint(1, "TLS: incoming connection from %s with %s %s", peer, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+	return ( TRUE );
+	}
+
 // Free the TLS state; optionally send one close_notify first, waiting at most
 // TLS_CLOSE_SECONDS and never for the peer's answer. The socket stays open.
 void	Socket	::	TLSFree(BOOL SendCloseNotify)
@@ -1062,6 +1143,13 @@ INT	Socket	::	TLSRead(BYTE *s, UINT count)
 
 // builds without HAVE_OPENSSL: TLS is never active (Open refuses TLSMode)
 BOOL	Socket	::	TLSOpen(char *host)		{ return ( FALSE ); }
+BOOL	Socket	::	TLSAccept(int fd, const char *peer)
+	{
+	SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: this dgate was built without TLS support", peer);
+	closesocket(fd);
+	Socketfd = 0;
+	return ( FALSE );
+	}
 void	Socket	::	TLSFree(BOOL SendCloseNotify)	{ TLSHandle = NULL; }
 int	Socket	::	TLSWait(int ForWrite, int Seconds)	{ return ( -1 ); }
 BOOL	Socket	::	TLSSend(BYTE *s, UINT count)	{ return ( FALSE ); }

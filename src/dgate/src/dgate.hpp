@@ -137,6 +137,7 @@ extern	char	PatientTableName[],
 		WorkListTableName[];
 extern	BYTE	Directory [];
 extern	BYTE	Port [];
+extern	BYTE	TLSPort [];
 extern	BYTE	KFACTORFILE [];
 extern	BYTE	MYACRNEMA [];
 extern	char	SOPClassFile [];
@@ -207,6 +208,7 @@ BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// TLS for nodes with T in acrnema.map
 BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE);	// the same, looked up by AE title
+BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);
 BOOL	RemoveFromPACS(DICOMDataObject *, BOOL KeepImages = FALSE);
 BOOL	BuildColumnString(DBENTRY	*DBE, char	*TableName, VR	*vr,	char	*TempString);

@@ -477,6 +477,7 @@ void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstan
 void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 unsigned int	SCSendSeq(void);
 void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+int	SCModeMayDiffer(const char *mode);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
 
 BOOL	StandardRetrieveNKI	::	Read (
@@ -808,7 +809,10 @@ BOOL	StandardRetrieveNKI	::	Read (
 			StripGroup2 = memicmp(AcceptedCompress, "as", 2)!=0 && memicmp(AcceptedCompress, "is", 2)!=0;
 
 			// outgoing storage commitment: a script applied to the sent copy only means the
-			// sent object may differ from the archive copy: never re-sent automatically
+			// sent object may differ from the archive copy: never re-sent automatically.
+			// Likewise the per-object processing of ProcessDDO (scrub 9999,0202, downsizing
+			// 9999,0200, frame extraction 9999,0201, RetrieveResultConverter0) and a compression
+			// that may change the pixel data (checked below with the mode actually used)
 			int scDiffer = 0;
 			if (OutgoingStorageCommitment && !cget)
 				{
@@ -818,6 +822,13 @@ BOOL	StandardRetrieveNKI	::	Read (
 				if (!rc[0] && MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, root, 64, ConfigFile))
 					MyGetPrivateProfileString(root, "RetrieveConverter0", "", rc, sizeof(rc), ConfigFile);
 				if (rc[0]) scDiffer = 1;
+				rc[0] = 0;	// RetrieveResultConverter0 (run per object in ProcessDDO)
+				MyGetPrivateProfileString("lua", "RetrieveResultConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (!rc[0] && MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, root, 64, ConfigFile))
+					MyGetPrivateProfileString(root, "RetrieveResultConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (rc[0]) scDiffer = 1;
+				if (DCO && (DCO->GetVR(0x9999, 0x0200) || DCO->GetVR(0x9999, 0x0201) || DCO->GetVR(0x9999, 0x0202)))
+					scDiffer = 1;
 				}
 
 			if ( !RetrieveOn (ADDO.Get(Index), &iDDO, &SStorage, DCO, &ADDO, ExtraBytes))
@@ -826,7 +837,10 @@ BOOL	StandardRetrieveNKI	::	Read (
 				{
 				// non NKI client
 			        if (DCO==NULL)
+					{
 					recompress(&iDDO, AcceptedCompress, "", StripGroup2, PDU);
+					if (SCModeMayDiffer(AcceptedCompress)) scDiffer = 1;
+					}
 
 				// NKI client has 2 vr's to control (re)compression
 				// 9999,0600=MaxSupportedCompression (old, nki only)
@@ -865,6 +879,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 							mode[1] = MaxCompression + '0';
 
 					recompress(&iDDO, mode, "", StripGroup2, PDU);
+					if (SCModeMayDiffer(mode)) scDiffer = 1;	// e.g. lossy 9999,0700 or ~j5 override
 					if (script[0])
 						{
 						CallImportConverterN(DCO, iDDO, -1, NULL, NULL, NULL, NULL, PDU, NULL, script);

@@ -252,6 +252,7 @@ Spectra0015: Thu, 6 Mar 2014 15:34:35 -0300: Fix mismatched new/delete in dbsql.
 20260907	mvh	MakeSafeStringValues no longer uses SetString and checks length, move SetString out of here
 20261012	mvh	The above change lost handling of binary tag values, reintroduced  (SM1312, Mahesh)
 20261026	mmd	Read TLSPort (incoming DICOM TLS port, default empty = none) next to TCPPort
+20261026	mmd	Read TLSLegacyPort (incoming legacy-profile TLS port, default empty = none)
 */
 
 #define NCACHE 256
@@ -322,6 +323,7 @@ char	UIDToMOPIDTableName [ 64 ] = "UIDToMOPID";
 char	UIDToCDRIDTableName [ 64 ] = "UIDToCDRID";
 BYTE	Port [ 64 ];
 BYTE	TLSPort [ 64 ];		// incoming DICOM TLS port; empty = no TLS listener
+BYTE	TLSLegacyPort [ 64 ];	// incoming legacy-profile TLS port; empty = no legacy listener
 
 // Later make everything MAX_PATH or similar?
 BYTE	KFACTORFILE [ 256 ] = "dicom.sql";
@@ -583,6 +585,9 @@ BOOL	ConfigMicroPACS()
 
 	MyGetPrivateProfileString ( RootSC, "TLSPort", "",
 		(char*) TLSPort, 64, ConfigFile);
+
+	MyGetPrivateProfileString ( RootSC, "TLSLegacyPort", "",
+		(char*) TLSLegacyPort, 64, ConfigFile);
 
 	MyGetPrivateProfileString ( RootSC, "DebugLevel", "0",
 		(char*) Temp, 64, ConfigFile);DebugVRs = atoi(Temp);

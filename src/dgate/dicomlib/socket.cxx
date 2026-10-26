@@ -38,6 +38,7 @@
 			fails the TLS connect, handshake or accept fails (never a blocking wait)
 20261026	mmd	TLSMode 2: the legacy client context (ClientContextLegacy hook); one console
 			line per legacy connection with the protocol and cipher
+20261026	mmd	TLSAccept(fd, peer, Legacy): the legacy server context (ServerContextLegacy)
 
 */
 
@@ -94,7 +95,7 @@
 #endif
 
 // outgoing TLS hooks, set by the application (all NULL: TLS is refused)
-SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL, NULL, NULL };
+SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
 #ifdef	HAVE_OPENSSL
 // the client context for TLSMode 1 (strict) or 2 (legacy), or NULL
@@ -1069,7 +1070,7 @@ BOOL	Socket	::	TLSOpen(char *host)
 // is read from the connection before it succeeds. On success the SSL object is
 // kept in TLSHandle and Socketfd = fd (Connected is not changed); on failure the
 // SSL object is freed, fd is closed and FALSE returned.
-BOOL	Socket	::	TLSAccept(int fd, const char *peer)
+BOOL	Socket	::	TLSAccept(int fd, const char *peer, int Legacy)
 	{
 	SSL_CTX	*ctx;
 	SSL	*ssl;
@@ -1083,7 +1084,10 @@ BOOL	Socket	::	TLSAccept(int fd, const char *peer)
 	TLSPeerAE[0] = 0;		// calling AE: not known before the A-ASSOCIATE-RQ
 	Socketfd = fd;
 
-	ctx = SocketTLS.ServerContext ? (SSL_CTX *) SocketTLS.ServerContext() : NULL;
+	if (Legacy)
+		ctx = SocketTLS.ServerContextLegacy ? (SSL_CTX *) SocketTLS.ServerContextLegacy() : NULL;
+	else
+		ctx = SocketTLS.ServerContext ? (SSL_CTX *) SocketTLS.ServerContext() : NULL;
 	ssl = ctx ? SSL_new(ctx) : NULL;
 	if (!ssl)
 		{
@@ -1260,7 +1264,7 @@ INT	Socket	::	TLSRead(BYTE *s, UINT count)
 // builds without HAVE_OPENSSL: TLS is never active (Open refuses TLSMode)
 BOOL	Socket	::	TLSOpen(char *host)		{ return ( FALSE ); }
 int	Socket	::	TLSConnect(long end)		{ return ( 1 ); }
-BOOL	Socket	::	TLSAccept(int fd, const char *peer)
+BOOL	Socket	::	TLSAccept(int fd, const char *peer, int Legacy)
 	{
 	SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: this dgate was built without TLS support", peer);
 	closesocket(fd);

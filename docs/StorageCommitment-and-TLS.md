@@ -2,8 +2,8 @@
 
 This document covers changes to dgate on top of upstream master `f8c0057` (1.5.0g4). It is written for
 someone who knows the Conquest code base. Each statement here has been checked against the code on
-branch `sc-outgoing-tls`. Items marked **(pending)** are on branches still under review and not yet
-merged. Check them again after the merge.
+branch `sc-outgoing-tls`: `sc-outgoing-tls` with verify-before-delete (`sco-verify`) and the legacy TLS
+profile (`sco-tls-legacy`) merged on top.
 
 All AE titles, addresses and file names below are examples (RFC 5737 addresses `192.0.2.x`).
 
@@ -111,7 +111,7 @@ ARCHIVE2     192.0.2.21    2762   j2            TSC
 ARCHIVE3     192.0.2.22    104    un            SCR5
 ARCHIVE4     192.0.2.23    2762   un            TSCRI
 VIEWER       192.0.2.30    2762   un            T
-WORKSTATION1 192.0.2.40    11112  un            TL           (pending: L)
+WORKSTATION1 192.0.2.40    11112  un            TL
 ```
 
 Only the first token after the compression column is parsed. Case does not matter, and `-` means
@@ -120,7 +120,7 @@ Only the first token after the compression column is parsed. Case does not matte
 | Token | Meaning |
 |---|---|
 | `T` | DICOM TLS to (and from) this node, strict profile (section 4) |
-| `L` | with `T` only: legacy TLS profile for OsiriX-class nodes **(pending)** |
+| `L` | with `T` only: legacy TLS profile for OsiriX-class nodes (4.3) |
 | `SC` | outgoing storage commitment for data sent to this node |
 | `R` | re-send missing objects, limit `OutgoingSCResendMax` |
 | `R<n>` | re-send at most n times (1..999); `R0` = no re-send |
@@ -135,16 +135,19 @@ Only the first token after the compression column is parsed. Case does not matte
   Lua convention working: `lua/association.lua` documents the 5th column as user data, e.g. a
   C-MOVE thread count read through `find_amap(...)[5]`. A number is never taken as an option.
 - `R` without `SC` is ignored, and so is `R` on a wildcard entry.
-- `L` without `T` is ignored **(pending)**.
+- `L` without `T` is ignored (`*** TLS: acrnema.map: <AE>: L needs T, L ignored (no TLS for this entry)`):
+  the entry gets no TLS at all.
 
 **How the map commands handle the column**
 - The text after the compression column, up to 127 characters, is kept as read
   (`ACRNemaAddress.Options`), together with the parsed `Flags` (`ACR_TLS`, `ACR_SC`, `ACR_RESEND`,
-  and `ACR_TLSLEGACY` (pending)) and `ResendLimit`.
+  `ACR_TLSLEGACY`) and `ResendLimit`.
 - `write_amap` writes the column back. Before this change, `write_amap` dropped everything after
   column 4.
-- **(pending)** With the legacy branch, `write_amap` writes the option token in the canonical
-  order `T L SC R…`.
+- When the first token holds options, `write_amap` writes it upper case in the canonical order
+  `T L SC R…` (e.g. `sctlr5` → `TLSCR5`, `SCT` → `TSC`). Every letter is kept, also one that is
+  ignored (`L` without `T`, `R0`, `R` on a wildcard entry). The rest of the line follows unchanged,
+  and a column that is not an option token is written as read.
 - `put_amap` takes an optional 6th item. With 5 items, the existing options are kept.
 - `get_amap` / `get_amaps` pass the column as a 13th format argument, after the existing 12.
 - Lua `get_amap(i)` returns it as a 5th value, only when the line has one.
@@ -177,7 +180,7 @@ default, with a console warning (printed only while the feature is on).
 | `OutgoingSCResendMax` | `3` | 0..999 | limit for plain `R` |
 | `OutgoingSCResendDelay` | `300` | 0.. | delay before a re-send; after failed re-sends it doubles up to the last `OutgoingSCRetryInterval` value |
 | `SCUnsafeFile` | `sc_unsafe.flag` | name | sentinel file (3.6); a name without a path is in the dgate directory |
-| `OutgoingSCVerifyMax` | `4` | 1..64 | concurrent `sc_verify_now` verifications **(pending)** |
+| `OutgoingSCVerifyMax` | `4` | 1..64 | concurrent `sc_verify_now` verifications; one more answers `0 busy` |
 
 In `[lua]`:
 
@@ -186,7 +189,8 @@ In `[lua]`:
 | `OutgoingSCStudyConfirmed` | empty | Lua run when a received report makes a study confirmed for its sender (3.8) |
 
 The test harness uses some test-only keys. All default to 0 and are not for production:
-`SCTestDelayBeforeWrite`, `SCTestDelayAfterRead`, `SCTestQueueMax`, `SCTestFailDemote`.
+`SCTestDelayBeforeWrite`, `SCTestDelayAfterRead`, `SCTestQueueMax`, `SCTestFailDemote`,
+`SCTestFailFetch`.
 
 Changing a key needs a restart. Lowering a limit does not interrupt work in progress.
 
@@ -330,8 +334,10 @@ re-sent automatically. This covers:
 - `sc_unsafe_clear:` removes it. The command is refused while the queue is not empty, while a local
   write is in progress, or while the database is unreachable.
 - Before removing the file, `sc_unsafe_clear:` reconciles: every COMMITTED row whose object was
-  stored locally after `CommittedAt` becomes CHANGED. **(pending, branch `sco-verify`):** every row
-  of a reconciled object becomes CHANGED, whatever its state, and fetch errors abort the clear.
+  stored locally after `CommittedAt` becomes CHANGED (Gen + 1). Every other row of such an object
+  becomes CHANGED as well, whatever its state (also FAILED, TIMEOUT, HELD, CANCELLED, because a late
+  result could still make them COMMITTED); only rows already CHANGED stay as they are. A database
+  fetch error while the rows are read refuses the clear, and the sentinel stays.
 - SIGTERM, SIGINT and `quit:` stop the server cleanly.
 
 **Write-in-progress marks.** A local rewrite is marked from the moment its rows are demoted until
@@ -355,7 +361,16 @@ Console (OperatorConsole) lines are written for:
 - every re-send;
 - the daily OVERDUE alarm;
 - sentinel ALARMs;
-- queue overflow (one line per 1000 drops).
+- queue overflow (one line per 1000 drops);
+- `sc_verify_now` (3.9): one line per N-ACTION, one per result received or refused, and one summary
+  line per verification:
+
+```
+Storage commitment verify: request to <AE>, transaction <TxUID>, <n> object(s)
+Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association: <c> committed, <f> failed
+*** Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association refused (<reason>): the verification fails
+Storage commitment verify: study <StudyUID>, AE <AE>, <n> object(s), <k> chunk(s), transaction(s) <TxUID …|->, <s.mmm> s: <1|0 reason>
+```
 
 Lines starting with `***` are warnings or alarms.
 
@@ -373,12 +388,15 @@ All commands are guarded by `checkaccess(ca_script)`.
 | `sc_unsafe:` | `0`, or `1 <first reason line>` |
 | `sc_unsafe_clear:` | reconcile and remove the sentinel (see 3.6); `sc_overflow_clear:` is an alias |
 | `sc_overflow:` | `0`, `1 since <time> dropped <n>`, or `1 marked: <reason>` |
-| `sc_verify_now:<StudyUID>,<AE>[,<timeout>]` | `1`, or `0 <reason>` (3.9) **(pending)** |
+| `sc_verify_now:<StudyUID>,<AE>[,<timeout>]` | `1`, or `0 <reason>` (3.9) |
 
 Lua functions:
 - `scconfirmed(studyuid [, ae, …])` returns `true` or `false`, or `nil` on error. It returns
   `false` when `OutgoingStorageCommitment=0`.
-- `scverifynow(studyuid, ae [, timeout])` returns `true`, or `false, reason` **(pending)**.
+- `scverifynow(studyuid, ae [, timeout])` returns `true`, or `false, reason`. Default timeout 60 s.
+  Inside the server it calls the verification directly; outside (e.g. `dgate --dolua:`) it sends
+  `sc_verify_now:` to the server, where results on a new association arrive (no answer from the
+  server: `false, "no answer from the server"`). Bad arguments: `false, "usage"`.
 
 Hook: `[lua] OutgoingSCStudyConfirmed`
 - It runs after the N-EVENT-REPORT response has been sent, once for each study that this result made
@@ -393,13 +411,13 @@ Hook: `[lua] OutgoingSCStudyConfirmed`
 > hook are ADVISORY.** Use them for monitoring and to schedule work. **Do not delete on them.**
 >
 > Delete a study locally only when `sc_verify_now` (Lua `scverifynow`) returned `1` **immediately
-> before** the deletion. **(pending, branch `sco-verify`)**
+> before** the deletion.
 
 Successive reviews kept finding edge cases where the persistent state can be wrong: a crash, a
 database outage, a stop at the wrong moment, races with local rewrites. The fail-closed mechanisms
 in 3.6 make these cases rare and safe-side, but deletion needs a stronger guarantee.
 
-**What `sc_verify_now` does** (pending)
+**What `sc_verify_now` does**
 1. Reads the study's local objects from the image table, with a fingerprint of each file (name,
    size, modification and change time, inode, device).
    - No objects: answers `0 empty`.
@@ -422,15 +440,30 @@ The answer is `1` only after all six steps pass.
 **Properties**
 - Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel is neither read nor
   set.
-- Other answers: `0 busy` (more than `OutgoingSCVerifyMax` verifications running), `0 disabled`
-  (switch off), `0 database error`, `0 usage`.
-- Timeout: default 60 s, 1..600.
-- One console line per verification.
+- Other answers (any doubt answers `0`):
+
+| Answer | Cause |
+|---|---|
+| `0 disabled` | `OutgoingStorageCommitment=0`; nothing is sent |
+| `0 usage` | StudyUID or AE not valid, timeout not a number in 1..600 |
+| `0 busy` | `OutgoingSCVerifyMax` verifications already running |
+| `0 database error` | the local objects could not be read, including a fetch error (5) |
+| `0 no local file` / `0 invalid local object` | an object of the study has no readable file, or a bad or repeated UID |
+| `0 TLS not available for this node` | the entry has `T` and this build has no TLS: nothing is sent in plain text |
+| `0 no connection` | no association to the node (also a failed TLS handshake or certificate check) |
+| `0 storage commitment not accepted` | the node refused the storage commitment context |
+| `0 request not sent` / `0 no response to the request` / `0 request refused` | the N-ACTION could not be sent, got no N-ACTION-RSP, or got an error status |
+| `0 internal error (…)` | no random TransactionUID, out of memory |
+
+- Timeout: default 60 s, 1..600. It covers all chunks.
+- One console line per verification (3.7), plus one per request and per result.
 - What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). Content is
   not compared.
 - An object stored after the answer is not covered, so delete right after the answer.
 
-Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` **(pending)**
+Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` defines
+`sc_delete_if_verified(patid, study, ae [, timeout])` (default 120 s), which deletes with
+`deletestudy:` only on `true` and prints the reason otherwise. In short:
 
 ```lua
 local ok, why = scverifynow(study, 'ARCHIVE', 120)
@@ -475,8 +508,8 @@ sockets keep their old code paths exactly. TLS is built only with `-DHAVE_OPENSS
 | `TLSAcceptSelfSigned` | `0` | 1 = accept self-signed peer certificates in both directions. Only the "self-signed" errors are forgiven; expired, not yet valid, bad signature, wrong purpose and host mismatch still fail. Logged once per AE. |
 | `TLSNodeCertsFile` | empty | per-node certificate fingerprints (4.2) |
 | `TLSPort` | empty | TLS listener port, read like `TCPPort`; empty = none; equal to `TCPPort` = startup error and no listener; port in use = clear console line |
-| `TLSEnforceForMappedNodes` | `1` | with `TLSPort` set: a calling AE with `T` in the map is rejected on the plain port (A-ASSOCIATE-RJ) before any data |
-| `TLSLegacyPort` | empty | third listener with the legacy profile **(pending)**; equal to `TCPPort` or `TLSPort` = startup error, no legacy listener |
+| `TLSEnforceForMappedNodes` | `1` | with `TLSPort` or `TLSLegacyPort` set: a calling AE with `T` in the map is rejected on the plain port (A-ASSOCIATE-RJ) before any data; either TLS port satisfies it |
+| `TLSLegacyPort` | empty | third listener with the legacy profile (4.3), read like `TCPPort`; works without `TLSPort`; equal to `TCPPort` or `TLSPort` = startup error line, no legacy listener |
 
 The certificate, CA, verify, min-version, cipher and self-signed keys are read when the first TLS
 context is made, so changing them needs a restart. `TLSVerifyHostname` is read for each connection.
@@ -516,7 +549,7 @@ MODALITY1     ab:cd:...:01, 77e0...9c        # two during a certificate change
 - TLS 1.3 with the OpenSSL defaults.
 - Nothing older than 1.2.
 
-**Legacy profile** (`TL` outgoing, `TLSLegacyPort` incoming) **(pending, branch `sco-tls-legacy`)**.
+**Legacy profile** (`TL` outgoing, `TLSLegacyPort` incoming).
 It exists for OsiriX-class stations that implement the older DICOM TLS profile.
 - It is opt-in per node and per port, and uses separate client and server contexts.
 - Protocol: TLS 1.0 to 1.2.
@@ -533,22 +566,38 @@ It exists for OsiriX-class stations that implement the older DICOM TLS profile.
     `TLSAcceptSelfSigned=1` (an accepted SHA-1 signature is logged).
 - `TLSMinVersion` and `TLSCipherList` do not apply. The certificates, `TLSCAFile`, `TLSVerifyPeer`,
   `TLSAcceptSelfSigned`, `TLSVerifyHostname` and `TLSNodeCertsFile` apply as for `T`.
-- One console line per connection gives the protocol and cipher.
 - **Downgrade protection:** a calling AE whose map entry has `T` without `L` is rejected on
-  `TLSLegacyPort`. `TLSEnforceForMappedNodes` is satisfied by either TLS port.
+  `TLSLegacyPort`. `T` without `L` to a legacy-only receiver fails; it is never retried with the
+  legacy profile. `TLSEnforceForMappedNodes` is satisfied by either TLS port.
 
-**Interoperability note (OsiriX MD) (pending)**
+**TLS log lines (both profiles).** Every TLS connection that passes its checks gets one line in the
+normal dgate log, outgoing after the handshake and incoming after the calling AE checks:
+
+```
+TLS: connected to <AE> (<ip>): <protocol> <cipher>, <strict|legacy> profile, node certificate <matches TLSNodeCertsFile|not in TLSNodeCertsFile>
+TLS: incoming from <AE> (<ip>): <protocol> <cipher>, <strict|legacy> profile, node certificate <…>
+```
+
+e.g. `TLS: connected to OSIRIX1 (192.0.2.40): TLSv1 AES128-SHA, legacy profile, node certificate not
+in TLSNodeCertsFile`. A refused connection has no such line, only its `*** TLS: …` refusal line with
+the reason: handshake failure (OpenSSL's reason), node certificate mismatch, legacy policy
+(`*** TLS: legacy connection with <AE> (<ip>) refused: <reason>`), a T node on the plain port, or a
+T node without L on the legacy port (`*** TLS: association from <AE> (<ip>) on TLSLegacyPort
+rejected (<protocol> <cipher>): <AE> has T without L in acrnema.map, use TLSPort`).
+
+**Interoperability note (OsiriX MD)**
 - As measured, OsiriX MD negotiates only TLS 1.0 / 1.2 with AES-CBC suites, so it needs the legacy
   profile.
 - Its default identity is a 1024-bit RSA certificate. The legacy policy rejects that certificate
-  (the console hints "OsiriX default certificate?"), so it must be replaced by a 2048-bit identity.
+  (the refusal reason reads `peer certificate RSA 1024 bit < 2048 (OsiriX default certificate?
+  choose a 2048-bit identity)`), so it must be replaced by a 2048-bit identity.
 
 ### 4.4 Build without OpenSSL
 
 - A node with `T`: the connection is refused with a console line ("built without TLS support").
   **Nothing is sent in plain text.** In particular a T node gets no plain C-STORE, no plain
   N-ACTION (objects stay NOTED), and no plain re-send.
-- `TLSPort` set: a console line, and no listener.
+- `TLSPort` or `TLSLegacyPort` set: a console line, and no listener.
 - `read_tlscerts:`: a console line.
 - Everything else is identical to the previous version.
 
@@ -577,7 +626,9 @@ SC worker opens its own `Database` connection.
 - Every UID that goes into SQL is checked to be digits and dots, ≤ 64 characters. AE titles are
   checked to be printable, ≤ 16 characters, with no quote or backslash.
 - Tables from earlier development builds get the `Gen` column added (`ALTER TABLE … ADD`).
-- Fetch errors are told apart from end of data in reconciliation and verification **(pending)**.
+- A fetch error (`Database::FetchError`) is told apart from the end of the rows wherever the
+  reconciliation, `sc_unsafe_clear:`, `sc_verify_now:` and the confirmed check read rows: the clear
+  is refused, and the verification answers `0 database error`.
 
 ---
 
@@ -598,8 +649,8 @@ containers. Every commit keeps the compile warning count at the baseline.
 | Confirmed | all committed → 1; one not → 0; object added → 0; two AEs; AE case on MariaDB; switch 0; hook fires once |
 | Fail-closed | local overwrite after COMMITTED; queue not drained; overflow; DB failure during overwrite; unclean kill → sentinel; clean run → no sentinel; regen keeps COMMITTED; `sc_unsafe_clear:` reconciliation |
 | TLS | outgoing and incoming with and without client certificate; wrong CA; node certificate match / mismatch / damaged file; hostname check; self-signed on/off; T node on the plain port rejected; `TLSPort`=`TCPPort`; never plain fallback; build without OpenSSL; connect timeout to a black-hole address; ini cache concurrency stress |
-| Verify (pending) | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; TLS path; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged |
-| Legacy TLS (pending) | legacy client on `TLSLegacyPort` accepted and on `TLSPort` refused; NULL/RC4/3DES refused; `TL` to a legacy-only receiver; `T` without L to it refused; modern T node on the legacy port rejected; `L` without `T` warning |
+| Verify | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; TLS path; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged; Lua in the server and from a client; reconciliation of every state; simulated fetch error |
+| Legacy TLS | legacy client on `TLSLegacyPort` accepted and on `TLSPort` refused; NULL/RC4/EXPORT/DES/3DES/anonymous offers refused on both ports; `TL` to a legacy-only receiver; `T` without L to it refused, never plain; node certificate mismatch and weak key refused; modern T node on the legacy port rejected; `L` without `T` warning; `TLSLegacyPort` = `TCPPort` / `TLSPort`; `TLSLegacyPort` alone; build without OpenSSL; map option parse/format unit test |
 
 ---
 
@@ -702,8 +753,18 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `0b2eef5` Build variant line at startup (SC-in SC-out [TLS]); on the variant A branch, `c81c14d`
   Build variant line at startup (SC-in)
 
-**Pending (not yet on `sc-outgoing-tls`)**
-- branch `sco-verify`: `sc_verify_now:` / `scverifynow`, `OutgoingSCVerifyMax`, reconciliation of
-  every state, fetch errors, `lua/sc_delete_if_verified.lua`
-- branch `sco-tls-legacy`: `53101ca` outgoing legacy profile (map option `L`), `739be49`
-  `TLSLegacyPort` listener, `a22990e` legacy key and signature policy
+**Verify before delete** (from `sco-verify`)
+- `45972cb` Outgoing storage commitment: sc_verify_now: and Lua scverifynow, a fresh check before a local delete
+- `4df40ae` Outgoing storage commitment: the reconciliation of sc_unsafe_clear: covers every state
+- `0b95df0` Outgoing storage commitment: a fetch error is told from the end of the rows
+
+**Legacy TLS profile** (from `sco-tls-legacy`)
+- `d9f3805` Outgoing TLS legacy profile: map option L (TL) for OsiriX-class nodes
+- `e444925` Incoming TLS legacy profile: TLSLegacyPort listener for OsiriX-class callers
+- `a54b812` TLS legacy profile: certificate checks at level 1 and a post-handshake key/signature policy
+- `cb5716e` TLS log: one operator console line per TLS connection, strict and legacy
+- `d169a42` acrnema.map header: describe the 5th-column options (T, L, SC, R, Rn, RI)
+
+**Documentation**
+- `84404a9` Docs: storage commitment (incoming/outgoing) and DICOM TLS, and the commit that resolves
+  its pending items after the merge

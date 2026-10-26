@@ -167,6 +167,9 @@ class	StandardRetrieveNKI	:
 					        Array < DICOMDataObject *> *,
 						void *) = 0;
 		virtual	BOOL	QualifyOn ( BYTE *, BYTE *, BYTE *, BYTE *, BYTE * ) = 0;
+		// set by QualifyOn: the acrnema.map entry of the move destination, so that the
+		// sub-association takes address and transport (TLS) from one lookup
+		ACRNemaAddress	QualifiedEntry;
 		virtual	BOOL	CallBack (	DICOMCommandObject	*,
 						DICOMDataObject	* ) = 0;
 		BOOL	Read (	ExtendedPDU_Service *, DICOMCommandObject *, void *ExtraBytes, BOOL cget );

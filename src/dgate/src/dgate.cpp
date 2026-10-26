@@ -1351,6 +1351,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			of the wait (at least 1 s); a result that does not arrive in full aborts the association
 20261026	mmd	Outgoing storage commitment: TransactionUID built with bounded buffers (UID root read
 			with a length limit, snprintf, length <= 64 checked); no GenUID into a fixed buffer
+20261026	mmd	Outgoing TLS: every connect site resolves the destination once (GetACRNemaForConnect,
+			QualifyOn entry for C-MOVE): address and TLS come from the same acrnema.map entry
 
 ENDOFUPDATEHISTORY
 */
@@ -6029,7 +6031,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
 	q = strchr(line+offset, ' '); if (q) *q=0;
 	c=compress; 
 	if (compress[0]) c=dummy;
-	if(!GetACRNema(line+offset, (char *)host, (char *)port, (char *)c))
+	if(!GetACRNemaForConnect(PDU[part], line+offset, (char *)host, (char *)port, (char *)c))
         { // it does not exist: get host:port
 	  strcpy(host, line+offset);
           p = strchr(host, ':');
@@ -6117,7 +6119,6 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
           PDU[part].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
     
-          PrepareTLSForAE(PDU[part], line+offset);
           if (!PDU[part].Connect((unsigned char *)&host, (unsigned char *)&port))
           { OperatorConsole.printf("*** ExportConverter%d.%d: Forward failed to connect to host %s\n", N, part, line+offset);
             delete DDO;
@@ -10476,7 +10477,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
       q = strchr(line+offset, ' '); if (q) *q=0;
       c=compress; 
       if (compress[0]) c=dummy;
-      if(!GetACRNema(line+offset, (char *)host, (char *)port, (char *)c))
+      if(!GetACRNemaForConnect(PDU[channel], line+offset, (char *)host, (char *)port, (char *)c))
       { strcpy(host, line+offset);
         p = strchr(host, ':');
         if (p) 
@@ -10562,7 +10563,6 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
         uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
         PDU[channel].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
   
-        PrepareTLSForAE(PDU[channel], line+offset);
         if (!PDU[channel].Connect((unsigned char *)&host, (unsigned char *)&port))
         { if (N >= -2) OperatorConsole.printf("*** %sConverter%d.%d: Forward failed to connect to host %s\n", ininame, N, channel, line+offset);
         }
@@ -12558,12 +12558,11 @@ static int DcmMove(const char *patid, char* pszSourceAE, char* pszDestinationAE,
 		}
 	else
 		{
-		if(!GetACRNema(pszSourceAE, (char *)host, (char *)port, (char *)compr)) 
+		if(!GetACRNemaForConnect(PDU, pszSourceAE, (char *)host, (char *)port, (char *)compr))
 			{
 			OperatorConsole.printf("***preretrieve: AE not found: %s\n", pszSourceAE);
 			return 1; 	// wrong address no retry
 			}
-		PrepareTLSForAE(PDU, pszSourceAE);
 		if(!PDU.Connect(host, port)) 
 			{
 			OperatorConsole.printf("***preretrieve: could not connect to AE: %s\n", pszSourceAE);
@@ -12787,7 +12786,7 @@ char *DcmMove2(char* pszSourceAE, const char* pszDestinationAE, BOOL patroot, in
 		}
 	else
 		{
-		if(!GetACRNema(pszSourceAE, (char *)host, (char *)port, (char *)compr)) 
+		if(!GetACRNemaForConnect(PDU, pszSourceAE, (char *)host, (char *)port, (char *)compr))
 			{
 			OperatorConsole.printf("***dicommove: AE not found: %s\n", pszSourceAE);
 			sprintf(StatusString, "***dicommove: AE not found: %s", pszSourceAE);
@@ -12795,8 +12794,7 @@ char *DcmMove2(char* pszSourceAE, const char* pszDestinationAE, BOOL patroot, in
 			strcpy(retvalue, StatusString);
 			return retvalue;
 			}
-		PrepareTLSForAE(PDU, pszSourceAE);
-		if(!PDU.Connect(host, port)) 
+		if(!PDU.Connect(host, port))
 			{
 			OperatorConsole.printf("***dicommove: could not connect to AE: %s\n", pszSourceAE);
 			sprintf(StatusString, "***dicommove: could not connect to AE: %s", pszSourceAE);
@@ -16182,7 +16180,7 @@ int VirtualQuery(DICOMDataObject *DDO, const char *Level, int N, Array < DICOMDa
 	ExtendedPDU_Service PDU;
 	PDU.AttachRTC(&VRType);
 
-	if(!GetACRNema(AE, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU, AE, (char *)ip, (char *)port, (char *)compress))
 		return 0;
 
 	// 20070103
@@ -16233,7 +16231,6 @@ int VirtualQuery(DICOMDataObject *DDO, const char *Level, int N, Array < DICOMDa
 	PDU.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
-	PrepareTLSForAE(PDU, AE);
 	if(!PDU.Connect(ip, port))
 		{
 		OperatorConsole.printf("*** Virtual query - failed to connect for C-FIND to %s\n", AE);
@@ -19196,7 +19193,7 @@ BOOL VirtualServer2(struct ReadAheadThreadData *ratd, int N)
 	OperatorConsole.printf("Virtual server - collecting %d missing objects from %s\n", ratd->filesmissing, AE);
 
 	PDU2.AttachRTC(&VRType);
-	if(!GetACRNema(AE, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU2, AE, (char *)ip, (char *)port, (char *)compress))
 		return FALSE;
 
 	PDU2.ClearAbstractSyntaxs();
@@ -19215,7 +19212,6 @@ BOOL VirtualServer2(struct ReadAheadThreadData *ratd, int N)
         PDU2.SetTimeOut(TCPIPTimeOut);
 
 	// Make association for MOVE on port/ip
-	PrepareTLSForAE(PDU2, AE);
 	if(!PDU2.Connect(ip, port))
 		{
 		PDU2.Close();
@@ -20209,8 +20205,9 @@ BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
 	return PDU.SetTLS(1, E.Name);
 	}
 
-// The same for a destination given by its AE title, as the connect sites use it
-// after GetACRNema. An AE that is not in the map (e.g. host:port) stays plain.
+// The same for a destination given by its AE title. An AE that is not in the map
+// (e.g. host:port) stays plain. NOT for connect sites: it is a second map lookup
+// after the address was resolved; use GetACRNemaForConnect there (fix round 1).
 BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE)
 	{
 	ACRNemaAddress	E;
@@ -20226,6 +20223,45 @@ BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE)
 		return PDU.SetTLS(0, NULL);
 	strcpy(E.Name, ae);		// a wildcard entry: the pin key uses the called AE
 	return SCPrepareTLS(PDU, E);
+	}
+
+// Connect sites (fix round 1): resolve the called AE ONCE and take address, port,
+// compression AND transport from that single map entry. GetACRNema followed by a
+// second lookup for the TLS flag could see two map versions (read_amap/put_amap in
+// between) and connect to the old address with the new entry's transport, so a node
+// with T could get plain text. Same matching and results as GetACRNema (ip/port/
+// compress copied as GetACRNema copies them); returns FALSE, with the transport set
+// to plain, when the AE is not in the map: the caller's host:port fallback stays plain
+// as before. compress may be NULL.
+BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char *compress)
+	{
+	ACRNemaAddress	E;
+
+	PDU.SetTLS(0, NULL);
+	if (!AE || !GetACRNemaEntryByAE(AE, &E))
+		return FALSE;
+	strcpy(ip, E.IP);
+	strcpy(port, E.Port);
+	if (compress)
+		strcpy(compress, E.Compress);
+	SCPrepareTLSForCalledAE(PDU, E, AE);
+	return TRUE;
+	}
+
+// The transport of PDU from map entry E (one lookup done by the caller) for called AE
+// title AE (it selects TLSPin_<AE>; for a wildcard entry the pin is that of the called AE).
+BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE)
+	{
+	ACRNemaAddress	EE = E;
+	char		ae[20];
+
+	memset(ae, 0, sizeof(ae));
+	if (AE)
+		strncpy(ae, AE, sizeof(ae)-1);
+	while (ae[0] && (ae[strlen(ae)-1]==' ' || ae[strlen(ae)-1]=='\t' || ae[strlen(ae)-1]=='\r' || ae[strlen(ae)-1]=='\n'))
+		ae[strlen(ae)-1] = 0;
+	strcpy(EE.Name, ae);
+	return SCPrepareTLS(PDU, EE);
 	}
 
 // TLS lines from the socket layer go to the operator console or the debug log
@@ -20811,16 +20847,26 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	return TRUE;
 	}
 
+// Entry (optional): the map entry the address came from, with Name = the move
+// destination as looked up (before SendUpperCaseAE), so that the C-MOVE
+// sub-association takes its transport from the same lookup (fix round 1)
 BOOL
 QualifyOn(
 	BYTE	*ACRNema,
 	BYTE	*MyACRNema,
 	BYTE	*RemoteIP,
 	BYTE	*RemotePort,
-	BYTE	*Compress)
+	BYTE	*Compress,
+	ACRNemaAddress *Entry = NULL)
 	{
+	ACRNemaAddress	E;
+
 	strcpy((char*)MyACRNema, (char*)MYACRNEMA);
-	if(!GetACRNema((char*)ACRNema, (char*)RemoteIP, (char*)RemotePort, (char*)Compress))
+	if (Entry)
+		{
+		memset(Entry, 0, sizeof(*Entry));
+		}
+	if(!GetACRNemaEntryByAE((char*)ACRNema, &E))
 		{
 		return FALSE;	// use "*	*	104	un" in acrnema.map to emulate this
 
@@ -20832,6 +20878,15 @@ QualifyOn(
 		SystemDebug.printf("(QualifyOn) (anonymous) IP:%s, PORT:%s\n", RemoteIP,RemotePort);
 		return ( TRUE );
 		*/
+		}
+	strcpy((char*)RemoteIP, E.IP);			// as GetACRNema copies them
+	strcpy((char*)RemotePort, E.Port);
+	strcpy((char*)Compress, E.Compress);
+	if (Entry)
+		{
+		*Entry = E;
+		memset(Entry->Name, 0, sizeof(Entry->Name));
+		strncpy(Entry->Name, (char*)ACRNema, sizeof(Entry->Name)-1);
 		}
 
 	/* GetACRNema is able to discern upper and lower case, so that when two different
@@ -20866,7 +20921,7 @@ BOOL	MyPatientRootRetrieveNKI	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyPatientRootRetrieveGeneric	::	QualifyOn (
@@ -20876,7 +20931,7 @@ BOOL	MyPatientRootRetrieveGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyPatientRootGetGeneric	::	QualifyOn (
@@ -20886,7 +20941,7 @@ BOOL	MyPatientRootGetGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyStudyRootRetrieve	::	QualifyOn (
@@ -20906,7 +20961,7 @@ BOOL	MyStudyRootRetrieveNKI	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyStudyRootRetrieveGeneric	::	QualifyOn (
@@ -20916,7 +20971,7 @@ BOOL	MyStudyRootRetrieveGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyStudyRootGetGeneric	::	QualifyOn (
@@ -20926,7 +20981,7 @@ BOOL	MyStudyRootGetGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyPatientStudyOnlyRetrieve	::	QualifyOn (
@@ -20946,7 +21001,7 @@ BOOL	MyPatientStudyOnlyRetrieveNKI	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyPatientStudyOnlyRetrieveGeneric	::	QualifyOn (
@@ -20956,7 +21011,7 @@ BOOL	MyPatientStudyOnlyRetrieveGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	MyPatientStudyOnlyGetGeneric	::	QualifyOn (
@@ -20966,7 +21021,7 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	QualifyOn (
 	BYTE	*RemotePort,
 	BYTE	*Compress)
 	{
-	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress));
+	return(::QualifyOn(ACRNema, MyACRNema, RemoteIP, RemotePort, Compress, &QualifiedEntry));
 	}
 
 BOOL	RunTimeClassStorage :: GetUID ( UID	&uid )
@@ -21352,7 +21407,7 @@ void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Ser
 
   PDU2.AttachRTC(&VRType);
 
-  if(!GetACRNema(server, (char *)host, (char *)port, (char *)compress))
+  if(!GetACRNemaForConnect(PDU2, server, (char *)host, (char *)port, (char *)compress))
   { strcpy(host, server);
     p = strchr(host, ':');
     if (p) 
@@ -21392,7 +21447,6 @@ void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Ser
   PDU2.AddAbstractSyntax ( iUID );
   PDU2.SetTimeOut(TCPIPTimeOut);
 
-  PrepareTLSForAE(PDU2, server);
   if (!PDU2.Connect((unsigned char *)&host, (unsigned char *)&port))
   { OperatorConsole.printf("*** Test forward: Forward failed to connect to host %s\n", server);
     delete pDDO;
@@ -22344,7 +22398,7 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 		  while (strlen(Calling) && Calling[strlen(Calling)-1]==' ') Calling[strlen(Calling)-1] = 0;
 
 		PDU2.AttachRTC(&VRType);
-		if(!GetACRNema(Calling, (char *)ip, (char *)port, (char *)compress))
+		if(!GetACRNemaForConnect(PDU2, Calling, (char *)ip, (char *)port, (char *)compress))
 			{
 			OperatorConsole.printf("*** Storage commitment - host not found: %s\n", Calling);
 			return FALSE;
@@ -22370,7 +22424,6 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 		PDU2.SetTimeOut(TCPIPTimeOut);
 
 		// Make new association for EVENT on port/ip
-		PrepareTLSForAE(PDU2, Calling);
 		if(!PDU2.Connect(ip, port))
 			{
 			OperatorConsole.printf("*** Storage commitment - failed to reconnect to %s (%s %s) for N-EVENT\n", Calling, ip, port);
@@ -29890,9 +29943,10 @@ BOOL GrabImagesFromServer(BYTE *calledae, const char *studydate, char *destinati
 	PDU.AttachRTC(&VRType);
 	PDU2.AttachRTC(&VRType);
 
-	if(!GetACRNema((char *)calledae, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU, (char *)calledae, (char *)ip, (char *)port, (char *)compress))
 		return FALSE;
-		
+	PDU2.SetTLS(PDU.Link.TLSMode, PDU.Link.TLSPeerAE);	// same entry for the C-MOVE association
+
 	// Start setting up connection for C-FIND
 	PDU.ClearAbstractSyntaxs();
 	PDU.SetLocalAddress(MYACRNEMA);
@@ -29919,7 +29973,6 @@ BOOL GrabImagesFromServer(BYTE *calledae, const char *studydate, char *destinati
         PDU2.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
-	PrepareTLSForAE(PDU, (char *)calledae);
 	if(!PDU.Connect(ip, port))
 		{
 		OperatorConsole.printf("*** Grab - failed to connect for C-FIND\n");
@@ -29927,7 +29980,6 @@ BOOL GrabImagesFromServer(BYTE *calledae, const char *studydate, char *destinati
 		}
 
 	// Make the association for the MOVE on port/ip
-	PrepareTLSForAE(PDU2, (char *)calledae);
 	if(!PDU2.Connect(ip, port))
 		{
 		PDU.Close();
@@ -30309,10 +30361,9 @@ static BOOL DcmEcho(const char *AE)
 	uid.Set("1.2.840.10008.1.1");		// Verification
 	PDU.AddAbstractSyntax(uid);
 
-	if(!GetACRNema((char *)AE, (char *)host, (char *)port, (char *)compr)) 
+	if(!GetACRNemaForConnect(PDU, (char *)AE, (char *)host, (char *)port, (char *)compr))
 		return FALSE;
-	
-	PrepareTLSForAE(PDU, AE);
+
 	if(!PDU.Connect(host, port))
 		return ( FALSE );
 	
@@ -32960,7 +33011,7 @@ char *heapinfo( void )
 	ExtendedPDU_Service PDU;
 	PDU.AttachRTC(&VRType);
 
-	if(!GetACRNema((char *)ae, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU, (char *)ae, (char *)ip, (char *)port, (char *)compress))
 		return 0;
 
 	PDU.ClearAbstractSyntaxs();
@@ -32992,7 +33043,6 @@ char *heapinfo( void )
 	PDU.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
-	PrepareTLSForAE(PDU, ae);
 	if(!PDU.Connect(ip, port))
 		return ( 0 );
 
@@ -33175,8 +33225,9 @@ static int PrintGrayScaleImages (
 	Array < DICOMDataObject *>	*ADDO,
 	char	*FilmFormat,
 	char	*AnnotationText,
-	char	*FilmOrientation, 
-	lua_State *L)
+	char	*FilmOrientation,
+	lua_State *L,
+	ACRNemaAddress *Entry)
 	{
 	UID	aBasicFilmSessionSOPClassUID("1.2.840.10008.5.1.1.1");
 	UID	aBasicFilmBoxSOPClassUID("1.2.840.10008.5.1.1.2");
@@ -33234,7 +33285,7 @@ static int PrintGrayScaleImages (
 	if (atoi(callback)) 
 	   Progress.printf("Process=%d, Type='dicomprint', Active=1\n", atoi(callback));
 
-	PrepareTLSForAE(PDU, (char *)RemoteAE);
+	SCPrepareTLSForCalledAE(PDU, *Entry, (char *)RemoteAE);	// the entry RemoteHost/Port came from
 	if(!PDU.Connect((BYTE *)RemoteHost, (BYTE *)RemotePort))
 		{
 		if (atoi(callback)) 
@@ -33639,9 +33690,13 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
   char		szFilmOrientation[30] = "PORTRAIT";
   char*		pszExtraOption;
   unsigned char ip[64], port[64], compress[64];
+  ACRNemaAddress E;
 
-  if(!GetACRNema((char *)pszRemoteAE, (char *)ip, (char *)port, (char *)compress))
+  if(!GetACRNemaEntryByAE((char *)pszRemoteAE, &E))	// one lookup: address and transport
 	return 0;
+  strcpy((char *)ip, E.IP);
+  strcpy((char *)port, E.Port);
+  strcpy((char *)compress, E.Compress);
   
   /* Create default ImageDisplayFormat */
   switch (pADDO->GetSize())
@@ -33676,7 +33731,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	pADDO,
 	szImageDisplayFormat,
 	pszAnnotation,
-	szFilmOrientation, L);
+	szFilmOrientation, L, &E);
   return rc;
 }
 
@@ -33735,7 +33790,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	ExtendedPDU_Service PDU;
 	PDU.AttachRTC(&VRType);
 
-	if(!GetACRNema((char *)ae, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU, (char *)ae, (char *)ip, (char *)port, (char *)compress))
         { // it does not exist: get host:port
           strcpy((char *)ip, (char *)ae);
           char *p = strchr((char *)ip, ':');
@@ -33767,8 +33822,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 
 	PDU.SetTimeOut(TCPIPTimeOut);
 
-	// Make the association for the FIND on port/ip
-	PrepareTLSForAE(PDU, ae);
+	// Make the association for the FIND on port/ip (transport set by GetACRNemaForConnect)
 	if(!PDU.Connect(ip, port))
 	  return ( 0 );
 
@@ -33823,8 +33877,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	// SM1312+Claude
 	PDU.SetRequestedCompressionType("");
 
-	// Make the association for the GET on port/ip
-	PrepareTLSForAE(PDU, ae);
+	// Make the association for the GET on port/ip (same PDU: transport kept from the lookup)
 	if(!PDU.Connect(ip, port))
         { delete P;
           delete P2;
@@ -33884,7 +33937,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	ExtendedPDU_Service PDU;
 	PDU.AttachRTC(&VRType);
 
-	if(!GetACRNema((char *)ae, (char *)ip, (char *)port, (char *)compress))
+	if(!GetACRNemaForConnect(PDU, (char *)ae, (char *)ip, (char *)port, (char *)compress))
         { strcpy((char *)ip, (char *)ae);
           char *p = strchr((char *)ip, ':');
           if (p) 
@@ -33916,7 +33969,6 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
         PDU.AddAbstractSyntax(uid);		// assures connect will not 
 
-	PrepareTLSForAE(PDU, ae);
 	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
         { OperatorConsole.printf("*** dicomstore: failed to connect to host %s\n", ae);
           lua_pushstring(L, "Failed to connect to host");
@@ -33999,7 +34051,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
     uid.Set("1.2.840.10008.1.1");	// Verification
     PDU.AddAbstractSyntax(uid);
     
-    if(!GetACRNema((char *)ae, (char *)host, (char *)port, (char *)compr)) 
+    if(!GetACRNemaForConnect(PDU, (char *)ae, (char *)host, (char *)port, (char *)compr))
     { // it does not exist: get host:port
       strcpy((char *)host, (char *)ae);
       char *p = strchr((char *)host, ':');
@@ -34012,7 +34064,6 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
       strcpy((char *)compr, "UN");
     }
     
-    PrepareTLSForAE(PDU, ae);
     if(!PDU.Connect(host, port))
     	return ( FALSE );
     

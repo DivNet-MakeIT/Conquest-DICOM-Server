@@ -1347,6 +1347,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			requests are used up) with OutgoingSCResendMissing 1 as well as 2; never TIMEOUT
 20261026	mmd	Outgoing storage commitment: REQUESTED objects past OutgoingSCDeadline (not RI) become
 			TIMEOUT on the next pass (transaction ABANDONED), not only after OutgoingSCReportTimeout
+20261026	mmd	Outgoing storage commitment: reads during OutgoingSCSameAssocWait are bounded by the rest
+			of the wait (at least 1 s); a result that does not arrive in full aborts the association
 
 ENDOFUPDATEHISTORY
 */
@@ -24324,9 +24326,90 @@ class SCAssocPDU : public PDU_Service
 	public:	BOOL	Pending() { return InSize>0 || PDataTF::Length!=0; }
 	};
 
+// socket time limit for the next read during the same-association wait: what is left of the
+// wait, at least 1 s (0 would mean "do not wait" to the socket layer)
+static void SCWaitBudget(SCAssocPDU &PDU, time_t until)
+	{
+	long left = (long)(until - time(NULL));
+	if (left < 1) left = 1;
+	PDU.SetTimeOut((int)left);
+	}
+
+// Watchdog for the reads of the same-association wait. The DICOM PDU reader goes on reading
+// after a socket read has timed out (the stream operators ignore the failure), so a time limit
+// per read does not end a message that stalls halfway. At the end of the wait the watchdog shuts
+// the connection down (both directions, plain or TLS); every further read then fails at once.
+// It never touches a connection that is no longer being read: the reader clears active under the
+// lock before the association is closed, and the watchdog frees its record after that.
+struct SCWatch { int fd; time_t until; int active; int fired; };
+static CRITICAL_SECTION	SCWatchCritical;
+static struct SCWatchCriticalInit
+	{
+	SCWatchCriticalInit() { InitializeCriticalSection(&SCWatchCritical); }
+	}	SCWatchCriticalInitObject;
+
+static BOOL WINAPI SCWatchThread(void *arg)
+	{
+	SCWatch *w = (SCWatch *)arg;
+	for (;;)
+		{
+		EnterCriticalSection(&SCWatchCritical);
+		if (!w->active)
+			{
+			LeaveCriticalSection(&SCWatchCritical);
+			free(w);
+			return TRUE;
+			}
+		if (!w->fired && time(NULL) >= w->until)
+			{
+			shutdown(w->fd, 2);		// SHUT_RDWR / SD_BOTH
+			w->fired = 1;
+			}
+		LeaveCriticalSection(&SCWatchCritical);
+		Sleep(100);
+		}
+	}
+
+// start a watchdog for connection fd until 'until'; NULL when no thread could be started (the
+// reads are then bounded per read only)
+static SCWatch *SCStartWatch(int fd, time_t until)
+	{
+	SCWatch *w = (SCWatch *)malloc(sizeof(SCWatch));
+	if (!w) return NULL;
+	w->fd = fd; w->until = until; w->active = 1; w->fired = 0;
+#ifdef WIN32
+	unsigned long ThreadID;
+	HANDLE h = CreateThread(NULL, 0x10000, (LPTHREAD_START_ROUTINE) SCWatchThread, w, 0, &ThreadID);
+	if (!h) { free(w); return NULL; }
+	CloseHandle(h);
+#else
+	pthread_t ThreadID;
+	if (pthread_create(&ThreadID, NULL, (void*(*)(void*))SCWatchThread, (void *)w)!=0) { free(w); return NULL; }
+	pthread_detach(ThreadID);
+#endif
+	return w;
+	}
+
+// stop the watchdog (it frees its record); TRUE when it shut the connection down
+static BOOL SCStopWatch(SCWatch *w)
+	{
+	BOOL fired;
+	if (!w) return FALSE;
+	EnterCriticalSection(&SCWatchCritical);
+	fired = w->fired;
+	w->active = 0;
+	LeaveCriticalSection(&SCWatchCritical);
+	return fired;
+	}
+
 // After an accepted N-ACTION: wait up to OutgoingSCSameAssocWait seconds for the result on
 // this association; an N-EVENT-REPORT of the storage commitment class is checked and
 // recorded by SCProcessEventReport and answered. Returns FALSE when the link is gone.
+// The reads of a message that starts within the wait are bounded by what is left of it (at
+// least 1 s): the socket time limit is set to it for every read (and set back to TCPIPTimeOut
+// afterwards), and a watchdog shuts the connection down at that time. A message that does not
+// arrive in full in time thus makes the reads fail: the association is aborted (SCSendAction
+// closes the link), and the destination has to send the result on a new association.
 static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 	{
 	DICOMCommandObject ECO;
@@ -24349,14 +24432,35 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 		Sleep(100);
 		}
 
-	if (!PDU.Read(&ECO)) return FALSE;	// released or aborted by the other side
-	if (ECO.GetUINT16(0x0000, 0x0100)!=0x0100 || !SCVRString(ECO.GetVR(0x0000, 0x0002), Sop, sizeof(Sop)) ||
-	    strcmp(Sop, "1.2.840.10008.1.20.1")!=0)
+	// a message has started: read it within the rest of the wait (at least 1 s)
+	if (until < time(NULL) + 1) until = time(NULL) + 1;
+	SCWatch *watch = SCStartWatch(PDU.Link.Socketfd, until);
+	BOOL	ok, sc = FALSE, fired;
+	SCWaitBudget(PDU, until);
+	ok = PDU.Read(&ECO);			// FALSE: released or aborted by the other side, or too slow
+	if (ok)
+		{
+		sc = ECO.GetUINT16(0x0000, 0x0100)==0x0100 && SCVRString(ECO.GetVR(0x0000, 0x0002), Sop, sizeof(Sop)) &&
+		     strcmp(Sop, "1.2.840.10008.1.20.1")==0;
+		if (sc)
+			{
+			SCWaitBudget(PDU, until);
+			ok = EventRequest.Read(&ECO, &PDU, &EDO);
+			}
+		}
+	fired = SCStopWatch(watch);
+	PDU.SetTimeOut(TCPIPTimeOut);
+	if (fired || !ok)
+		{
+		if (fired || time(NULL)>=until)
+			OperatorConsole.printf("*** Storage commitment: no complete message from %s within the same-association wait (association aborted)\n", ae);
+		return FALSE;
+		}
+	if (!sc)
 		{
 		OperatorConsole.printf("*** Storage commitment: unexpected message from %s on the request association\n", ae);
 		return TRUE;
 		}
-	if (!EventRequest.Read(&ECO, &PDU, &EDO)) return FALSE;
 	eventid = ECO.GetUINT16(0x0000, 0x1002);
 	if (!SCVRUID(ECO.GetVR(0x0000, 0x1000), Inst) || strcmp(Inst, "1.2.840.10008.1.20.1.1")!=0)
 		{

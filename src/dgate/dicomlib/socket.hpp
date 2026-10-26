@@ -103,6 +103,7 @@ class	Socket
 		BOOL	TLSAccept(int fd, const char *peer);
 	private:
 		BOOL	TLSOpen(char *host);
+		int	TLSConnect(long end);
 		void	TLSFree(BOOL SendCloseNotify);
 		int	TLSWait(int ForWrite, int Seconds);
 		BOOL	TLSSend(BYTE *, UINT);

@@ -1356,6 +1356,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	TLS fixes: bounded TLS connect, locks for warnings and contexts, verify mode per
 			connection; incoming checks use one canonical calling AE form on both ports, pins found
 			without regard to case; TLS ini values read through cache-size buffers
+20261026	mmd	TLSAcceptSelfSigned (default 0): 1 accepts self-signed peer certificates (both
+			directions; only the self-signed errors are forgiven), logged once per AE
 
 ENDOFUPDATEHISTORY
 */
@@ -20185,6 +20187,19 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //                      optional, comma separated); when set, the certificate must match one
 //                      (outgoing: the server certificate of AE; incoming: the client
 //                      certificate of calling AE AE)
+//   TLSAcceptSelfSigned 0 (default) | 1: 0 = a self-signed peer certificate is accepted only
+//                      when it (or its issuer) is in TLSCAFile (normal chain verification).
+//                      1 = also accept a self-signed peer certificate (outgoing: server of a
+//                      T node; incoming: client on TLSPort): only the verification errors
+//                      "self-signed certificate" and "self-signed certificate in chain" are
+//                      forgiven; expired, not yet valid, bad signature (also of the self-signed
+//                      certificate itself), wrong purpose and a host name mismatch
+//                      (TLSVerifyHostname = 1) still fail. TLSPin_<AE> still applies on top.
+//                      Once per AE and process a console line says that a self-signed
+//                      certificate was accepted; without TLSPin_<AE> it says that the identity
+//                      is NOT verified (anyone can make a self-signed certificate). With 1,
+//                      TLSCAFile may be empty (then only self-signed peers are accepted).
+//                      Read with the other keys when the TLS context is made.
 // Incoming (step 4b):
 //   TLSPort            port of the TLS listener, read like TCPPort; empty (default) = none;
 //                      equal to TCPPort = startup error, no TLS listener
@@ -20406,13 +20421,34 @@ static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
 	return TRUE;
 	}
 
+// Verify callback of both contexts. With TLSAcceptSelfSigned = 1 (kept in the context's
+// app data, so each connection reads its own context: no global) the two self-signed
+// errors are forgiven and the connection is marked (SSL app data) so that the log line
+// and the pin check after the handshake know it. Every other error keeps failing.
+static	int	TLSVerifyCallback(int ok, X509_STORE_CTX *x)
+	{
+	SSL	*ssl;
+	int	err;
+
+	if (ok)
+		return 1;
+	err = X509_STORE_CTX_get_error(x);
+	if (err != X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT && err != X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN)
+		return 0;
+	ssl = (SSL *) X509_STORE_CTX_get_ex_data(x, SSL_get_ex_data_X509_STORE_CTX_idx());
+	if (!ssl || !SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)) || SSL_get_verify_mode(ssl)==SSL_VERIFY_NONE)
+		return 0;			// TLSAcceptSelfSigned = 0 (or not verifying at all): as before
+	SSL_set_app_data(ssl, (void *) 1);	// this connection: a self-signed certificate was accepted
+	return 1;
+	}
+
 // Make the client (server=FALSE) or server (server=TRUE, incoming TLSPort) SSL_CTX
 // from dicom.ini. Returns NULL (with a console line) on any configuration problem,
 // so that T nodes are refused, or no TLS listener started, rather than half secured.
 static	SSL_CTX	*TLSMakeContext(BOOL server)
 	{
 	const char	*side = server ? "server" : "client";
-	char	cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
+	char	cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256], selfsigned[32];
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
 	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore (this context only)
@@ -20423,6 +20459,7 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 	TLSIni("TLSVerifyPeer", "require", verify, sizeof(verify));
 	TLSIni("TLSMinVersion", "1.2", minv, sizeof(minv));
 	TLSIni("TLSCipherList", "", ciphers, sizeof(ciphers));
+	TLSIni("TLSAcceptSelfSigned", "0", selfsigned, sizeof(selfsigned));
 
 	if      (stricmp(verify, "require")==0) TLSVerifyMode = 2;
 	else if (stricmp(verify, "verify")==0)  TLSVerifyMode = 1;
@@ -20492,18 +20529,29 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 			if (names) SSL_CTX_set_client_CA_list(ctx, names);
 			}
 		}
-	else if (TLSVerifyMode)
+	else if (TLSVerifyMode && !atoi(selfsigned))
 		{
-		OperatorConsole.printf("*** TLS: TLSCAFile is needed unless TLSVerifyPeer = ignore\n");
+		OperatorConsole.printf("*** TLS: TLSCAFile is needed unless TLSVerifyPeer = ignore (or TLSAcceptSelfSigned = 1)\n");
 		SSL_CTX_free(ctx);
 		return NULL;
 		}
+
+	// TLSAcceptSelfSigned: flag in the context for the verify callback; the signature of a
+	// self-signed certificate is then checked too (OpenSSL skips it by default)
+	if (atoi(selfsigned))
+		{
+		SSL_CTX_set_app_data(ctx, (void *) 1);
+		X509_VERIFY_PARAM_set_flags(SSL_CTX_get0_param(ctx), X509_V_FLAG_CHECK_SS_SIGNATURE);
+		OperatorConsole.printf("TLS: TLSAcceptSelfSigned = 1: self-signed %s certificates are accepted (set TLSPin_<AE> for such nodes)\n", server ? "client" : "server");
+		}
+	else
+		SSL_CTX_set_app_data(ctx, NULL);
 
 	if (server)
 		{
 		// client certificate: require = must be sent and valid, verify = valid when sent
 		SSL_CTX_set_verify(ctx, TLSVerifyMode==2 ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT :
-					TLSVerifyMode==1 ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+					TLSVerifyMode==1 ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, TLSVerifyCallback);
 		// every association is a full handshake: no session cache, no TLS 1.3 tickets
 		SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 		SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"dgate", 5);
@@ -20515,7 +20563,7 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 		}
 	else
 		{
-		SSL_CTX_set_verify(ctx, TLSVerifyMode ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+		SSL_CTX_set_verify(ctx, TLSVerifyMode ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, TLSVerifyCallback);
 		if (!TLSVerifyMode)
 			OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: server certificates are not verified\n");
 		}
@@ -20546,20 +20594,40 @@ static	struct	TLSWarnCriticalInit
 	{
 	TLSWarnCriticalInit() { InitializeCriticalSection(&TLSWarnCritical); }
 	}	TLSWarnCriticalInitObject;
-static	void	TLSWarnUnbound(const char *AE)
+// TRUE the first time (kind, AE) is seen in this process (always TRUE once 128 are kept)
+static	BOOL	TLSFirstTime(char kind, const char *AE)
 	{
-	static char	warned[64][20];
+	static char	warned[128][20];
 	static int	nwarned = 0;
+	char		item[20];
 	BOOL		known = FALSE;
 
+	snprintf(item, sizeof(item), "%c%s", kind, AE);
 	EnterCriticalSection(&TLSWarnCritical);
 	for (int i=0; i<nwarned && !known; i++)
-		if (strcmp(warned[i], AE)==0) known = TRUE;
-	if (!known && nwarned<64) { strncpy(warned[nwarned], AE, 19); warned[nwarned][19] = 0; nwarned++; }
+		if (strcmp(warned[i], item)==0) known = TRUE;
+	if (!known && nwarned<128) { strcpy(warned[nwarned], item); nwarned++; }
 	LeaveCriticalSection(&TLSWarnCritical);
-	if (known)
+	return !known;
+	}
+
+static	void	TLSWarnUnbound(const char *AE)
+	{
+	if (!TLSFirstTime('U', AE))
 		return;
 	OperatorConsole.printf("*** TLS: %s is accepted on any certificate signed by a CA in TLSCAFile (no TLSPin_%s, TLSVerifyHostname = 0); use a dedicated DICOM CA or set a pin\n", AE, AE);
+	}
+
+// Once per AE and process, when the verify callback accepted a self-signed certificate
+// for this connection (TLSAcceptSelfSigned = 1). pinned: TLSPin_<AE> is set (and checked).
+static	void	TLSNoteSelfSigned(SSL *ssl, const char *AE, const char *peer, BOOL pinned)
+	{
+	if (!SSL_get_app_data(ssl) || !TLSFirstTime(pinned ? 'P' : 'S', AE))
+		return;
+	if (pinned)
+		OperatorConsole.printf("TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1); identity checked by TLSPin_%s\n", AE, peer, AE);
+	else
+		OperatorConsole.printf("*** TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1) WITHOUT TLSPin_%s: the identity of %s is NOT verified (anyone can make a self-signed certificate); set TLSPin_%s\n", AE, peer, AE, AE, AE);
 	}
 
 // TLSVerifyHostname from dicom.ini
@@ -20669,7 +20737,8 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	if (!pins[0])
 		{
 		// identity then rests on TLSCAFile alone: say so once per node
-		if (!TLSHostnameCheckOn()) TLSWarnUnbound(AE);
+		if (SSL_get_app_data(ssl)) TLSNoteSelfSigned(ssl, AE, host, FALSE);
+		else if (!TLSHostnameCheckOn()) TLSWarnUnbound(AE);
 		if (cert) X509_free(cert);
 		return TRUE;
 		}
@@ -20688,6 +20757,7 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		return FALSE;
 		}
 	SystemDebug.printf("TLS: certificate of %s matches %s\n", AE, key);
+	TLSNoteSelfSigned(ssl, AE, host, TRUE);
 	return TRUE;
 	}
 
@@ -20713,7 +20783,10 @@ static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *pe
 	snprintf(key, sizeof(key), "TLSPin_%s", AE);	// key compared without case
 	TLSIni(key, "", pins, sizeof(pins));
 	if (!pins[0])
+		{
+		TLSNoteSelfSigned(ssl, AE, peer, FALSE);
 		return TRUE;
+		}
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 	cert = SSL_get1_peer_certificate(ssl);
@@ -20733,6 +20806,7 @@ static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *pe
 		return FALSE;
 		}
 	SystemDebug.printf("TLS: client certificate of %s matches %s\n", AE, key);
+	TLSNoteSelfSigned(ssl, AE, peer, TRUE);
 	return TRUE;
 	}
 

@@ -1384,6 +1384,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			run did not stop cleanly (running marker <SCUnsafeFile>.running); while it exists no study
 			is confirmed. sc_unsafe: shows it, sc_unsafe_clear: (also sc_overflow_clear:) reconciles
 			the rows with the local files and removes it. SIGTERM/SIGINT and quit: stop cleanly
+20261026	mmd	Outgoing storage commitment: a positive "study confirmed" is checked again before it is given:
+			no queue, write-mark or invalidation change and no sentinel since its queries started (else
+			asked again, at most 3 times, then 0); 0 while a rewrite of a sent object is in progress
 
 ENDOFUPDATEHISTORY
 */
@@ -23277,11 +23280,11 @@ static void SCImageSeriesJoin(char *out)
 static BOOL SCNotedPending(const char *ae, const char *study);
 static BOOL SCSqlText(const char *s, int max);
 static BOOL SCUnsafeActive(void);
+static unsigned int SCConfirmGen(void);
+static BOOL SCConfirmStillValid(unsigned int gen);
 
-// Confirmed check with the number of local objects of the study in *objects.
-// Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
-// have SCObject rows for this study and SC in acrnema.map (none: 0, never sent = not confirmed).
-static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char **AEs, int nAE, int *objects)
+// One attempt of the confirmed check (see SCStudyConfirmedCount)
+static int SCStudyConfirmedOnce(Database &DB, const char *StudyUID, const char **AEs, int nAE, int *objects)
 	{
 	char tables[256], sctables[256], join[512], where[1024], col[128], aew[64];
 	SCListItem *local = NULL, *aes = NULL, *done = NULL;
@@ -23376,6 +23379,30 @@ done:
 	if (aes) free(aes);
 	if (done) free(done);
 	return r;
+	}
+
+// Confirmed check with the number of local objects of the study in *objects.
+// Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
+// have SCObject rows for this study and SC in acrnema.map (none: 0, never sent = not confirmed).
+// The queue, the database rows and the write marks are read one after the other, not in one
+// step: a send noted, a write starting, a demotion or "commitment unsafe" between them could make
+// the reads disagree. So the invalidation generation (SCInvalGen) is taken before the reads, and a
+// 1 is only given when, after the reads, it has not changed, no rewrite of a sent object is in
+// progress and commitment is not unsafe; otherwise the check is done again (at most
+// SC_CONFIRMTRIES times), then 0. A 0 or -1 is given at once (never wrong on the safe side).
+#define SC_CONFIRMTRIES 3
+static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char **AEs, int nAE, int *objects)
+	{
+	int r = 0;
+	for (int t=0; t<SC_CONFIRMTRIES; t++)
+		{
+		unsigned int gen = SCConfirmGen();
+		r = SCStudyConfirmedOnce(DB, StudyUID, AEs, nAE, objects);
+		if (r!=1) return r;
+		if (SCConfirmStillValid(gen)) return 1;
+		}
+	OperatorConsole.printf("Storage commitment: study %.64s not confirmed now (state changed during %d checks; ask again)\n", StudyUID, SC_CONFIRMTRIES);
+	return 0;
 	}
 
 // Is the study confirmed: 1 for ALL given AEs, 0 not, -1 error (see SCStudyConfirmedCount).
@@ -23856,11 +23883,21 @@ static int		SCNotedCount = 0;		// items in the queue (including those the worker
 static unsigned int	SCNotedDropped = 0;		// items dropped because the queue was full
 static unsigned int	SCOverflowSince = 0;		// time of the first drop not cleared (0 = none; shown by sc_overflow:)
 static int		SCStopping = 0;			// the server stops: the queue has had its last drain
+static unsigned int	SCInvalGen = 0;			// + 1 on every queue add, drop or removal, write mark,
+							// local change, demotion and "unsafe" (SCStudyConfirmedCount)
 static CRITICAL_SECTION	SCNotedCritical;
 static struct SCNotedCriticalInit
 	{
 	SCNotedCriticalInit() { InitializeCriticalSection(&SCNotedCritical); }
 	}	SCNotedCriticalInitObject;
+
+// one step of the invalidation generation (after a demotion in the database, or "unsafe")
+static void SCInvalidate(void)
+	{
+	EnterCriticalSection(&SCNotedCritical);
+	SCInvalGen++;
+	LeaveCriticalSection(&SCNotedCritical);
+	}
 
 // Local changes: objects stored again locally (overwrite) while outgoing storage commitment is on.
 // Every change gets the next sequence number; a send that started before the change of its
@@ -24018,6 +24055,7 @@ static void SCUnsafeSet(const char *reason)
 		if (ok) SCUnsafeLines++;
 		}
 	LeaveCriticalSection(&SCUnsafeCritical);
+	SCInvalidate();
 	OperatorConsole.printf("*** Storage commitment ALARM: commitment unsafe (%s): no study is confirmed until sc_unsafe_clear: is given%s\n",
 		reason, ok ? "" : " (the sentinel file could not be written: this holds only until the server stops)");
 	(void)first;
@@ -24079,6 +24117,29 @@ static void SCUnsafeStartup(void)
 		SCUnsafeSet("the running marker could not be written (an unclean stop could not be detected)");
 	}
 
+// for SCStudyConfirmedCount: the generation before the reads ...
+static unsigned int SCConfirmGen(void)
+	{
+	unsigned int g;
+	EnterCriticalSection(&SCNotedCritical);
+	g = SCInvalGen;
+	LeaveCriticalSection(&SCNotedCritical);
+	return g;
+	}
+
+// ... and after them: unchanged, no rewrite of a sent object in progress (any object: the study of
+// a write is not known; such rewrites are rare) and commitment not unsafe
+static BOOL SCConfirmStillValid(unsigned int gen)
+	{
+	BOOL ok;
+	EnterCriticalSection(&SCNotedCritical);
+	ok = SCInvalGen==gen && SCWritesUnknown==0;
+	for (int i=0; i<SC_WRITEMAX && ok; i++)
+		if (SCWrites[i].used && SCWrites[i].relevant) ok = FALSE;
+	LeaveCriticalSection(&SCNotedCritical);
+	return ok && !SCUnsafeActive();
+	}
+
 // caller holds SCNotedCritical
 static BOOL SCWriteInProgressLocked(const char *inst)
 	{
@@ -24106,6 +24167,7 @@ int SCWriteBegin(const char *inst)
 			break;
 			}
 	if (r<0) SCWritesUnknown++;
+	SCInvalGen++;
 	LeaveCriticalSection(&SCNotedCritical);
 	return r;
 	}
@@ -24136,6 +24198,7 @@ static unsigned int SCRegisterChange(const char *inst)
 	for (int i=0; i<SC_WRITEMAX; i++)
 		if (SCWrites[i].used && strcmp(SCWrites[i].inst, inst)==0) SCWrites[i].relevant = 1;
 	r = SCChangeSeq++;
+	SCInvalGen++;
 	strncpy(SCChanges[r % SC_CHANGEMAX].inst, inst, 64);
 	SCChanges[r % SC_CHANGEMAX].inst[64] = 0;
 	SCChanges[r % SC_CHANGEMAX].seq = r;
@@ -24227,6 +24290,7 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		q->stale = SCWriteInProgressLocked(q->inst) ? 1 : 0;	// noted while the object is rewritten
 		SCNotedCount++;
 		}
+	SCInvalGen++;					// added or dropped
 	LeaveCriticalSection(&SCNotedCritical);
 
 	// a dropped item is never confirmed, and from the first drop no study is (commitment unsafe,
@@ -24327,6 +24391,7 @@ static void SCDropNoted(int n)
 	SCNotedHead = (SCNotedHead + n) % SC_NOTEDMAX;
 	SCNotedCount -= n;
 	if (SCNotedCount==0) SCNotedHead = 0;
+	if (n>0) SCInvalGen++;
 	LeaveCriticalSection(&SCNotedCritical);
 	}
 
@@ -24462,7 +24527,9 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 	SCRegisterChange(inst);				// first: a send recorded from now on sees the change,
 							// and a write of inst in progress (SaveToDisk) becomes relevant
 	if (n==0) return;
-	if (SCTestFailDemote || !DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+	BOOL demoted = !SCTestFailDemote && DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where);
+	SCInvalidate();
+	if (!demoted)
 		{
 		char why[200];
 		OperatorConsole.printf("*** Storage commitment ALARM: %s stored again locally, but its commitment state could not be reset\n", inst);
@@ -24507,7 +24574,9 @@ void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written)
 		{
 		SCRegisterChange(uid);
 		sprintf(where, "SOPInstUID = '%s' and State <> 'CHANGED'", uid);
-		if (SCTestFailDemote || !DB || !SCEnsureTables(*DB) || !DB->UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		BOOL demoted = !SCTestFailDemote && DB && SCEnsureTables(*DB) && DB->UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where);
+		SCInvalidate();
+		if (!demoted)
 			{
 			char why[200];
 			OperatorConsole.printf("*** Storage commitment ALARM: %s %s locally, but its commitment state could not be reset again\n",
@@ -24520,6 +24589,7 @@ void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written)
 	EnterCriticalSection(&SCNotedCritical);
 	if (slot>=0 && slot<SC_WRITEMAX) { SCWrites[slot].used = 0; SCWrites[slot].relevant = 0; }
 	else if (slot==-1 && SCWritesUnknown>0) SCWritesUnknown--;
+	SCInvalGen++;
 	LeaveCriticalSection(&SCNotedCritical);
 	}
 void CloneDB(char *AE)
@@ -24990,7 +25060,9 @@ static BOOL SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 	char where[256];
 	if (!it->stale && !SCChangedSince(it->inst, it->seq)) return TRUE;
 	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
-	if (DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+	BOOL demoted = DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where);
+	SCInvalidate();
+	if (demoted)
 		{
 		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send)\n", it->inst, it->ae);
 		return TRUE;
@@ -26271,7 +26343,9 @@ static int SCReconcile(Database &DB)
 		if (known && (long long)st.st_mtime < (long long)list[i].last) continue;	// every send after the file was written
 		if (known) sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED') and LastSent <= %lld", list[i].inst, (long long)st.st_mtime);
 		else       sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED')", list[i].inst);
-		if (!DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where)) { free(list); return -1; }
+		BOOL demoted = DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where);
+		SCInvalidate();
+		if (!demoted) { free(list); return -1; }
 		OperatorConsole.printf("Storage commitment: reconciliation: %s made CHANGED (%s)\n", list[i].inst,
 			known ? "local file written at or after its last send" : "no local file");
 		changed++;

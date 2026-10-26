@@ -1340,6 +1340,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: a send is noted with the destination actually used (called
 			AE of the association, e.g. the dest clause of a forward; address, port and TLS of the
 			connection, PDU_Service::Connected*); requests and re-sends only go there (else HELD)
+20261026	mmd	Outgoing storage commitment: NoResend also for C-MOVE with scrub (9999,0202), downsizing
+			(9999,0200), frame extraction (9999,0201), RetrieveResultConverter0, and for any send
+			or re-send whose compression may change the pixel data (lossy, NKI, clip, downsize)
 
 ENDOFUPDATEHISTORY
 */
@@ -3879,6 +3882,7 @@ void SCLocalWritten(const char *inst);
 unsigned int SCSendSeq(void);
 void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+int SCModeMayDiffer(const char *mode);
 
 void TestCompress(char *filename, const char *modes, ExtendedPDU_Service *PDU);
 void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Service *PDU);
@@ -6150,7 +6154,8 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
-        if (scOn) SCNoteSentPDU(PDU+part, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
+        // script clause or a lossy/changing compression: sent copy may differ from the archive copy
+        if (scOn) SCNoteSentPDU(PDU+part, scCls, scInst, scStudy, script[0]!=0 || SCModeMayDiffer(compress), scSeq);
       
         ImagesForwarded++;
         if (level==4) 
@@ -10587,7 +10592,8 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
   	  PDU[channel].Close();
 	}
 	else
-	{ if (scOn) SCNoteSentPDU(PDU+channel, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
+	{ // script clause or a lossy/changing compression: sent copy may differ from the archive copy
+	  if (scOn) SCNoteSentPDU(PDU+channel, scCls, scInst, scStudy, script[0]!=0 || SCModeMayDiffer(p), scSeq);
 	  ImagesForwarded++;
 
 	  if (level==4) 
@@ -23432,6 +23438,23 @@ void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 	SCNoteSentEx(AE, SOPClassUID, SOPInstanceUID, StudyUID, 0);
 	}
 
+// May a (re)compression mode as passed to recompress() change the pixel data, so that the
+// sent object cannot be reproduced exactly from the archive copy? 0 only for modes known to
+// keep it: "" / as / is / v* (as is), u* (uncompressed), j1 j2 (lossless JPEG), jk (lossless
+// JPEG 2000), js (JPEG-LS lossless). Everything else counts as differing: lossy JPEG j3..j6,
+// jl, j7 (near-lossless), clipping (#), NKI modes (n*, also when lossless), downsizing (k*),
+// script compression (s*), unknown modes. Conservative: it only disables automatic re-send.
+int SCModeMayDiffer(const char *mode)
+	{
+	char a, b;
+	if (!mode || !mode[0]) return 0;
+	a = (char)tolower((unsigned char)mode[0]);
+	b = (char)tolower((unsigned char)mode[1]);
+	if ((a=='a' && b=='s') || (a=='i' && b=='s') || a=='v' || a=='u') return 0;
+	if (a=='j' && (b=='1' || b=='2' || b=='k' || b=='s')) return 0;
+	return 1;
+	}
+
 // read the three UIDs from an object before it is written (Write empties the object)
 // buffers of 68; empty string when absent or invalid
 void SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study)
@@ -24799,6 +24822,16 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		BOOL StripGroup2 = memicmp(p, "as", 2)!=0 && memicmp(p, "is", 2)!=0;
 		compress[0] = p[0];
 		compress[1] = p[1];
+		// a compression that changes the pixel data would send other content than the first
+		// send: never re-sent (NoResend), alarm
+		if (SCModeMayDiffer(compress))
+			{
+			SCResendUpdate(DB, aew, it[i].inst, "NoResend = 1");
+			OperatorConsole.printf("*** Storage commitment ALARM: %s not re-sent to %s: compression %c%c may change the pixel data (NoResend)\n",
+				it[i].inst, ae, compress[0], compress[1]);
+			delete DDO;
+			continue;
+			}
 		recompress(&DDO, compress, "", StripGroup2, &PDU);
 		RTCStorage.SetUID(uid);
 		if (!RTCStorage.Write(&PDU, DDO, &DCO))

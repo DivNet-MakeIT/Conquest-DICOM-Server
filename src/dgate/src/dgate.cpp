@@ -1303,6 +1303,14 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			in a bounded in-memory queue (ExportConverter and ImportConverter forward, C-MOVE SCP
 			in nkiqrsop.cpp (not C-GET), Lua dicomstore); server command sc_queue: gives its length
 
+20261026	mmd	Outgoing storage commitment worker thread, started only with OutgoingStorageCommitment = 1:
+			records noted sends, asks per destination and study after OutgoingSCQuietTime (N-ACTION in
+			chunks of OutgoingSCMaxBatch, written to the tables before it is sent, random TransactionUID),
+			waits OutgoingSCSameAssocWait s for the result on that association, asks again after
+			OutgoingSCReportTimeout per OutgoingSCRetries/OutgoingSCRetryInterval until OutgoingSCDeadline
+			(TIMEOUT), purges after OutgoingSCKeepDays; no plain text request to a node with T;
+			server command sc_status:
+
 ENDOFUPDATEHISTORY
 */
 
@@ -1466,6 +1474,16 @@ int	CacheVirtualData=1;				// if set, keep (cache) passed through data
 int	EnableStorageCommitment=0;			// if set, accept and process storage commitment (N-ACTION, N-EVENT-REPORT)
 int	OutgoingStorageCommitment=0;			// if set, storage commitment for data sent to nodes with SC in acrnema.map
 int	OutgoingSCCheckIP=1;				// results only accepted from the address of the destination in acrnema.map
+int	OutgoingSCQuietTime=30;			// seconds since the last send of a study to a node before asking for commitment
+int	OutgoingSCMaxBatch=500;			// max objects per storage commitment request (N-ACTION)
+int	OutgoingSCSameAssocWait=5;			// seconds to wait for the result on the request association (0 = release at once)
+int	OutgoingSCReportTimeout=3600;			// no result within this time after an accepted request = failed attempt
+int	OutgoingSCRetries=5;				// requests again after a failed attempt (5 = at most 6 requests)
+int	OutgoingSCRetryDelays[16]={60,300,900,3600};	// OutgoingSCRetryInterval: delay before request again n, last repeats
+int	OutgoingSCRetryDelayCount=4;
+int	OutgoingSCDeadline=86400;			// after first send + this the object is TIMEOUT
+int	OutgoingSCScanInterval=15;			// storage commitment worker loop period
+int	OutgoingSCKeepDays=7;				// committed objects and closed transactions are purged after this
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -22279,6 +22297,919 @@ static void SimplifyDicom(DICOMDataObject *pDDO)
 	while((vr=DO2.Pop())) pDDO->Push(vr);
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// Outgoing storage commitment, part 2: the worker thread (this server as SCU).
+// Started only when OutgoingStorageCommitment = 1. Every OutgoingSCScanInterval seconds:
+//   1. objects noted by the send paths (SCTakeNoted) are recorded in SCObject (NOTED)
+//   2. OPEN transactions without result after OutgoingSCReportTimeout are ABANDONED,
+//      their objects are asked again later (new TxUID) or become TIMEOUT
+//   3. NOTED objects older than OutgoingSCDeadline become TIMEOUT
+//   4. per (destination, study), after OutgoingSCQuietTime, an N-ACTION is sent on a
+//      new association, in chunks of OutgoingSCMaxBatch; everything is written to the
+//      tables before it is sent, so a restart resumes from the tables
+//   5. once an hour old COMMITTED objects and closed transactions are purged
+// Nothing here deletes images.
+//////////////////////////////////////////////////////////////////////////////////////////
+
+
+#define SC_DRAINMAX	2000		// noted objects recorded per pass
+#define SC_GROUPMAX	1000		// (destination, study) groups looked at per pass
+#define SC_TXMAX	1000		// timed out transactions handled per pass
+#define SC_WARNMAX	64		// destinations remembered for once-only warnings
+
+// one object of a chunk to be asked for
+struct SCItem { char inst[68]; char cls[68]; char ip[132]; char port[68]; int tls; };
+
+// one (destination, study) group of NOTED objects
+struct SCGroup { char ae[20]; char study[68]; unsigned int last; unsigned int next; int n; };
+
+// read an integer key of [sscscp]; out of range or not a number: default, with a warning
+// when outgoing storage commitment is on (so nothing new is printed when it is off)
+static int SCIniInt(const char *root, const char *key, int def, int min, int max)
+	{
+	char s[64];
+	int i, v;
+	MyGetPrivateProfileString(root, key, "", s, 64, ConfigFile);
+	SCTrim(s);
+	if (s[0]==0) return def;
+	for (i=0; s[i]; i++)
+		if (!(s[i]>='0' && s[i]<='9') && !(i==0 && s[i]=='-')) break;
+	v = atoi(s);
+	if (s[i] || v<min || v>max)
+		{
+		if (OutgoingStorageCommitment)
+			OperatorConsole.printf("*** dicom.ini %s = %s is not valid (%d..%d), using %d\n", key, s, min, max, def);
+		return def;
+		}
+	return v;
+	}
+
+// OutgoingSCRetryInterval: one number or a comma separated list of seconds, the last one
+// repeats; any invalid or non-positive value gives the default list with a warning
+static void SCReadRetryInterval(const char *root)
+	{
+	char s[256], *p;
+	int d[16], n=0, bad=0;
+	MyGetPrivateProfileString(root, "OutgoingSCRetryInterval", "60,300,900,3600", s, 256, ConfigFile);
+	p = s;
+	while (*p && !bad)
+		{
+		while (*p==' ' || *p=='\t') p++;
+		if (!(*p>='0' && *p<='9')) { bad=1; break; }
+		long v = strtol(p, &p, 10);
+		while (*p==' ' || *p=='\t') p++;
+		if (v<=0 || v>31536000 || n>=16) { bad=1; break; }
+		d[n++] = (int)v;
+		if (*p==',') { p++; if (*p==0) bad=1; }
+		else if (*p) bad=1;
+		}
+	if (bad || n==0)
+		{
+		if (OutgoingStorageCommitment)
+			OperatorConsole.printf("*** dicom.ini OutgoingSCRetryInterval = %s is not valid, using 60,300,900,3600\n", s);
+		d[0]=60; d[1]=300; d[2]=900; d[3]=3600; n=4;
+		}
+	for (int i=0; i<n; i++) OutgoingSCRetryDelays[i] = d[i];
+	OutgoingSCRetryDelayCount = n;
+	}
+
+// read all worker keys; called from ConfigDgate
+void SCReadWorkerConfig(const char *root)
+	{
+	OutgoingSCQuietTime     = SCIniInt(root, "OutgoingSCQuietTime",     30,    0, 31536000);
+	OutgoingSCMaxBatch      = SCIniInt(root, "OutgoingSCMaxBatch",      500,   1, SC_MAXMEMBERS);
+	OutgoingSCSameAssocWait = SCIniInt(root, "OutgoingSCSameAssocWait", 5,     0, 3600);
+	OutgoingSCReportTimeout = SCIniInt(root, "OutgoingSCReportTimeout", 3600,  1, 31536000);
+	OutgoingSCRetries       = SCIniInt(root, "OutgoingSCRetries",       5,     0, 1000000);
+	OutgoingSCDeadline      = SCIniInt(root, "OutgoingSCDeadline",      86400, 1, 315360000);
+	OutgoingSCScanInterval  = SCIniInt(root, "OutgoingSCScanInterval",  15,    1, 3600);
+	OutgoingSCKeepDays      = SCIniInt(root, "OutgoingSCKeepDays",      7,     1, 36500);
+	SCReadRetryInterval(root);
+	}
+
+// delay before asking again after attempt number 'attempts' (1 = first request failed)
+static int SCRetryDelay(int attempts)
+	{
+	int n = OutgoingSCRetryDelayCount;
+	if (n<1) return 60;
+	if (attempts<1) attempts = 1;
+	if (attempts>n) attempts = n;
+	return OutgoingSCRetryDelays[attempts-1];
+	}
+
+// text that may go between quotes in our SQL: no quote or backslash, bounded length
+static BOOL SCSqlText(const char *s, int max)
+	{
+	int n = strlen(s);
+	if (n>max) return FALSE;
+	for (int i=0; i<n; i++) if (s[i]=='\'' || s[i]=='\\' || s[i]<32) return FALSE;
+	return TRUE;
+	}
+
+// a destination AE title from the queue or the table: trimmed, checked with the step 2 rule
+static BOOL SCCleanAE(const char *in, char *out)
+	{
+	strncpy(out, in, 19); out[19] = 0;
+	SCTrim(out);
+	return SCIsAE(out);
+	}
+
+// GROUP BY expression for the destination: exact (binary) on MySQL/MariaDB
+static const char *SCAEGroup(Database &DB)
+	{
+	return DB.db_type==DT_MYSQL ? "BINARY CalledAE" : "CalledAE";
+	}
+
+// random bytes from the system: /dev/urandom, or rand_s on Windows; FALSE when not available
+#ifdef WIN32
+extern "C" int __cdecl rand_s(unsigned int *randomValue);
+#endif
+static BOOL SCRandomBytes(unsigned char *b, int n)
+	{
+#ifdef WIN32
+	for (int i=0; i<n; i+=4)
+		{
+		unsigned int r;
+		if (rand_s(&r)!=0) return FALSE;
+		for (int j=0; j<4 && i+j<n; j++) b[i+j] = (unsigned char)(r>>(8*j));
+		}
+	return TRUE;
+#else
+	FILE *f = fopen("/dev/urandom", "rb");
+	if (!f) return FALSE;
+	int r = fread(b, 1, n, f);
+	fclose(f);
+	return r==n;
+#endif
+	}
+
+// big-endian byte string as a decimal number without leading zeros (out: 3*n+2 bytes)
+static void SCBytesToDecimal(const unsigned char *in, int n, char *out)
+	{
+	unsigned char b[32];
+	char tmp[100];
+	int k=0, i, nonzero;
+	memcpy(b, in, n);
+	do
+		{
+		unsigned int rem = 0;
+		nonzero = 0;
+		for (i=0; i<n; i++)
+			{
+			unsigned int cur = rem*256 + b[i];
+			b[i] = (unsigned char)(cur/10);
+			rem = cur%10;
+			if (b[i]) nonzero = 1;
+			}
+		tmp[k++] = (char)('0'+rem);
+		}
+	while (nonzero);
+	for (i=0; i<k; i++) out[i] = tmp[k-1-i];
+	out[k] = 0;
+	}
+
+// a UID with valid components: digits, no empty component, no leading zero, at most 64
+static BOOL SCStrictUID(const char *s)
+	{
+	if (!SCIsUID(s)) return FALSE;
+	const char *p = s;
+	while (*p)
+		{
+		if (*p=='.') return FALSE;
+		if (*p=='0' && p[1] && p[1]!='.') return FALSE;
+		while (*p && *p!='.') p++;
+		if (*p=='.') { p++; if (*p==0) return FALSE; }
+		}
+	return TRUE;
+	}
+
+// new TransactionUID: the server's UID root (UIDPrefix, as GenUID) + ".20." + 64 random bits.
+// If that root does not give a valid UID of at most 64 characters, 2.25 + 128 random bits.
+// FALSE when no random numbers are available: then nothing is sent.
+static BOOL SCNewTxUID(char *out)
+	{
+	unsigned char r[16];
+	char dec[64], tmp[80];
+	GenUID(tmp);			// force load of the UID root
+	if (!SCRandomBytes(r, 16)) return FALSE;
+	SCBytesToDecimal(r, 8, dec);
+	if (strlen(UIDPrefix)+4+strlen(dec) <= 64)
+		{
+		sprintf(out, "%s.20.%s", UIDPrefix, dec);
+		if (SCStrictUID(out)) return TRUE;
+		}
+	SCBytesToDecimal(r, 16, dec);
+	sprintf(out, "2.25.%s", dec);
+	return SCStrictUID(out);
+	}
+
+// UID element padded with NUL to even length
+static void SCSetUIDVR(VR **vr, int g, int e, const char *s)
+	{
+	unsigned int len = strlen(s);
+	char *p = (char *)malloc(len+2);
+	strcpy(p, s);
+	if (len & 1) p[len++] = 0;
+	*vr = new VR(g, e, len, (void*)p, (BOOL) TRUE);
+	}
+
+// once-only warnings per destination (worker thread only)
+static BOOL SCWarnOnce(char list[][20], int *n, const char *ae)
+	{
+	for (int i=0; i<*n; i++) if (strcmp(list[i], ae)==0) return FALSE;
+	if (*n<SC_WARNMAX) { strcpy(list[*n], ae); (*n)++; }
+	return TRUE;
+	}
+
+// study of an image from the image and series tables; "" when unknown
+static void SCLookupStudy(Database &DB, const char *inst, char *study)
+	{
+	char where[256], series[72], st[72];
+	SQLLEN len;
+	study[0] = 0;
+	if (!SCIsUID(inst)) return;
+	sprintf(where, "%s = '%s'", UniqueKey(ImageDB), inst);
+	series[0] = 0;
+	if (!DB.Query(ImageTableName, UniqueLink(ImageDB), where, NULL)) return;
+	DB.BindField(1, SQL_C_CHAR, series, 70, &len);
+	if (!DB.NextRecord()) return;
+	SCTrim(series);
+	if (!SCIsUID(series)) return;
+	sprintf(where, "%s = '%s'", UniqueKey(SeriesDB), series);
+	st[0] = 0;
+	if (!DB.Query(SeriesTableName, UniqueLink(SeriesDB), where, NULL)) return;
+	DB.BindField(1, SQL_C_CHAR, st, 70, &len);
+	if (!DB.NextRecord()) return;
+	SCTrim(st);
+	if (SCIsUID(st)) strcpy(study, st);
+	}
+
+// record one noted send: new row NOTED; an object in a final state (or cancelled/held) was
+// sent again and starts over; NOTED or REQUESTED only gets the new LastSent
+static void SCRecordNoted(Database &DB, SCNoted *it)
+	{
+	char ae[20], aew[64], where[256], upd[1024], cols[256], vals[1024], state[16], study[68];
+	SQLLEN len;
+	ACRNemaAddress E;
+	unsigned int t = it->t;
+
+	if (!SCCleanAE(it->ae, ae) || !SCIsUID(it->inst) || !SCIsUID(it->cls) || (it->study[0] && !SCIsUID(it->study)))
+		{
+		OperatorConsole.printf("*** Storage commitment: noted send with invalid AE or UID not recorded\n");
+		return;
+		}
+	strcpy(study, it->study);
+	if (study[0]==0) SCLookupStudy(DB, it->inst, study);
+
+	SCAEWhere(DB, aew, ae);
+	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
+	if (!DB.Query("SCObject", "State", where, NULL))
+		{ OperatorConsole.printf("*** Storage commitment: database query failed, send of %s to %s not recorded\n", it->inst, ae); return; }
+	state[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, state, sizeof(state), &len);
+	BOOL exists = DB.NextRecord();
+	SCTrim(state);
+
+	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
+		{
+		sprintf(upd, "LastSent = %u", t);
+		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
+			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
+		return;
+		}
+
+	// the destination as it is now in acrnema.map: a later address change holds the object
+	if (!GetACRNemaEntryByAE(ae, &E) || !(E.Flags & ACR_SC))
+		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); return; }
+	if (!SCSqlText(E.IP, 128) || !SCSqlText(E.Port, 16))
+		{ OperatorConsole.printf("*** Storage commitment: unusable address of %s in acrnema.map, send not recorded\n", ae); return; }
+
+	if (exists)
+		{
+		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
+			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d",
+			t, t, study, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0);
+		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
+			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
+		return;
+		}
+
+	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
+		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend");
+	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, 0",
+		ae, it->inst, it->cls, study, t, t, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0);
+	if (!DB.AddRecord("SCObject", cols, vals))
+		OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae);
+	}
+
+// objects of a transaction still REQUESTED: TIMEOUT when the attempts are used up or the
+// deadline has passed (alarm), else NOTED again with NextTry from OutgoingSCRetryInterval
+static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned int now)
+	{
+	char aew[64], where[512], upd[256], cnt[32];
+	SQLLEN len;
+	int i, n, ntimeout = 0;
+	long long limit = (long long)now - OutgoingSCDeadline;
+
+	SCAEWhere(DB, aew, ae);
+	sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and (Attempts > %d or FirstSent < %lld)",
+		aew, TxUID, OutgoingSCRetries, limit);
+	if (!DB.Query("SCObject", "COUNT(*)", where, NULL)) return FALSE;
+	cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	if (DB.NextRecord()) ntimeout = atoi(cnt);
+	if (ntimeout)
+		{
+		if (!DB.UpdateRecords((char *)"SCObject", (char *)"State = 'TIMEOUT'", where)) return FALSE;
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s TIMEOUT (no result: requests used up or deadline passed), transaction %s\n",
+			ntimeout, ae, TxUID);
+		}
+
+	// the rest is asked again later; the delay depends on the number of attempts
+	n = OutgoingSCRetryDelayCount;
+	for (i=1; i<=n; i++)
+		{
+		if (i<n) sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts = %d", aew, TxUID, i);
+		else     sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED'", aew, TxUID);
+		sprintf(upd, "State = 'NOTED', NextTry = %u", now + SCRetryDelay(i));
+		if (!DB.UpdateRecords((char *)"SCObject", upd, where)) return FALSE;
+		}
+	return TRUE;
+	}
+
+// close a transaction that got no (usable) result: objects first, so a stop halfway leaves
+// the transaction OPEN and it is handled again by the report timeout
+static void SCAbandon(Database &DB, const char *ae, const char *TxUID, unsigned int now, BOOL unsupported)
+	{
+	char aew[64], where[512], upd[128];
+	if (unsupported)
+		{
+		SCAEWhere(DB, aew, ae);
+		sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED'", aew, TxUID);
+		if (!DB.UpdateRecords((char *)"SCObject", (char *)"State = 'UNSUPPORTED'", where))
+			{ OperatorConsole.printf("*** Storage commitment: database update failed for transaction %s\n", TxUID); return; }
+		}
+	else if (!SCRequeue(DB, ae, TxUID, now))
+		{ OperatorConsole.printf("*** Storage commitment: database update failed for transaction %s\n", TxUID); return; }
+	sprintf(upd, "State = 'ABANDONED', ClosedAt = %u, Result = '%s'", now, unsupported ? "UNSUPP" : "NORESULT");
+	sprintf(where, "TxUID = '%s' and State = 'OPEN'", TxUID);
+	if (!DB.UpdateRecords((char *)"SCTransaction", upd, where))
+		OperatorConsole.printf("*** Storage commitment: database update failed for transaction %s\n", TxUID);
+	}
+
+// step 2: OPEN transactions without result within OutgoingSCReportTimeout
+static void SCCheckReportTimeouts(Database &DB, unsigned int now)
+	{
+	char where[128], tx[72], ae[24];
+	SQLLEN len;
+	int n = 0, i;
+	struct SCTx { char tx[68]; char ae[20]; } *list;
+
+	list = (struct SCTx *)malloc(sizeof(struct SCTx)*SC_TXMAX);
+	if (!list) return;
+	sprintf(where, "State = 'OPEN' and SentAt < %lld", (long long)now - OutgoingSCReportTimeout);
+	if (!DB.Query("SCTransaction", "TxUID, CalledAE", where, NULL))
+		{ OperatorConsole.printf("*** Storage commitment: database query failed (transactions)\n"); free(list); return; }
+	tx[0] = ae[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, tx, 70, &len);
+	DB.BindField(2, SQL_C_CHAR, ae, 20, &len);
+	while (n<SC_TXMAX && DB.NextRecord())
+		{
+		SCTrim(tx);
+		if (SCIsUID(tx) && SCCleanAE(ae, list[n].ae)) { strcpy(list[n].tx, tx); n++; }
+		tx[0] = ae[0] = 0;
+		}
+	for (i=0; i<n; i++)
+		{
+		OperatorConsole.printf("*** Storage commitment: no result from %s for transaction %s within %d s\n", list[i].ae, list[i].tx, OutgoingSCReportTimeout);
+		SCAbandon(DB, list[i].ae, list[i].tx, now, FALSE);
+		}
+	free(list);
+	}
+
+// step 3: NOTED objects past FirstSent + OutgoingSCDeadline become TIMEOUT (alarm per destination)
+static void SCCheckDeadline(Database &DB, unsigned int now)
+	{
+	char where[256], cols[96], ae[24], cnt[32], aew[64], upd[64];
+	SQLLEN len;
+	char (*aes)[20];
+	int counts[SC_WARNMAX], n = 0, i;
+	long long limit = (long long)now - OutgoingSCDeadline;
+
+	aes = (char (*)[20])malloc(20*SC_WARNMAX);
+	if (!aes) return;
+	sprintf(cols, "%s, COUNT(*)", SCAEGroup(DB));
+	sprintf(where, "State = 'NOTED' and FirstSent < %lld GROUP BY %s", limit, SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL)) { free(aes); return; }
+	ae[0] = cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+	DB.BindField(2, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	while (n<SC_WARNMAX && DB.NextRecord())
+		{
+		if (SCCleanAE(ae, aes[n])) counts[n++] = atoi(cnt);
+		ae[0] = cnt[0] = 0;
+		}
+	for (i=0; i<n; i++)
+		{
+		SCAEWhere(DB, aew, aes[i]);
+		sprintf(where, "%s and State = 'NOTED' and FirstSent < %lld", aew, limit);
+		strcpy(upd, "State = 'TIMEOUT'");
+		if (DB.UpdateRecords((char *)"SCObject", upd, where))
+			OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s TIMEOUT (deadline of %d s passed)\n", counts[i], aes[i], OutgoingSCDeadline);
+		else
+			OperatorConsole.printf("*** Storage commitment: database update failed (deadline for %s)\n", aes[i]);
+		}
+	free(aes);
+	}
+
+// set NOTED objects of a chunk to a final state (CANCELLED or HELD)
+static void SCSetItems(Database &DB, const char *ae, SCItem *it, int n, const char *state)
+	{
+	char aew[64], where[256], upd[64];
+	SCAEWhere(DB, aew, ae);
+	sprintf(upd, "State = '%s'", state);
+	for (int i=0; i<n; i++)
+		{
+		sprintf(where, "%s and SOPInstUID = '%s' and State = 'NOTED'", aew, it[i].inst);
+		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
+			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it[i].inst, ae);
+		}
+	}
+
+// association that exposes whether data is already read into the buffer
+class SCAssocPDU : public PDU_Service
+	{
+	public:	BOOL	Pending() { return InSize>0 || PDataTF::Length!=0; }
+	};
+
+// After an accepted N-ACTION: wait up to OutgoingSCSameAssocWait seconds for the result on
+// this association; an N-EVENT-REPORT of the storage commitment class is checked and
+// recorded by SCProcessEventReport and answered. Returns FALSE when the link is gone.
+static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
+	{
+	DICOMCommandObject ECO;
+	DICOMDataObject EDO;
+	ESCPRQ	EventRequest;
+	ESCPRSP	EventResponse;
+	UID	instance("1.2.840.10008.1.20.1.1");
+	char	Sop[68], Inst[68];
+	time_t	until = time(NULL) + OutgoingSCSameAssocWait;
+	UINT16	status;
+	int	eventid;
+
+	// poll: data in the buffer or on the socket; nothing within the wait: release
+	while (!PDU.Pending() && !PDU.Link.Poll())
+		{
+		if (time(NULL)>=until) return TRUE;
+		Sleep(100);
+		}
+
+	if (!PDU.Read(&ECO)) return FALSE;	// released or aborted by the other side
+	if (ECO.GetUINT16(0x0000, 0x0100)!=0x0100 || !SCVRString(ECO.GetVR(0x0000, 0x0002), Sop, sizeof(Sop)) ||
+	    strcmp(Sop, "1.2.840.10008.1.20.1")!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment: unexpected message from %s on the request association\n", ae);
+		return TRUE;
+		}
+	if (!EventRequest.Read(&ECO, &PDU, &EDO)) return FALSE;
+	eventid = ECO.GetUINT16(0x0000, 0x1002);
+	if (!SCVRUID(ECO.GetVR(0x0000, 0x1000), Inst) || strcmp(Inst, "1.2.840.10008.1.20.1.1")!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment result refused: affected SOP instance is not the storage commitment instance\n");
+		status = 0x0112;
+		}
+	else
+		status = SCProcessEventReport(ae, eventid, &EDO);	// our own association to the map address
+	EventResponse.Write(&PDU, &ECO, &instance, status, eventid, NULL);
+	return TRUE;
+	}
+
+// open the association and send the N-ACTION; 0 = accepted, 1 = failed (ask again later),
+// 2 = the storage commitment class was not accepted
+static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SCItem *it, int n)
+	{
+	SCAssocPDU PDU;
+	UID	uid, scclass("1.2.840.10008.1.20.1"), instance("1.2.840.10008.1.20.1.1");
+	ASCPRQ	ActionRequest;
+	ASCPRSP	ActionResponse;
+	DICOMCommandObject DCO;
+	DICOMDataObject DDO, RDO;
+	VR	*vr;
+	char	ip[132], port[68], called[20];
+	UINT16	status;
+	int	i;
+
+	strcpy(ip, E->IP);
+	strcpy(port, E->Port);
+	strcpy(called, ae);
+
+	PDU.AttachRTC(&VRType);
+	PDU.ClearAbstractSyntaxs();
+	PDU.SetLocalAddress(MYACRNEMA);
+	PDU.SetRemoteAddress((unsigned char *)called);
+	uid.Set("1.2.840.10008.3.1.1.1");	// application context (DICOM)
+	PDU.SetApplicationContext(uid);
+	PDU.AddAbstractSyntax(scclass);		// as SCU, the default role: no role selection
+	uid.Set("1.2.840.10008.1.1");		// also Verification (as the forwarder does): a node that
+	PDU.AddAbstractSyntax(uid);		// refuses only the commitment class still accepts the
+	PDU.SetTimeOut(TCPIPTimeOut);		// association, so that case is told from a failed connect
+
+	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
+		{
+		OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
+		return 1;
+		}
+	if (!PDU.IsAbstractSyntaxAccepted(scclass))
+		{
+		PDU.Close();
+		return 2;
+		}
+
+	// dataset: TransactionUID and the Referenced SOP Sequence
+	SCSetUIDVR(&vr, 0x0008, 0x1195, TxUID);
+	DDO.Push(vr);
+	Array<DICOMDataObject*> *SQ = new Array<DICOMDataObject*>;
+	for (i=0; i<n; i++)
+		{
+		DICOMDataObject *item = new DICOMDataObject;
+		SCSetUIDVR(&vr, 0x0008, 0x1150, it[i].cls);
+		item->Push(vr);
+		SCSetUIDVR(&vr, 0x0008, 0x1155, it[i].inst);
+		item->Push(vr);
+		SQ->Add(item);
+		}
+	vr = new VR(0x0008, 0x1199, 0, (void *)NULL, FALSE);
+	vr->SQObjectArray = (void *)SQ;
+	DDO.Push(vr);
+
+	if (!ActionRequest.Write(&PDU, &DDO, &instance, 1))
+		{
+		OperatorConsole.printf("*** Storage commitment: N-ACTION to %s could not be sent (transaction %s)\n", ae, TxUID);
+		PDU.Link.Close();
+		return 1;
+		}
+	if (!PDU.Read(&DCO) || !ActionResponse.Read(&DCO, &PDU, &RDO))
+		{
+		OperatorConsole.printf("*** Storage commitment: no N-ACTION response from %s (transaction %s)\n", ae, TxUID);
+		PDU.Link.Close();
+		return 1;
+		}
+	status = DCO.GetUINT16(0x0000, 0x0900);
+	if (status!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment: N-ACTION refused by %s with status 0x%04x (transaction %s)\n", ae, status, TxUID);
+		if (!PDU.Close()) PDU.Link.Close();
+		return 1;
+		}
+	OperatorConsole.printf("Storage commitment request accepted by %s (transaction %s)\n", ae, TxUID);
+
+	if (OutgoingSCSameAssocWait>0 && !SCWaitSameAssoc(PDU, ae))
+		{
+		PDU.Link.Close();
+		return 0;
+		}
+	if (!PDU.Close()) PDU.Link.Close();
+	return 0;
+	}
+
+// results of SCSendChunk
+#define SC_CHUNK_STOP	0	// chunk stays NOTED (TLS node, database or random failure): next pass
+#define SC_CHUNK_DONE	1	// sent, cancelled, held or unsupported: go on with the group
+#define SC_CHUNK_DOWN	2	// request failed: no more requests to this destination in this pass
+
+// one chunk of NOTED objects of a (destination, study) group: check the destination, write
+// the transaction, then send
+static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned int now)
+	{
+	static char warntls[SC_WARNMAX][20], warnunsup[SC_WARNMAX][20];
+	static int nwarntls = 0, nwarnunsup = 0;
+	ACRNemaAddress E;
+	char TxUID[72], vals[512], where[512], upd[256], aew[64];
+	int i, k, tls, r, nheld = 0;
+
+	// the destination now: gone or without SC -> CANCELLED
+	if (!GetACRNemaEntryByAE((char *)ae, &E) || !(E.Flags & ACR_SC))
+		{
+		OperatorConsole.printf("*** Storage commitment: %s is not in acrnema.map with SC any more, %d object(s) CANCELLED\n", ae, n);
+		SCSetItems(DB, ae, it, n, "CANCELLED");
+		return SC_CHUNK_DONE;
+		}
+
+	// objects sent to another address (or TLS setting) than the map has now -> HELD
+	tls = (E.Flags & ACR_TLS) ? 1 : 0;
+	for (i=k=0; i<n; i++)
+		{
+		if (strcmp(it[i].ip, E.IP)!=0 || strcmp(it[i].port, E.Port)!=0 || it[i].tls!=tls)
+			{
+			if (nheld++==0)
+				OperatorConsole.printf("*** Storage commitment ALARM: %s changed in acrnema.map (sent to %s %s%s, now %s %s%s)\n",
+					ae, it[i].ip, it[i].port, it[i].tls ? " TLS" : "", E.IP, E.Port, tls ? " TLS" : "");
+			SCSetItems(DB, ae, it+i, 1, "HELD");
+			}
+		else
+			{
+			if (k!=i) it[k] = it[i];
+			k++;
+			}
+		}
+	if (nheld)
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s HELD (not asked at the new address)\n", nheld, ae);
+	n = k;
+	if (n==0) return SC_CHUNK_DONE;
+
+	// never plain text to a node with T; TLS is not available in this version
+	if (tls)
+		{
+		if (SCWarnOnce(warntls, &nwarntls, ae))
+			OperatorConsole.printf("*** Storage commitment: %s has T in acrnema.map; TLS is not available, no request sent (objects stay NOTED)\n", ae);
+		return SC_CHUNK_STOP;
+		}
+
+	if (!SCNewTxUID(TxUID))
+		{
+		OperatorConsole.printf("*** Storage commitment: no random numbers for a transaction UID, nothing sent\n");
+		return SC_CHUNK_STOP;
+		}
+
+	// write first: transaction, members, objects REQUESTED; any failure -> do not send
+	sprintf(vals, "'%s', '%s', %u, 0, 'OPEN', '', %d", TxUID, ae, now, n);
+	if (!DB.AddRecord("SCTransaction", "TxUID, CalledAE, SentAt, ClosedAt, State, Result, Members", vals))
+		{
+		OperatorConsole.printf("*** Storage commitment: database insert failed, nothing sent to %s\n", ae);
+		return SC_CHUNK_STOP;
+		}
+	for (i=0; i<n; i++)
+		{
+		sprintf(vals, "'%s', '%s', '%s', 0, 0", TxUID, it[i].inst, it[i].cls);
+		if (!DB.AddRecord("SCTxMember", "TxUID, SOPInstUID, SOPClassUID, Outcome, Reason", vals))
+			{
+			OperatorConsole.printf("*** Storage commitment: database insert failed, nothing sent to %s\n", ae);
+			SCAbandon(DB, ae, TxUID, now, FALSE);
+			return SC_CHUNK_STOP;
+			}
+		}
+	SCAEWhere(DB, aew, ae);
+	sprintf(upd, "State = 'REQUESTED', TxUID = '%s', Attempts = Attempts + 1", TxUID);
+	sprintf(where, "%s and State = 'NOTED' and SOPInstUID in (SELECT SOPInstUID FROM SCTxMember WHERE TxUID = '%s')", aew, TxUID);
+	if (!DB.UpdateRecords((char *)"SCObject", upd, where))
+		{
+		OperatorConsole.printf("*** Storage commitment: database update failed, nothing sent to %s\n", ae);
+		SCAbandon(DB, ae, TxUID, now, FALSE);
+		return SC_CHUNK_STOP;
+		}
+
+	OperatorConsole.printf("Storage commitment request to %s: transaction %s, %d object(s)\n", ae, TxUID, n);
+	r = SCSendAction(ae, &E, TxUID, it, n);
+	if (r==1)
+		{
+		SCAbandon(DB, ae, TxUID, (unsigned int)time(NULL), FALSE);
+		OperatorConsole.printf("Storage commitment request to %s failed (transaction %s): asked again later\n", ae, TxUID);
+		return SC_CHUNK_DOWN;
+		}
+	if (r==2)
+		{
+		SCAbandon(DB, ae, TxUID, (unsigned int)time(NULL), TRUE);
+		if (SCWarnOnce(warnunsup, &nwarnunsup, ae))
+			OperatorConsole.printf("*** Storage commitment: %s does not accept the storage commitment class, objects UNSUPPORTED (images were sent normally)\n", ae);
+		}
+	return SC_CHUNK_DONE;
+	}
+
+// step 4: groups of NOTED objects per (destination, study) that are quiet and due
+static void SCProcessGroups(Database &DB, unsigned int now)
+	{
+	char where[512], cols[192], ae[24], study[72], last[32], next[32], cnt[32], aew[64];
+	char inst[72], cls[72], ip[132], port[68], tls[16];
+	SQLLEN len;
+	SCGroup *g;
+	SCItem *it;
+	char down[SC_WARNMAX][20];
+	int ng = 0, i, j, n, r, round, ndown = 0;
+
+	g = (SCGroup *)malloc(sizeof(SCGroup)*SC_GROUPMAX);
+	it = (SCItem *)malloc(sizeof(SCItem)*OutgoingSCMaxBatch);
+	if (!g || !it) { if (g) free(g); if (it) free(it); return; }
+
+	sprintf(cols, "%s, StudyUID, MAX(LastSent), MAX(NextTry), COUNT(*)", SCAEGroup(DB));
+	sprintf(where, "State = 'NOTED' GROUP BY %s, StudyUID", SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL))
+		{ OperatorConsole.printf("*** Storage commitment: database query failed (groups)\n"); free(g); free(it); return; }
+	ae[0] = study[0] = last[0] = next[0] = cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+	DB.BindField(2, SQL_C_CHAR, study, 70, &len);
+	DB.BindField(3, SQL_C_CHAR, last, sizeof(last), &len);
+	DB.BindField(4, SQL_C_CHAR, next, sizeof(next), &len);
+	DB.BindField(5, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	while (ng<SC_GROUPMAX && DB.NextRecord())
+		{
+		SCTrim(study);
+		if (SCCleanAE(ae, g[ng].ae) && (study[0]==0 || SCIsUID(study)))
+			{
+			strcpy(g[ng].study, study);
+			g[ng].last = (unsigned int)atol(last);
+			g[ng].next = (unsigned int)atol(next);
+			g[ng].n = atoi(cnt);
+			// ready: quiet since the last send, and every retry delay over
+			if ((long long)g[ng].last + OutgoingSCQuietTime <= (long long)now && g[ng].next <= now) ng++;
+			}
+		ae[0] = study[0] = last[0] = next[0] = cnt[0] = 0;
+		}
+
+	for (i=0; i<ng; i++)
+		{
+		// a destination that failed in this pass is not tried again until the next pass
+		for (j=0; j<ndown; j++) if (strcmp(down[j], g[i].ae)==0) break;
+		if (j<ndown) continue;
+
+		SCAEWhere(DB, aew, g[i].ae);
+		for (round=0; round<1000; round++)
+			{
+			sprintf(where, "%s and StudyUID = '%s' and State = 'NOTED' and NextTry <= %u", aew, g[i].study, now);
+			if (!DB.Query("SCObject", "SOPInstUID, SOPClassUID, DestIP, DestPort, DestTLS", where, NULL))
+				{ OperatorConsole.printf("*** Storage commitment: database query failed (objects)\n"); break; }
+			inst[0] = cls[0] = ip[0] = port[0] = tls[0] = 0;
+			DB.BindField(1, SQL_C_CHAR, inst, 70, &len);
+			DB.BindField(2, SQL_C_CHAR, cls, 70, &len);
+			DB.BindField(3, SQL_C_CHAR, ip, 130, &len);
+			DB.BindField(4, SQL_C_CHAR, port, 66, &len);
+			DB.BindField(5, SQL_C_CHAR, tls, sizeof(tls), &len);
+			n = 0;
+			while (n<OutgoingSCMaxBatch && DB.NextRecord())
+				{
+				SCTrim(inst); SCTrim(cls); SCTrim(ip); SCTrim(port);
+				if (SCIsUID(inst) && SCIsUID(cls))
+					{
+					strcpy(it[n].inst, inst);
+					strcpy(it[n].cls, cls);
+					strcpy(it[n].ip, ip);
+					strcpy(it[n].port, port);
+					it[n].tls = atoi(tls);
+					n++;
+					}
+				inst[0] = cls[0] = ip[0] = port[0] = tls[0] = 0;
+				}
+			if (n==0) break;
+			r = SCSendChunk(DB, g[i].ae, it, n, now);
+			if (r==SC_CHUNK_DOWN && ndown<SC_WARNMAX) strcpy(down[ndown++], g[i].ae);
+			if (r!=SC_CHUNK_DONE) break;		// stays NOTED, or asked again later
+			if (n<OutgoingSCMaxBatch) break;
+			now = (unsigned int)time(NULL);
+			}
+		}
+	free(g);
+	free(it);
+	}
+
+// step 5: COMMITTED objects and closed transactions older than OutgoingSCKeepDays
+static void SCPurge(Database &DB, unsigned int now)
+	{
+	char where[512];
+	long long limit = (long long)now - (long long)OutgoingSCKeepDays*86400;
+	BOOL ok = TRUE;
+
+	sprintf(where, "State = 'COMMITTED' and CommittedAt > 0 and CommittedAt < %lld", limit);
+	ok = DB.DeleteRecord("SCObject", where) && ok;
+	sprintf(where, "TxUID in (SELECT TxUID FROM SCTransaction WHERE State in ('CLOSED', 'ABANDONED') and ClosedAt > 0 and ClosedAt < %lld)", limit);
+	ok = DB.DeleteRecord("SCTxMember", where) && ok;
+	sprintf(where, "State in ('CLOSED', 'ABANDONED') and ClosedAt > 0 and ClosedAt < %lld", limit);
+	ok = DB.DeleteRecord("SCTransaction", where) && ok;
+	if (!ok) OperatorConsole.printf("*** Storage commitment: purge of old records failed (retried in an hour)\n");
+	}
+
+// one pass of the worker; the database is opened per pass
+static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
+	{
+	Database DB;
+	unsigned int now;
+	int i, n;
+
+	if (!DB.Open(DataSource, UserName, Password, DataHost))
+		{
+		OperatorConsole.printf("*** Storage commitment worker: no database connection\n");
+		return;
+		}
+	if (!SCEnsureTables(DB)) { DB.Close(); return; }
+
+	n = SCTakeNoted(buf, SC_DRAINMAX);
+	for (i=0; i<n; i++) SCRecordNoted(DB, buf+i);
+
+	now = (unsigned int)time(NULL);
+	SCCheckReportTimeouts(DB, now);
+	SCCheckDeadline(DB, now);
+	SCProcessGroups(DB, now);
+
+	now = (unsigned int)time(NULL);
+	if (now >= *lastpurge + 3600)
+		{
+		SCPurge(DB, now);
+		*lastpurge = now;
+		}
+	DB.Close();
+	}
+
+// the worker thread: runs while the server runs; idle while OutgoingStorageCommitment is
+// set to 0 again (e.g. by read_ini); all state is in the tables
+static BOOL WINAPI SCWorkerThread(void)
+	{
+	SCNoted *buf = (SCNoted *)malloc(sizeof(SCNoted)*SC_DRAINMAX);
+	time_t lastpurge = 0;
+	if (!buf) { OperatorConsole.printf("*** Storage commitment worker: out of memory\n"); return FALSE; }
+	OperatorConsole.printf("Started outgoing storage commitment thread\n");
+	while (TRUE)
+		{
+		if (OutgoingStorageCommitment) SCWorkerPass(buf, &lastpurge);
+		Sleep(1000*OutgoingSCScanInterval);
+		}
+	return TRUE;
+	}
+
+// start the worker once; called at server start only when OutgoingStorageCommitment = 1
+void StartSCWorkerThread(void)
+	{
+	static BOOL started = FALSE;
+	if (started) return;
+	started = TRUE;
+#ifdef WIN32
+	unsigned long ThreadID;
+	CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) SCWorkerThread, NULL, 0, &ThreadID);
+#else
+	pthread_t ThreadID;
+	pthread_create(&ThreadID, NULL, (void*(*)(void*))SCWorkerThread, (void *)NULL);
+	pthread_detach(ThreadID);
+#endif
+	}
+
+// sc_status: per destination the number of objects per state and the age of the oldest
+// object still waiting (NOTED or REQUESTED); plus the number of open transactions
+static void SCStatusText(char *out, int size)
+	{
+	static const char *states[] = { "NOTED", "REQUESTED", "COMMITTED", "FAILED", "TIMEOUT", "UNSUPPORTED", "HELD", "CANCELLED" };
+	const int ns = 8;
+	struct SCStat { char ae[20]; int c[8]; unsigned int oldest; } *s;
+	Database DB;
+	char cols[128], where[128], ae[24], st[24], cnt[32], first[32], line[512];
+	SQLLEN len;
+	int n = 0, i, j, used = 0, open = 0;
+	unsigned int now = (unsigned int)time(NULL);
+
+	out[0] = 0;
+	if (!OutgoingStorageCommitment) { snprintf(out, size, "outgoing storage commitment is off (OutgoingStorageCommitment = 0)\n"); return; }
+	if (!DB.Open(DataSource, UserName, Password, DataHost)) { snprintf(out, size, "no database connection\n"); return; }
+	if (!SCEnsureTables(DB)) { DB.Close(); snprintf(out, size, "storage commitment tables not available\n"); return; }
+	s = (struct SCStat *)malloc(sizeof(struct SCStat)*SC_WARNMAX);
+	if (!s) { DB.Close(); return; }
+
+	sprintf(cols, "%s, State, COUNT(*), MIN(FirstSent)", SCAEGroup(DB));
+	sprintf(where, "1 = 1 GROUP BY %s, State", SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL)) { DB.Close(); free(s); snprintf(out, size, "database query failed\n"); return; }
+	ae[0] = st[0] = cnt[0] = first[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+	DB.BindField(2, SQL_C_CHAR, st, sizeof(st), &len);
+	DB.BindField(3, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	DB.BindField(4, SQL_C_CHAR, first, sizeof(first), &len);
+	while (DB.NextRecord())
+		{
+		char a[20];
+		SCTrim(st);
+		if (SCCleanAE(ae, a))
+			{
+			for (i=0; i<n; i++) if (strcmp(s[i].ae, a)==0) break;
+			if (i==n && n<SC_WARNMAX) { memset(&s[n], 0, sizeof(struct SCStat)); strcpy(s[n].ae, a); n++; }
+			if (i<n)
+				for (j=0; j<ns; j++)
+					if (strcmp(st, states[j])==0)
+						{
+						s[i].c[j] += atoi(cnt);
+						unsigned int f = (unsigned int)atol(first);
+						if (j<2 && f && (s[i].oldest==0 || f<s[i].oldest)) s[i].oldest = f;
+						}
+			}
+		ae[0] = st[0] = cnt[0] = first[0] = 0;
+		}
+
+	if (DB.Query("SCTransaction", "COUNT(*)", "State = 'OPEN'", NULL))
+		{
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		if (DB.NextRecord()) open = atoi(cnt);
+		}
+	DB.Close();
+
+	used = snprintf(out, size, "open transactions: %d\n", open);
+	if (n==0 && used<size) used += snprintf(out+used, size-used, "no objects\n");
+	for (i=0; i<n && used<size; i++)
+		{
+		int k = snprintf(line, sizeof(line), "%s", s[i].ae);
+		for (j=0; j<ns; j++) k += snprintf(line+k, sizeof(line)-k, " %s=%d", states[j], s[i].c[j]);
+		if (s[i].oldest) snprintf(line+k, sizeof(line)-k, " oldest_waiting=%ds\n", (int)(now - s[i].oldest));
+		else             snprintf(line+k, sizeof(line)-k, " oldest_waiting=-\n");
+		if (used + (int)strlen(line) >= size) break;
+		strcpy(out+used, line);
+		used += strlen(line);
+		}
+	free(s);
+	}
+
 static int cgi_parse(char *in, char *out, const char *name, const char *def);
 
 BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &DCO,
@@ -23828,6 +24759,13 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		if (memicmp("MIRROR", SilentText+14, 6)==0) 
 			r = CheckFreeStoreOnMIRRORDevice(atoi(SilentText+20));
 		sprintf(Response, p, r);
+		return true;
+		}
+
+	if (memcmp(SilentText, "sc_status:", 10)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCStatusText(Response, 5000);
 		return true;
 		}
 
@@ -26221,6 +27159,8 @@ void ConfigDgate(void)
 	MyGetPrivateProfileString(szRootSC, "OutgoingSCCheckIP", "1", szTemp, 32, ConfigFile);
 	OutgoingSCCheckIP = atoi(szTemp);
 
+	SCReadWorkerConfig(szRootSC);		// OutgoingSCQuietTime ... OutgoingSCKeepDays
+
 	MyGetPrivateProfileString(szRootSC, "PadAEWithZeros", "0", szTemp, 32, ConfigFile);
         ConfigPadAEWithZeros = atoi(szTemp);
 
@@ -26598,6 +27538,10 @@ main ( int	argc, char	*argv[] )
 			  OperatorConsole.printf("Also monitoring for files in: %s\n", tempStr);
 			  StartMonitorThread(monitorfolder2);
 			}
+
+			// outgoing storage commitment worker: only when switched on in dicom.ini
+			if (OutgoingStorageCommitment && !NoThread)
+				StartSCWorkerThread();
 
 			if (NoThread)
 				while ( TRUE )

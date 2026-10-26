@@ -1413,6 +1413,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			to TCPPort or TLSPort = startup error, no legacy listener) with the legacy server context;
 			a calling AE with T but without L in acrnema.map is rejected there; T nodes satisfy
 			TLSEnforceForMappedNodes on either TLS port
+20261026	mmd	TLS legacy profile hardened: certificates verified at auth level 1 (security level 0
+			only for the protocol), and after every legacy handshake: ephemeral DH >= 2048 / EC >= 224
+			bits, every certificate key in the chain RSA/DSA >= 2048 / EC >= 224 bits, no MD5 signature,
+			SHA-1 signatures only for a node in TLSNodeCertsFile or with TLSAcceptSelfSigned = 1
 
 ENDOFUPDATEHISTORY
 */
@@ -20398,8 +20402,16 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //   (AES-CBC with SHA-1; DHE, then ECDHE, then RSA key exchange; never NULL, RC4, EXPORT,
 //   DES or 3DES; the legacy server takes its own order and has DH parameters, so a client
 //   offering DHE gets forward secrecy),
-//   OpenSSL security level 0 in that context only (TLS 1.0/1.1 need it), and a peer
-//   certificate key of at least 112 bits (e.g. RSA 2048). Certificates, TLSCAFile,
+//   OpenSSL security level 0 in that context only (TLS 1.0/1.1 need it), while certificates
+//   are still verified at auth level 1. After every legacy handshake, both directions, the
+//   connection is refused ("*** TLS: legacy connection with <AE> (<ip>) refused: <reason>") when
+//     - the ephemeral key is DH below 2048 bits or EC below 224 bits;
+//     - any certificate key in the verified chain (the peer certificate when not verified)
+//       is RSA/DSA below 2048 bits, EC below 224 bits, or another type below 112 security bits;
+//     - any certificate below the trust anchor is signed with MD5 (or MD4/MD2);
+//     - any certificate below the trust anchor is signed with SHA-1, unless the node is in
+//       TLSNodeCertsFile (its certificate is then pinned) or TLSAcceptSelfSigned = 1; an
+//       accepted SHA-1 signature is logged. Certificates, TLSCAFile,
 //   TLSVerifyPeer, TLSAcceptSelfSigned, TLSVerifyHostname and TLSNodeCertsFile apply as for T.
 //   TLSMinVersion and TLSCipherList do not apply to it (fixed policy). One console line
 //   per connection gives the protocol and cipher. T without L: unchanged (strict profile).
@@ -20642,27 +20654,97 @@ static	BOOL	TLSIsLegacy(SSL *ssl)
 	return r;
 	}
 
-// Legacy profile: the peer certificate key must have at least TLS_LEGACY_MIN_BITS of
-// security (security level 0 lets OpenSSL accept any key size). TRUE without a certificate
-// (TLSVerifyPeer decides that); what names the peer in messages.
-static	BOOL	TLSLegacyKeyStrong(SSL *ssl, const char *what)
+// Legacy profile: a key is strong enough (RSA/DSA/DH >= 2048 bits, EC >= 224 bits, other
+// types >= TLS_LEGACY_MIN_BITS security bits). why gets the reason when it is not, e.g.
+// "peer certificate RSA 1024 bit < 2048 (OsiriX default certificate? ...)": the built-in
+// OsiriX certificate is a self-signed RSA 1024 one, refused here on purpose.
+static	BOOL	TLSLegacyKeyOK(EVP_PKEY *k, const char *what, char *why, int whylen)
 	{
-	X509		*cert;
-	EVP_PKEY	*key;
-	int		bits = 0;
+	int	id = EVP_PKEY_base_id(k), bits = EVP_PKEY_bits(k);
+	const char	*type = NULL;
+	int	need = 0;
+
+	if (id==EVP_PKEY_RSA || id==EVP_PKEY_RSA_PSS) { type = "RSA"; need = 2048; }
+	else if (id==EVP_PKEY_DSA) { type = "DSA"; need = 2048; }
+	else if (id==EVP_PKEY_DH || id==EVP_PKEY_DHX) { type = "DH"; need = 2048; }
+	else if (id==EVP_PKEY_EC) { type = "EC"; need = 224; }
+	if (type)
+		{
+		if (bits >= need) return TRUE;
+		snprintf(why, whylen, "%s %s %d bit < %d%s", what, type, bits, need,
+			strcmp(what, "peer certificate")==0 && need==2048 ? " (OsiriX default certificate? choose a 2048-bit identity)" : "");
+		return FALSE;
+		}
+	if (EVP_PKEY_security_bits(k) >= TLS_LEGACY_MIN_BITS) return TRUE;
+	snprintf(why, whylen, "%s with %d security bits < %d", what, EVP_PKEY_security_bits(k), TLS_LEGACY_MIN_BITS);
+	return FALSE;
+	}
+
+// Legacy profile, after the handshake (both directions): the ephemeral key, every
+// certificate key of the verified chain (the peer certificate alone when it was not
+// verified) and the chain signatures (see the description above). AE/peer name the
+// connection; listed = the node is in TLSNodeCertsFile (its certificate is pinned).
+static	BOOL	TLSLegacyPolicy(SSL *ssl, const char *AE, const char *peer, BOOL listed)
+	{
+	char		why[256], what[64];
+	EVP_PKEY	*tk = NULL;
+	X509		*leaf, *c;
+	STACK_OF(X509)	*ch;
+	int		i, n, md, pk, sha1 = 0;
+
+	why[0] = 0;
+	// ephemeral (DHE/ECDHE) key; none for RSA key transport
+	if (SSL_is_server(ssl))
+		{
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	cert = SSL_get1_peer_certificate(ssl);
-#else
-	cert = SSL_get_peer_certificate(ssl);
+		SSL_get_tmp_key(ssl, &tk);
 #endif
-	if (!cert)
+		}
+	else
+		SSL_get_peer_tmp_key(ssl, &tk);
+	if (tk)
+		{
+		TLSLegacyKeyOK(tk, "ephemeral key", why, sizeof(why));
+		EVP_PKEY_free(tk);
+		}
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	leaf = SSL_get1_peer_certificate(ssl);
+#else
+	leaf = SSL_get_peer_certificate(ssl);
+#endif
+	ch = SSL_get0_verified_chain(ssl);
+	n = ch ? sk_X509_num(ch) : 0;
+	for (i=0; !why[0] && i<(n ? n : (leaf ? 1 : 0)); i++)
+		{
+		c = n ? sk_X509_value(ch, i) : leaf;
+		if (!c) continue;
+		if (i) snprintf(what, sizeof(what), "CA certificate %d of the chain", i);
+		else   snprintf(what, sizeof(what), "peer certificate");
+		if (X509_get0_pubkey(c) && !TLSLegacyKeyOK(X509_get0_pubkey(c), what, why, sizeof(why)))
+			break;
+		if (n && i==n-1)
+			continue;			// the trust anchor: its own signature does not count
+		md = pk = 0;
+		OBJ_find_sigid_algs(X509_get_signature_nid(c), &md, &pk);
+		if (md==NID_md5 || md==NID_md4 || md==NID_md2 || md==NID_md5_sha1)
+			snprintf(why, sizeof(why), "%s certificate %d of the chain is signed with MD5", i ? "CA" : "peer", i);
+		else if (md==NID_sha1)
+			sha1 = 1;
+		}
+	if (leaf) X509_free(leaf);
+
+	if (!why[0] && sha1)
+		{
+		if (listed || SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)))
+			OperatorConsole.printf("TLS: legacy connection with %s (%s): SHA-1 signed certificate accepted (%s)\n", AE, peer,
+				listed ? "certificate in TLSNodeCertsFile" : "TLSAcceptSelfSigned = 1");
+		else
+			snprintf(why, sizeof(why), "a certificate is signed with SHA-1 (accepted only for a node in TLSNodeCertsFile or with TLSAcceptSelfSigned = 1)");
+		}
+	if (!why[0])
 		return TRUE;
-	key = X509_get0_pubkey(cert);
-	if (key) bits = EVP_PKEY_security_bits(key);
-	X509_free(cert);
-	if (bits >= TLS_LEGACY_MIN_BITS)
-		return TRUE;
-	OperatorConsole.printf("*** TLS: legacy profile: certificate key of %s too weak (%d security bits, at least %d needed); connection refused\n", what, bits, TLS_LEGACY_MIN_BITS);
+	OperatorConsole.printf("*** TLS: legacy connection with %s (%s) refused: %s\n", AE, peer, why);
 	return FALSE;
 	}
 
@@ -20678,9 +20760,20 @@ static	int	TLSVerifyCallback(int ok, X509_STORE_CTX *x)
 	if (ok)
 		return 1;
 	err = X509_STORE_CTX_get_error(x);
+	ssl = (SSL *) X509_STORE_CTX_get_ex_data(x, SSL_get_ex_data_X509_STORE_CTX_idx());
+	// legacy profile (auth level 1): a SHA-1 signature is let through here and decided after
+	// the handshake (TLSLegacyPolicy: only for a pinned node or TLSAcceptSelfSigned = 1);
+	// MD5 and everything else keep failing
+	if (err == X509_V_ERR_CA_MD_TOO_WEAK && ssl && TLSIsLegacy(ssl))
+		{
+		X509	*c = X509_STORE_CTX_get_current_cert(x);
+		int	md = 0, pk = 0;
+		if (c && OBJ_find_sigid_algs(X509_get_signature_nid(c), &md, &pk) && md==NID_sha1)
+			return 1;
+		return 0;
+		}
 	if (err != X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT && err != X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN)
 		return 0;
-	ssl = (SSL *) X509_STORE_CTX_get_ex_data(x, SSL_get_ex_data_X509_STORE_CTX_idx());
 	if (!ssl || !SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)) || SSL_get_verify_mode(ssl)==SSL_VERIFY_NONE)
 		return 0;			// TLSAcceptSelfSigned = 0 (or not verifying at all): as before
 	SSL_set_app_data(ssl, (void *) 1);	// this connection: a self-signed certificate was accepted
@@ -20748,6 +20841,11 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 		SSL_CTX_free(ctx);
 		return NULL;
 		}
+	// legacy: security level 0 is only for the protocol (TLS 1.0/1.1 and their MD5+SHA-1
+	// handshake signature); certificate chains are still verified at level 1 (keys >= 80
+	// bits, no MD5; SHA-1 see the verify callback), the rest after the handshake
+	if (legacy)
+		X509_VERIFY_PARAM_set_auth_level(SSL_CTX_get0_param(ctx), 1);
 	if (legacy && server)
 		{
 		// DHE suites: DH group sized from the server certificate (RSA 2048 = ffdhe2048);
@@ -21240,9 +21338,15 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	unsigned char	fp[2][TLS_FP_BYTES];
 	int		good = 0, n = 0, r;
 
-	// legacy profile: no weak peer key (security level 0 in that context accepts any size)
-	if (TLSIsLegacy(ssl) && !TLSLegacyKeyStrong(ssl, AE))
-		return FALSE;
+	// legacy profile: ephemeral key, chain keys and signatures (TLSLegacyPolicy)
+	if (TLSIsLegacy(ssl))
+		{
+		unsigned char	lfp[2][TLS_FP_BYTES];
+		char		lfile[256];
+		int		ln = 0;
+		if (!TLSLegacyPolicy(ssl, AE, host, TLSNodeCertLookup(AE, lfp, &ln, lfile, sizeof(lfile)) > 0))
+			return FALSE;
+		}
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 	cert = SSL_get1_peer_certificate(ssl);
@@ -21582,8 +21686,17 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 			return FALSE;
 			}
 
+		// the line of this AE, else the line of the non-wildcard acrnema.map entry the
+		// calling AE resolves to (map lookups ignore case)
+		char		certae[20], file[256];
+		unsigned char	fp[2][TLS_FP_BYTES];
+		int		n;
+		strcpy(certae, ae);
+		if (TLSNodeCertLookup(ae, fp, &n, file, sizeof(file))==0 && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
+			strcpy(certae, E.Name);
+
 		// legacy port: one line per association; a node with T but not L is not taken
-		// here (it must use TLSPort); the peer key strength is checked
+		// here (it must use TLSPort); then the legacy policy (TLSLegacyPolicy)
 		SSL	*lssl = (SSL *) PDU->Link.TLSHandle;
 		if (TLSIsLegacy(lssl))
 			{
@@ -21593,18 +21706,9 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 				OperatorConsole.printf("*** TLS: association from %s (%s) on TLSLegacyPort rejected: %s has T without L in acrnema.map, use TLSPort\n", ae, peer, E.Name);
 				return FALSE;
 				}
-			if (!TLSLegacyKeyStrong(lssl, ae))
+			if (!TLSLegacyPolicy(lssl, ae, peer, TLSNodeCertLookup(certae, fp, &n, file, sizeof(file)) > 0))
 				return FALSE;
 			}
-
-		// the line of this AE, else the line of the non-wildcard acrnema.map entry the
-		// calling AE resolves to (map lookups ignore case)
-		char		certae[20], file[256];
-		unsigned char	fp[2][TLS_FP_BYTES];
-		int		n;
-		strcpy(certae, ae);
-		if (TLSNodeCertLookup(ae, fp, &n, file, sizeof(file))==0 && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
-			strcpy(certae, E.Name);
 		return TLSCheckIncomingNodeCert(PDU, certae, peer);
 #else
 		return FALSE;				// cannot happen: no TLS in this build

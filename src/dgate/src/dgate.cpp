@@ -1364,6 +1364,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
+20261026	mmd	Outgoing storage commitment: the same-association watchdog shuts down its own duplicate
+			of the socket descriptor (never a number the reader closed and another thread reused);
+			without a duplicate or a thread the result is not read there (association closed)
 
 ENDOFUPDATEHISTORY
 */
@@ -24958,14 +24961,46 @@ static void SCWaitBudget(SCAssocPDU &PDU, time_t until)
 // after a socket read has timed out (the stream operators ignore the failure), so a time limit
 // per read does not end a message that stalls halfway. At the end of the wait the watchdog shuts
 // the connection down (both directions, plain or TLS); every further read then fails at once.
-// It never touches a connection that is no longer being read: the reader clears active under the
-// lock before the association is closed, and the watchdog frees its record after that.
+// It works on its OWN DUPLICATE of the descriptor, taken before the read starts. The reader
+// (PDU_Service::Read and the socket layer under it, plain or TLS) may close its own descriptor on
+// an error (A-ABORT, A-RELEASE-RP, protocol error, failed read), and another thread may then get
+// the same number for another connection. The duplicate is a separate number that refers to the
+// same socket: shutdown() on it acts on the connection being read and nothing else, and its
+// number cannot be reused while the watchdog holds it. SCStopWatch closes the duplicate under the
+// lock, so the watchdog never calls shutdown() on a closed or reused number either. Without a
+// duplicate (WIN32 with winsock 1, or dup failing) or without a thread, SCStartWatch returns NULL
+// and the caller does not read at all (fail closed).
 struct SCWatch { int fd; time_t until; int active; int fired; };
 static CRITICAL_SECTION	SCWatchCritical;
 static struct SCWatchCriticalInit
 	{
 	SCWatchCriticalInit() { InitializeCriticalSection(&SCWatchCritical); }
 	}	SCWatchCriticalInitObject;
+
+// own descriptor for the same socket; -1 when not possible (0 is "no socket" in the socket layer)
+static int SCDupSocket(int fd)
+	{
+#ifdef WIN32
+	(void)fd;
+	return -1;			// a SOCKET cannot be duplicated with winsock 1 (winsock.h)
+#else
+	if (fd<=0) return -1;
+#ifdef F_DUPFD_CLOEXEC
+	return fcntl(fd, F_DUPFD_CLOEXEC, 0);	// not inherited by programs started by the server
+#else
+	return dup(fd);
+#endif
+#endif
+	}
+
+static void SCCloseDup(int fd)
+	{
+#ifndef WIN32
+	if (fd>0) close(fd);
+#else
+	(void)fd;
+#endif
+	}
 
 static BOOL WINAPI SCWatchThread(void *arg)
 	{
@@ -24979,9 +25014,9 @@ static BOOL WINAPI SCWatchThread(void *arg)
 			free(w);
 			return TRUE;
 			}
-		if (!w->fired && time(NULL) >= w->until)
+		if (!w->fired && w->fd>0 && time(NULL) >= w->until)
 			{
-			shutdown(w->fd, 2);		// SHUT_RDWR / SD_BOTH
+			shutdown(w->fd, 2);		// SHUT_RDWR / SD_BOTH, on our own duplicate
 			w->fired = 1;
 			}
 		LeaveCriticalSection(&SCWatchCritical);
@@ -24989,33 +25024,38 @@ static BOOL WINAPI SCWatchThread(void *arg)
 		}
 	}
 
-// start a watchdog for connection fd until 'until'; NULL when no thread could be started (the
-// reads are then bounded per read only)
+// start a watchdog for connection fd until 'until' (on a duplicate of fd); NULL when no duplicate
+// or no thread: the caller must then not read (fail closed)
 static SCWatch *SCStartWatch(int fd, time_t until)
 	{
+	int dfd = SCDupSocket(fd);
+	if (dfd<=0) return NULL;
 	SCWatch *w = (SCWatch *)malloc(sizeof(SCWatch));
-	if (!w) return NULL;
-	w->fd = fd; w->until = until; w->active = 1; w->fired = 0;
+	if (!w) { SCCloseDup(dfd); return NULL; }
+	w->fd = dfd; w->until = until; w->active = 1; w->fired = 0;
 #ifdef WIN32
 	unsigned long ThreadID;
 	HANDLE h = CreateThread(NULL, 0x10000, (LPTHREAD_START_ROUTINE) SCWatchThread, w, 0, &ThreadID);
-	if (!h) { free(w); return NULL; }
+	if (!h) { SCCloseDup(dfd); free(w); return NULL; }
 	CloseHandle(h);
 #else
 	pthread_t ThreadID;
-	if (pthread_create(&ThreadID, NULL, (void*(*)(void*))SCWatchThread, (void *)w)!=0) { free(w); return NULL; }
+	if (pthread_create(&ThreadID, NULL, (void*(*)(void*))SCWatchThread, (void *)w)!=0) { SCCloseDup(dfd); free(w); return NULL; }
 	pthread_detach(ThreadID);
 #endif
 	return w;
 	}
 
-// stop the watchdog (it frees its record); TRUE when it shut the connection down
+// stop the watchdog: its duplicate is closed here, under the lock (the watchdog frees its record);
+// TRUE when it shut the connection down
 static BOOL SCStopWatch(SCWatch *w)
 	{
 	BOOL fired;
 	if (!w) return FALSE;
 	EnterCriticalSection(&SCWatchCritical);
 	fired = w->fired;
+	SCCloseDup(w->fd);
+	w->fd = -1;
 	w->active = 0;
 	LeaveCriticalSection(&SCWatchCritical);
 	return fired;
@@ -25029,6 +25069,8 @@ static BOOL SCStopWatch(SCWatch *w)
 // afterwards), and a watchdog shuts the connection down at that time. A message that does not
 // arrive in full in time thus makes the reads fail: the association is aborted (SCSendAction
 // closes the link), and the destination has to send the result on a new association.
+// No watchdog (no duplicate descriptor or no thread): nothing is read, the association is
+// closed at once (FALSE) and the result has to come on a new association.
 static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 	{
 	DICOMCommandObject ECO;
@@ -25055,6 +25097,11 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 	if (until < time(NULL) + 1) until = time(NULL) + 1;
 	SCWatch *watch = SCStartWatch(PDU.Link.Socketfd, until);
 	BOOL	ok, sc = FALSE, fired;
+	if (!watch)
+		{
+		OperatorConsole.printf("*** Storage commitment: no watchdog for the same-association wait (%s): association closed without reading, the result must come on a new association\n", ae);
+		return FALSE;
+		}
 	SCWaitBudget(PDU, until);
 	ok = PDU.Read(&ECO);			// FALSE: released or aborted by the other side, or too slow
 	if (ok)

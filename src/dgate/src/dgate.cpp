@@ -1390,6 +1390,15 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: the watchdog's duplicate descriptor is taken at 1 or above (never 0,
 			which the socket layer reads as "no socket"); every non-negative duplicate is used and closed
 20261026	mmd	Status display reads the gpps statistics through GppsStatistics (under the ini cache lock)
+20261026	mmd	Outgoing storage commitment: sc_verify_now:<StudyUID>,<AE>[,<timeout>] and Lua scverifynow():
+			a fresh, synchronous commitment request for exactly the local objects of a study, answered
+			1 only when the archive reports all of them committed in that call and the local objects
+			did not change meanwhile; nothing is written to the tables. The only basis for deleting a
+			study locally: sc_confirmed:, scconfirmed and the OutgoingSCStudyConfirmed hook are
+			advisory. OutgoingSCVerifyMax (default 4) verifications at a time; example
+			lua/sc_delete_if_verified.lua (not enabled anywhere). The dgate log gets one line per
+			verification (study, AE, objects, chunks, TransactionUIDs, duration, result), one per
+			request, and one per result received or refused (request or new association)
 
 ENDOFUPDATEHISTORY
 */
@@ -1572,6 +1581,7 @@ int	OutgoingSCKeepDays=7;				// committed objects and closed transactions are pu
 int	OutgoingSCResendMissing=1;			// re-send to nodes with R: 0 never, 1 failed (transient reason), 2 also no result
 int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
 int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
+int	OutgoingSCVerifyMax=4;				// sc_verify_now: at most this many verifications at the same time (1..64)
 int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
@@ -3936,7 +3946,7 @@ OffsetDatesInDICOMObject(DICOMObject *DO, const char *Exceptions, int Offset, Da
 int
 SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE);
 
-int  SCWriteBegin(const char *inst);
+int  SCWriteBegin(const char *inst, const char *study);
 void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written);
 extern int SCTestDelayBeforeWrite;
 
@@ -3949,7 +3959,7 @@ struct SCWriteGuard
 	Database	*db;
 	BOOL		active;
 	SCWriteGuard() : slot(-2), inst(NULL), db(NULL), active(FALSE) {}
-	void Begin(Database *d, const char *i) { db = d; inst = i; slot = SCWriteBegin(i); active = slot!=-2; }
+	void Begin(Database *d, const char *i, const char *s) { db = d; inst = i; slot = SCWriteBegin(i, s); active = slot!=-2; }
 	void Written() { if (active) { active = FALSE; SCWriteEnd(db, slot, inst, TRUE); } }
 	~SCWriteGuard() { if (active) SCWriteEnd(db, slot, inst, FALSE); }
 	};
@@ -7381,6 +7391,42 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
     lua_pushboolean(L, r==1);
     return 1;
   }
+  int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size);
+  int SCVerifyInServer(void);
+
+  // scverifynow(studyuid, ae [, timeout]): true when the archive committed every local object of the
+  // study in this call (sc_verify_now:), else false and the reason. Outside the server process
+  // (e.g. dgate --dolua:) it is asked of the server, where results on new associations arrive.
+  static int luascverifynow(lua_State *L)
+  { int n = lua_gettop(L), t = 60, r;
+    char reason[256];
+    if (n<2 || !lua_isstring(L, 1) || !lua_isstring(L, 2) || (n>2 && !lua_isnumber(L, 3)) ||
+        strlen(lua_tostring(L, 1))>64 || strlen(lua_tostring(L, 2))>64)
+    { lua_pushboolean(L, 0);
+      lua_pushstring(L, "usage");
+      return 2;
+    }
+    if (n>2) t = (int)lua_tointeger(L, 3);
+    if (SCVerifyInServer())
+      r = SCVerifyNow(lua_tostring(L, 1), lua_tostring(L, 2), t, reason, sizeof(reason));
+    else
+    { char cmd[256], buf[1024];
+      int len;
+      sprintf(cmd, "sc_verify_now:%s,%s,%d", lua_tostring(L, 1), lua_tostring(L, 2), t);
+      buf[0] = 0;
+      SendServerCommand("", cmd, 0, buf, FALSE, FALSE, NULL);
+      len = strlen(buf);
+      while (len>0 && (buf[len-1]==' ' || buf[len-1]=='\n' || buf[len-1]=='\r')) buf[--len] = 0;
+      r = strcmp(buf, "1")==0;
+      if (r) reason[0] = 0;
+      else if (memcmp(buf, "0 ", 2)==0) snprintf(reason, sizeof(reason), "%s", buf+2);
+      else snprintf(reason, sizeof(reason), "no answer from the server");
+    }
+    lua_pushboolean(L, r==1);
+    if (r==1) return 1;
+    lua_pushstring(L, reason);
+    return 2;
+  }
   static int luaget_amap(lua_State *L)
   { int r = lua_tointeger(L, 1);
     ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
@@ -9730,6 +9776,7 @@ const char *do_lua(lua_State **L, char *cmd, struct scriptdata *sd)
     lua_register      (*L, "retry",         luaretry);
     lua_register      (*L, "get_amap",      luaget_amap);
     lua_register      (*L, "scconfirmed",   luascconfirmed);
+    lua_register      (*L, "scverifynow",   luascverifynow);
     lua_register      (*L, "get_sqldef",    luaget_sqldef);
     lua_register      (*L, "dbquery",       luadbquery);
     lua_register      (*L, "sql",           luasql);
@@ -13668,7 +13715,13 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 	// outgoing storage commitment: the write of this object is in progress from here until its
 	// file is written (also on every failure return); nothing when OutgoingStorageCommitment is 0
 	SCWriteGuard scWrite;
-	if (OutgoingStorageCommitment) scWrite.Begin(DB, szSop);
+	char scStudy[256];
+	scStudy[0] = 0;
+	if (OutgoingStorageCommitment)
+		{
+		SearchDICOMObject(DDOPtr, "0020,000d", scStudy);	// the study of the write (sc_verify_now:)
+		scWrite.Begin(DB, szSop, scStudy);
+		}
 
 	// try to enter object into database (object is not saved when this fails)
 	if(!SaveToDataBase(*DB, DDOPtr, rFilename, Device2, *rRoot))
@@ -23215,7 +23268,14 @@ BOOL SCEnsureTables(Database &DB)
 // database (image table) has an SCObject row in state COMMITTED for X. It is computed live,
 // each time it is asked, from the image table and SCObject (no stored marker), so an object
 // added to the study gives 0 at once. Other states (NOTED, REQUESTED, FAILED, TIMEOUT,
-// UNSUPPORTED, HELD) never count. Used before deleting studies in routing scripts.
+// UNSUPPORTED, HELD) never count.
+//
+// ADVISORY ONLY. sc_confirmed:, sc_confirmed_list:, Lua scconfirmed and the hook
+// OutgoingSCStudyConfirmed come from the persistent state (queue, retries, re-sends, SCObject),
+// which crashes, database outages, stops and races can leave wrong. They are for monitoring and
+// automation. Any deletion of a study must call sc_verify_now: (Lua scverifynow) immediately
+// before it deletes, and delete only on 1 (true): see "Verify now" below and the example
+// lua/sc_delete_if_verified.lua.
 //////////////////////////////////////////////////////////////////////////////////////////
 
 #define SC_MAXCONFIRMAES 16
@@ -23774,6 +23834,83 @@ static BOOL SCSenderMatchesMap(char *Calling, unsigned int ConnectedIP, const ch
 	return TRUE;
 	}
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// Verify now, part 1: verifications in progress (sc_verify_now:, Lua scverifynow; see part 2).
+// Each has one pending request at a time: a NEW random TransactionUID (in memory only, never
+// written to any table), the AE asked and the exact set of objects asked about. A result for such
+// a TransactionUID, on the request association or on a new one, is checked here with the rules of
+// the worker path and handed to the waiting thread (which polls it); no table is read or changed.
+//////////////////////////////////////////////////////////////////////////////////////////
+#define SC_VERIFYCAP 64			// upper limit of OutgoingSCVerifyMax
+struct SCVerifyPending { int used; char tx[65]; char ae[20]; SCMember *m; int nm; int reports; int bad; int nfail; };
+static SCVerifyPending	SCVerifyMap[SC_VERIFYCAP];
+static int		SCVerifyActive = 0;		// verifications running (at most OutgoingSCVerifyMax)
+static CRITICAL_SECTION	SCVerifyCritical;
+static struct SCVerifyCriticalInit
+	{
+	SCVerifyCriticalInit() { InitializeCriticalSection(&SCVerifyCritical); }
+	}	SCVerifyCriticalInitObject;
+
+// A storage commitment result: is it for a pending verification? FALSE when its TransactionUID is
+// not one of them (the caller then handles it as before). TRUE when it is: the result is checked in
+// full - instok: the affected SOP instance was the storage commitment instance; the calling AE is
+// the AE asked; checkip: the connection comes from the map address of that AE when
+// OutgoingSCCheckIP is 1 (not for the request association, which we opened to that address);
+// event type 1 or 2; exactly the requested set, each object once, same SOP classes; failure
+// reasons present - and recorded for the waiting thread; *status is the answer (0, or 0x0110 when
+// refused). A refused result makes the verification fail; so does any later result with failures.
+static BOOL SCVerifyDeliver(const char *Calling, int EventTypeID, DICOMDataObject *DDO, BOOL instok,
+	BOOL checkip, unsigned int ConnectedIP, UINT16 *status)
+	{
+	char tx[68], calling[20];
+	const char *why = NULL, *ipwhy = NULL;
+	BOOL ipok = TRUE;
+	int k, i, nok = 0, nfail = 0;
+
+	if (!SCVRUID(DDO->GetVR(0x0008, 0x1195), tx)) return FALSE;
+	memset(calling, 0, sizeof(calling));
+	strncpy(calling, Calling ? Calling : "", 16);
+	if (checkip && OutgoingSCCheckIP && SCIsAE(calling))
+		ipok = SCSenderMatchesMap(calling, ConnectedIP, &ipwhy);
+
+	EnterCriticalSection(&SCVerifyCritical);
+	for (k=0; k<SC_VERIFYCAP; k++)
+		if (SCVerifyMap[k].used && strcmp(SCVerifyMap[k].tx, tx)==0) break;
+	if (k==SC_VERIFYCAP)
+		{
+		LeaveCriticalSection(&SCVerifyCritical);
+		return FALSE;
+		}
+	SCVerifyPending *p = SCVerifyMap+k;
+	if (!instok)                               why = "affected SOP instance is not the storage commitment instance";
+	else if (strcmp(calling, p->ae)!=0)        why = "result sent by an AE other than the one asked";
+	else if (!ipok)                            why = ipwhy ? ipwhy : "connection not from the map address";
+	else if (EventTypeID!=1 && EventTypeID!=2) why = "event type is not 1 or 2";
+	else
+		{
+		for (i=0; i<p->nm; i++) { p->m[i].seen = 0; p->m[i].reason = 0; }
+		if (!SCCheckSequence(DDO, 0x1199, p->m, p->nm, 1, &nok, &why)) ;
+		else if (!SCCheckSequence(DDO, 0x1198, p->m, p->nm, 2, &nfail, &why)) ;
+		else if (nok+nfail != p->nm)       why = "result does not cover all requested instances";
+		else if (EventTypeID==1 && nfail)  why = "event type 1 with failed instances";
+		else if (EventTypeID==2 && !nfail) why = "event type 2 without failed instances";
+		}
+	p->reports++;
+	if (why) p->bad = 1;
+	else if (nfail > p->nfail) p->nfail = nfail;
+	LeaveCriticalSection(&SCVerifyCritical);
+
+	// checkip is set exactly for results on a new association (SCEventReportSupport)
+	if (why)
+		OperatorConsole.printf("*** Storage commitment verify: result from %s for %s on the %s refused (%s): the verification fails\n",
+			calling, tx, checkip ? "new association" : "request association", why);
+	else
+		OperatorConsole.printf("Storage commitment verify: result from %s for %s on the %s: %d committed, %d failed\n",
+			calling, tx, checkip ? "new association" : "request association", nok, nfail);
+	*status = why ? 0x0110 : 0;
+	return TRUE;
+	}
+
 // N-EVENT-REPORT of the storage commitment class on any association: read, check, answer
 BOOL StorageApp ::	SCEventReportSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP)
 	{
@@ -23795,18 +23932,28 @@ BOOL StorageApp ::	SCEventReportSupport( ExtendedPDU_Service *PDU, DICOMCommandO
 	// statuses used (PS3.7 N-EVENT-REPORT): 0110 processing failure (also for refusals),
 	// 0112 no such SOP instance, 0113 no such event type
 	char Inst[68];
-	if (!SCVRUID(DCO->GetVR(0x0000, 0x1000), Inst) || strcmp(Inst, "1.2.840.10008.1.20.1.1")!=0)
+	BOOL instok = SCVRUID(DCO->GetVR(0x0000, 0x1000), Inst) && strcmp(Inst, "1.2.840.10008.1.20.1.1")==0;
+
+	memset(Calling, 0, 20);
+	strncpy(Calling, (char *)(((AAssociateAC *)PDU)->CallingApTitle), 16);
+	SCTrim(Calling);
+	eventid = DCO->GetUINT16(0x0000, 0x1002);
+
+	// the result of a verification in progress (sc_verify_now:): checked in full and handed to the
+	// waiting thread; no table is read or changed, no hook
+	if (SCVerifyDeliver(Calling, eventid, &DDO, instok, TRUE, ConnectedIP, &status))
+		{
+		EventResponse.Write(PDU, DCO, &instance, status, eventid, NULL);
+		return TRUE;
+		}
+
+	if (!instok)
 		{
 		OperatorConsole.printf("*** Storage commitment result refused: affected SOP instance is not the storage commitment instance\n");
 		EventResponse.Write(PDU, DCO, &instance, 0x0112, DCO->GetUINT16(0x0000, 0x1002), NULL);
 		return TRUE;
 		}
 
-	memset(Calling, 0, 20);
-	strncpy(Calling, (char *)(((AAssociateAC *)PDU)->CallingApTitle), 16);
-	SCTrim(Calling);
-
-	eventid = DCO->GetUINT16(0x0000, 0x1002);
 	if (!SCIsAE(Calling))
 		{
 		OperatorConsole.printf("*** Storage commitment result refused: unusable calling AE title\n");
@@ -23919,7 +24066,7 @@ static unsigned int	SCChangeSeq = 0;		// number of changes so far (= sequence of
 // recorded (SCCheckStale) is stale: it may have read either file. All under SCNotedCritical.
 // No free slot: the write counts as relevant for every object (SCWritesUnknown) until it ends.
 #define SC_WRITEMAX 256
-struct SCWriting { char inst[65]; int used; int relevant; };
+struct SCWriting { char inst[65]; char study[65]; int used; int relevant; };
 static SCWriting	SCWrites[SC_WRITEMAX];
 static int		SCWritesUnknown = 0;		// writes in progress without a slot
 
@@ -24155,8 +24302,9 @@ static BOOL SCWriteInProgressLocked(const char *inst)
 	}
 
 // a write of inst starts; returns its slot, -1 when no slot was free (counted as unknown), -2 when
-// nothing is tracked (outgoing storage commitment off, or not a usable UID)
-int SCWriteBegin(const char *inst)
+// nothing is tracked (outgoing storage commitment off, or not a usable UID). study: its study
+// ("" or NULL when not known: then sc_verify_now: counts it as a write of every study)
+int SCWriteBegin(const char *inst, const char *study)
 	{
 	int i, r = -1;
 	if (!OutgoingStorageCommitment || !inst || strlen(inst)>64) return -2;
@@ -24166,6 +24314,8 @@ int SCWriteBegin(const char *inst)
 			{
 			strcpy(SCWrites[i].inst, inst);
 			SCTrim(SCWrites[i].inst);
+			SCWrites[i].study[0] = 0;
+			if (study && strlen(study)<=64) { strcpy(SCWrites[i].study, study); SCTrim(SCWrites[i].study); }
 			SCWrites[i].used = 1;
 			SCWrites[i].relevant = 0;
 			r = i;
@@ -24822,6 +24972,7 @@ void SCReadWorkerConfig(const char *root)
 	OutgoingSCResendMissing = SCIniInt(root, "OutgoingSCResendMissing", 1,     0, 2);
 	OutgoingSCResendMax     = SCIniInt(root, "OutgoingSCResendMax",     3,     0, 999);
 	OutgoingSCResendDelay   = SCIniInt(root, "OutgoingSCResendDelay",   300,   0, 31536000);
+	OutgoingSCVerifyMax     = SCIniInt(root, "OutgoingSCVerifyMax",     4,     1, 64);	// 64 = SC_VERIFYCAP
 	// test-only keys (default 0 = no effect): widen race windows so the tests can hit them
 	SCTestDelayBeforeWrite  = SCIniInt(root, "SCTestDelayBeforeWrite",  0,     0, 60000);
 	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
@@ -24981,25 +25132,33 @@ static BOOL SCStrictUID(const char *s)
 // The root is read here with a bounded length (not through GenUID, which writes into the caller's
 // buffer without a size); every UID is built with snprintf and its length checked before use.
 // FALSE when no random numbers are available, or no valid UID results: then nothing is sent.
-// out: at least 65 bytes. Worker thread only (the root is read once).
+// out: at least 65 bytes. Any thread (the worker, sc_verify_now:): the root is read once, under a lock.
+static CRITICAL_SECTION	SCTxUIDCritical;
+static struct SCTxUIDCriticalInit
+	{
+	SCTxUIDCriticalInit() { InitializeCriticalSection(&SCTxUIDCritical); }
+	}	SCTxUIDCriticalInitObject;
 static BOOL SCNewTxUID(char *out)
 	{
-	static char root[80];
+	static char rootonce[80];
 	static BOOL loaded = FALSE;
 	unsigned char r[16];
-	char dec[64], tmp[160], szRootSC[64], prefix[80];
+	char dec[64], tmp[160], szRootSC[64], prefix[80], root[80];
 	int len;
 
 	out[0] = 0;
+	EnterCriticalSection(&SCTxUIDCritical);
 	if (!loaded)
 		{
 		strcpy(prefix, "1.2.826.0.1.3680043.2.135.1066");
 		if (MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, szRootSC, 64, ConfigFile))
 			MyGetPrivateProfileString(szRootSC, "UIDPrefix", "1.2.826.0.1.3680043.2.135.1066", prefix, 64, ConfigFile);
 		prefix[64] = 0;
-		snprintf(root, sizeof(root), "%s.6", prefix);
+		snprintf(rootonce, sizeof(rootonce), "%s.6", prefix);
 		loaded = TRUE;
 		}
+	strcpy(root, rootonce);
+	LeaveCriticalSection(&SCTxUIDCritical);
 	if (!SCRandomBytes(r, 16)) return FALSE;
 	SCBytesToDecimal(r, 8, dec);
 	len = snprintf(tmp, sizeof(tmp), "%s.20.%s", root, dec);
@@ -25692,6 +25851,548 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 		}
 	if (!PDU.Close()) PDU.Link.Close();
 	return 0;
+	}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Verify now, part 2: sc_verify_now:<StudyUID>,<AE>[,<timeout s>] and Lua scverifynow(study, ae
+// [, timeout]). The ONLY basis for deleting a study locally: the persistent state (SCObject,
+// sc_confirmed:, scconfirmed, the hook) is advisory. A verification asks the archive now,
+// synchronously, about exactly the objects the study has locally, and answers 1 only when, in
+// this very call:
+//  1. the local objects (image table) and the fingerprint of each file (name, size, modification
+//     and change time, inode, device) were read; none: "0 empty"; a write of one of them, or of an
+//     object of the study, in progress: "0 writing";
+//  2. the AE is a non-wildcard acrnema.map entry with SC (else "0 not an SC node"); the request
+//     goes to that entry's address, with TLS when it has T (node certificate file and all TLS
+//     checks apply; never plain text to a T node);
+//  3. per chunk of at most OutgoingSCMaxBatch objects a NEW random TransactionUID is registered
+//     as pending (memory only), then an association (storage commitment + Verification) is opened
+//     and the N-ACTION asks for exactly those objects;
+//  4. the result came on that association (read as in the worker's same-association wait:
+//     bounded, watchdog on a duplicate descriptor, at most OutgoingSCSameAssocWait s) or on a new
+//     association (SCEventReportSupport hands it over by TransactionUID), checked as strictly as in
+//     the worker path (SCVerifyDeliver); none before the timeout: "0 no result";
+//  5. every chunk reported every object committed (event type 1, all in 0008,1199, nothing in
+//     0008,1198), else "0 failed <n>" (n objects reported failed) or "0 invalid result";
+//  6. the local objects and fingerprints, read again, are the same, no local change of them was
+//     registered meanwhile and no write of the study is in progress, else "0 changed".
+// Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel file is neither
+// read nor set. Any other doubt (database, connection, refusal of the request) answers 0 with a
+// reason. At most OutgoingSCVerifyMax (default 4) at a time ("0 busy"); timeout 1..600 s, default
+// 60. One console line per verification. What the archive confirms is its custody of these SOP
+// instance UIDs (PS3.4 annex J); content is not compared. An object of the study stored after the
+// answer is not covered: the caller deletes right after the answer (lua/sc_delete_if_verified.lua).
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// one local object of the study and the fingerprint of its file
+struct SCVerifyObj { char inst[65]; char cls[65]; char *file; long long size, mts, mtn, cts, ctn; unsigned long long ino, dev; };
+
+#define SCV_DBERROR	-1		// SCVerifyLocal: database error (or no SOP class column, out of memory)
+#define SCV_NOFILE	-2		// an object without a readable local file
+#define SCV_BAD		-3		// an invalid or repeated UID
+
+static int SCVerifyObjCompare(const void *a, const void *b)
+	{ return strcmp(((const SCVerifyObj*)a)->inst, ((const SCVerifyObj*)b)->inst); }
+
+static void SCVerifyFree(SCVerifyObj *o, int n)
+	{
+	if (!o) return;
+	for (int i=0; i<n; i++) if (o[i].file) free(o[i].file);
+	free(o);
+	}
+
+// the fingerprint of the file of o; FALSE when it cannot be read
+static BOOL SCVerifyStat(SCVerifyObj *o)
+	{
+	struct stat st;
+	if (!o->file || stat(o->file, &st)!=0) return FALSE;
+	o->size = (long long)st.st_size;
+	o->mts  = (long long)st.st_mtime;
+	o->cts  = (long long)st.st_ctime;
+#if defined(__linux__)
+	o->mtn  = (long long)st.st_mtim.tv_nsec;
+	o->ctn  = (long long)st.st_ctim.tv_nsec;
+#elif defined(__APPLE__)
+	o->mtn  = (long long)st.st_mtimespec.tv_nsec;
+	o->ctn  = (long long)st.st_ctimespec.tv_nsec;
+#else
+	o->mtn  = o->ctn = 0;
+#endif
+	o->ino  = (unsigned long long)st.st_ino;
+	o->dev  = (unsigned long long)st.st_dev;
+	return TRUE;
+	}
+
+static BOOL SCVerifySame(SCVerifyObj *a, SCVerifyObj *b)
+	{
+	return strcmp(a->inst, b->inst)==0 && strcmp(a->cls, b->cls)==0 && a->file && b->file && strcmp(a->file, b->file)==0 &&
+	       a->size==b->size && a->mts==b->mts && a->mtn==b->mtn && a->cts==b->cts && a->ctn==b->ctn &&
+	       a->ino==b->ino && a->dev==b->dev;
+	}
+
+// The local objects of a study (image table joined to the series table) with the fingerprints of
+// their files, sorted by SOP instance UID, in *out. Returns their number, or SCV_DBERROR,
+// SCV_NOFILE or SCV_BAD.
+static int SCVerifyLocal(Database &DB, const char *StudyUID, SCVerifyObj **out)
+	{
+	char tables[256], join[512], cols[512], inst[256], cls[256], file[1024], dev[256], full[1024];
+	const char *clscol = NULL;
+	SCVerifyObj *o = NULL, *t;
+	SQLLEN len;
+	int n = 0, cap = 0, i, r = SCV_DBERROR;
+
+	*out = NULL;
+	for (i=0; ImageDB && ImageDB[i].Element; i++)
+		if (ImageDB[i].Group==0x0008 && ImageDB[i].Element==0x0016) { clscol = ImageDB[i].SQLColumn; break; }
+	if (!clscol)
+		{
+		OperatorConsole.printf("*** Storage commitment verify: the image table has no SOP class UID column\n");
+		return SCV_DBERROR;
+		}
+	sprintf(tables, "%s, %s", ImageTableName, SeriesTableName);
+	SCImageSeriesJoin(join);
+	sprintf(join+strlen(join), " and %s.%s = '%s'", SeriesTableName, UniqueLink(SeriesDB), StudyUID);
+	sprintf(cols, "%s.%s, %s.%s, %s.ObjectFile, %s.DeviceName", ImageTableName, UniqueKey(ImageDB),
+		ImageTableName, clscol, ImageTableName, ImageTableName);
+	if (!DB.Query(tables, cols, join, NULL)) return SCV_DBERROR;
+	inst[0] = cls[0] = file[0] = dev[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, inst, sizeof(inst), &len);
+	DB.BindField(2, SQL_C_CHAR, cls,  sizeof(cls),  &len);
+	DB.BindField(3, SQL_C_CHAR, file, sizeof(file), &len);
+	DB.BindField(4, SQL_C_CHAR, dev,  sizeof(dev),  &len);
+	while (DB.NextRecord())
+		{
+		SCTrim(inst); SCTrim(cls); SCTrim(file); SCTrim(dev);
+		if (!SCIsUID(inst) || !SCIsUID(cls)) { r = SCV_BAD; goto fail; }
+		if (n==cap)
+			{
+			cap = cap ? 2*cap : 256;
+			t = (SCVerifyObj *)realloc(o, cap*sizeof(SCVerifyObj));
+			if (!t) { r = SCV_DBERROR; goto fail; }
+			o = t;
+			}
+		strcpy(o[n].inst, inst);
+		strcpy(o[n].cls, cls);
+		o[n].file = NULL;
+		n++;
+		if (!file[0] || !dev[0] || !FindPhysicalDevice(dev, full, file) || strlen(full)+strlen(file)>=sizeof(full))
+			{ r = SCV_NOFILE; goto fail; }
+		strcat(full, file);
+		o[n-1].file = strdup(full);
+		if (!o[n-1].file) { r = SCV_DBERROR; goto fail; }
+		inst[0] = cls[0] = file[0] = dev[0] = 0;
+		}
+	if (n>1) qsort(o, n, sizeof(SCVerifyObj), SCVerifyObjCompare);
+	for (i=1; i<n; i++)
+		if (strcmp(o[i-1].inst, o[i].inst)==0) { r = SCV_BAD; goto fail; }
+	for (i=0; i<n; i++)
+		if (!SCVerifyStat(o+i)) { r = SCV_NOFILE; goto fail; }
+	*out = o;
+	return n;
+fail:
+	SCVerifyFree(o, n);
+	return r;
+	}
+
+// the local objects of a study, with their own database connection
+static int SCVerifyRead(const char *StudyUID, SCVerifyObj **out)
+	{
+	Database DB;
+	int n;
+	*out = NULL;
+	if (!DB.Open(DataSource, UserName, Password, DataHost)) return SCV_DBERROR;
+	n = SCVerifyLocal(DB, StudyUID, out);
+	DB.Close();
+	return n;
+	}
+
+// a local write in progress (SaveToDisk, SCWriteBegin) of one of the objects o, of an object of the
+// study, or of an unknown object or study
+static BOOL SCVerifyWriting(const char *StudyUID, SCVerifyObj *o, int n)
+	{
+	BOOL r;
+	SCVerifyObj key;
+	EnterCriticalSection(&SCNotedCritical);
+	r = SCWritesUnknown>0;
+	for (int i=0; i<SC_WRITEMAX && !r; i++)
+		{
+		if (!SCWrites[i].used) continue;
+		if (!SCWrites[i].study[0] || strcmp(SCWrites[i].study, StudyUID)==0) r = TRUE;
+		else if (n>0)
+			{
+			strcpy(key.inst, SCWrites[i].inst);
+			if (bsearch(&key, o, n, sizeof(SCVerifyObj), SCVerifyObjCompare)) r = TRUE;
+			}
+		}
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
+	}
+
+static BOOL SCVerifyHasResult(int k)
+	{
+	BOOL r;
+	EnterCriticalSection(&SCVerifyCritical);
+	r = SCVerifyMap[k].reports>0;
+	LeaveCriticalSection(&SCVerifyCritical);
+	return r;
+	}
+
+// After the accepted N-ACTION of a verification: wait for the result on this association until
+// 'until', read as SCWaitSameAssoc reads (bounded by the rest of the wait, at least 1 s; watchdog
+// on a duplicate descriptor; without one nothing is read). A result for the pending
+// TransactionUID is handed over by SCVerifyDeliver (no tables); a result arriving meanwhile on a
+// new association ends the wait. Returns FALSE when the association must be closed without release.
+static BOOL SCVerifyWaitSameAssoc(SCAssocPDU &PDU, const char *ae, int k, time_t until)
+	{
+	DICOMCommandObject ECO;
+	DICOMDataObject EDO;
+	ESCPRQ	EventRequest;
+	ESCPRSP	EventResponse;
+	UID	instance("1.2.840.10008.1.20.1.1");
+	char	Sop[68], Inst[68];
+	UINT16	status = 0x0110;
+	BOOL	ok, sc = FALSE, fired, instok;
+	int	eventid;
+
+	while (!PDU.Pending() && !PDU.Link.Poll())
+		{
+		if (time(NULL)>=until || SCVerifyHasResult(k)) return TRUE;
+		Sleep(100);
+		}
+	if (until < time(NULL) + 1) until = time(NULL) + 1;
+	SCWatch *watch = SCStartWatch(PDU.Link.Socketfd, until);
+	if (!watch)
+		{
+		OperatorConsole.printf("*** Storage commitment verify: no watchdog for the same-association wait (%s): association closed without reading\n", ae);
+		return FALSE;
+		}
+	SCWaitBudget(PDU, until);
+	ok = PDU.Read(&ECO);
+	if (ok)
+		{
+		sc = ECO.GetUINT16(0x0000, 0x0100)==0x0100 && SCVRString(ECO.GetVR(0x0000, 0x0002), Sop, sizeof(Sop)) &&
+		     strcmp(Sop, "1.2.840.10008.1.20.1")==0;
+		if (sc)
+			{
+			SCWaitBudget(PDU, until);
+			ok = EventRequest.Read(&ECO, &PDU, &EDO);
+			}
+		}
+	fired = SCStopWatch(watch);
+	PDU.SetTimeOut(TCPIPTimeOut);
+	if (fired || !ok) return FALSE;
+	if (!sc)
+		{
+		OperatorConsole.printf("*** Storage commitment verify: unexpected message from %s on the request association\n", ae);
+		return FALSE;
+		}
+	eventid = ECO.GetUINT16(0x0000, 0x1002);
+	instok = SCVRUID(ECO.GetVR(0x0000, 0x1000), Inst) && strcmp(Inst, "1.2.840.10008.1.20.1.1")==0;
+	// our own association to the map address of ae: the peer is ae (no address check)
+	if (!SCVerifyDeliver(ae, eventid, &EDO, instok, FALSE, 0, &status))
+		{
+		OperatorConsole.printf("*** Storage commitment verify: result from %s for another transaction on the request association refused (not a pending verification)\n", ae);
+		status = 0x0110;
+		}
+	EventResponse.Write(&PDU, &ECO, &instance, status, eventid, NULL);
+	return TRUE;
+	}
+
+// One request of a verification: association to the address of map entry E (TLS when it has T),
+// N-ACTION with TransactionUID tx for exactly the objects o[0..n-1] (pending as k), then the
+// same-association wait (OutgoingSCSameAssocWait, within the deadline). NULL when the request was
+// accepted, else the reason.
+static const char *SCVerifyRequest(const char *ae, ACRNemaAddress *E, const char *tx, SCVerifyObj *o, int n, int k, time_t deadline)
+	{
+	SCAssocPDU PDU;
+	UID	uid, scclass("1.2.840.10008.1.20.1"), instance("1.2.840.10008.1.20.1.1");
+	ASCPRQ	ActionRequest;
+	ASCPRSP	ActionResponse;
+	DICOMCommandObject DCO;
+	DICOMDataObject DDO, RDO;
+	VR	*vr;
+	char	called[20];
+	long	left;
+	time_t	until;
+	int	i;
+
+	strcpy(called, ae);
+	left = (long)(deadline - time(NULL));
+	if (left < 1) return "no result";
+	PDU.AttachRTC(&VRType);
+	PDU.ClearAbstractSyntaxs();
+	PDU.SetLocalAddress(MYACRNEMA);
+	PDU.SetRemoteAddress((unsigned char *)called);
+	uid.Set("1.2.840.10008.3.1.1.1");	// application context (DICOM)
+	PDU.SetApplicationContext(uid);
+	PDU.AddAbstractSyntax(scclass);		// as SCU, the default role
+	uid.Set("1.2.840.10008.1.1");		// and Verification, as the worker does
+	PDU.AddAbstractSyntax(uid);
+	PDU.SetTimeOut((int)(left < TCPIPTimeOut ? left : TCPIPTimeOut));
+
+	ACRNemaAddress EE = *E;
+	strcpy(EE.Name, called);
+	if (!SCPrepareTLS(PDU, EE)) return "TLS not available for this node";
+	if (!PDU.Connect((unsigned char *)E->IP, (unsigned char *)E->Port)) return "no connection";
+	if (!PDU.IsAbstractSyntaxAccepted(scclass))
+		{
+		if (!PDU.Close()) PDU.Link.Close();
+		return "storage commitment not accepted";
+		}
+
+	SCSetUIDVR(&vr, 0x0008, 0x1195, tx);
+	DDO.Push(vr);
+	Array<DICOMDataObject*> *SQ = new Array<DICOMDataObject*>;
+	for (i=0; i<n; i++)
+		{
+		DICOMDataObject *item = new DICOMDataObject;
+		SCSetUIDVR(&vr, 0x0008, 0x1150, o[i].cls);
+		item->Push(vr);
+		SCSetUIDVR(&vr, 0x0008, 0x1155, o[i].inst);
+		item->Push(vr);
+		SQ->Add(item);
+		}
+	vr = new VR(0x0008, 0x1199, 0, (void *)NULL, FALSE);
+	vr->SQObjectArray = (void *)SQ;
+	DDO.Push(vr);
+
+	if (!ActionRequest.Write(&PDU, &DDO, &instance, 1))
+		{
+		PDU.Link.Close();
+		return "request not sent";
+		}
+	if (!PDU.Read(&DCO) || !ActionResponse.Read(&DCO, &PDU, &RDO))
+		{
+		PDU.Link.Close();
+		return "no response to the request";
+		}
+	if (DCO.GetUINT16(0x0000, 0x0900)!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment verify: N-ACTION refused by %s with status 0x%04x (transaction %s)\n", ae, DCO.GetUINT16(0x0000, 0x0900), tx);
+		if (!PDU.Close()) PDU.Link.Close();
+		return "request refused";
+		}
+
+	until = time(NULL) + OutgoingSCSameAssocWait;
+	if (until > deadline) until = deadline;
+	if (OutgoingSCSameAssocWait>0 && !SCVerifyWaitSameAssoc(PDU, called, k, until))
+		{
+		PDU.Link.Close();
+		return NULL;
+		}
+	if (!PDU.Close()) PDU.Link.Close();
+	return NULL;
+	}
+
+// One chunk: register a pending request with a new TransactionUID, ask, wait for the result until
+// the deadline, remove the pending request. NULL when every object was reported committed, else
+// the reason (fail receives "failed <n>").
+static const char *SCVerifyChunk(const char *ae, ACRNemaAddress *E, SCVerifyObj *o, int n, time_t deadline, char *fail,
+	char *txs, int txsize)
+	{
+	char tx[72];
+	SCMember *m;
+	int k, i, reports, bad, nfail;
+	const char *why;
+
+	if (!SCNewTxUID(tx)) return "internal error (no random transaction UID)";
+	m = (SCMember *)malloc(n*sizeof(SCMember));
+	if (!m) return "internal error (out of memory)";
+	for (i=0; i<n; i++)				// o is sorted: so is m (bsearch in SCCheckSequence)
+		{
+		strcpy(m[i].inst, o[i].inst);
+		strcpy(m[i].cls, o[i].cls);
+		m[i].seen = m[i].reason = m[i].outcome = m[i].oreason = m[i].gen = 0;
+		}
+	EnterCriticalSection(&SCVerifyCritical);
+	for (k=0; k<SC_VERIFYCAP; k++)
+		if (!SCVerifyMap[k].used) break;
+	if (k<SC_VERIFYCAP)
+		{
+		SCVerifyPending *p = SCVerifyMap+k;
+		p->used = 1;
+		strcpy(p->tx, tx);
+		strcpy(p->ae, ae);
+		p->m = m;
+		p->nm = n;
+		p->reports = p->bad = p->nfail = 0;
+		}
+	LeaveCriticalSection(&SCVerifyCritical);
+	if (k==SC_VERIFYCAP) { free(m); return "busy"; }
+
+	if (strlen(txs)+strlen(tx)+5 < (size_t)txsize) sprintf(txs+strlen(txs), "%s%s", txs[0] ? " " : "", tx);
+	else if (!strstr(txs, "...")) strcat(txs, " ...");	// txsize leaves room for it
+	OperatorConsole.printf("Storage commitment verify: request to %s, transaction %s, %d object(s)\n", ae, tx, n);
+	why = SCVerifyRequest(ae, E, tx, o, n, k, deadline);
+	if (!why)
+		while (time(NULL) < deadline && !SCVerifyHasResult(k)) Sleep(100);
+
+	EnterCriticalSection(&SCVerifyCritical);
+	reports = SCVerifyMap[k].reports;
+	bad     = SCVerifyMap[k].bad;
+	nfail   = SCVerifyMap[k].nfail;
+	SCVerifyMap[k].used = 0;
+	SCVerifyMap[k].m = NULL;
+	SCVerifyMap[k].tx[0] = 0;
+	LeaveCriticalSection(&SCVerifyCritical);
+	free(m);
+
+	if (bad)        return "invalid result";
+	if (why)        return why;
+	if (reports==0) return "no result";
+	if (nfail>0)    { sprintf(fail, "failed %d", nfail); return fail; }
+	return NULL;
+	}
+
+// steps 1 to 6 (see part 2); NULL when the answer is 1, else the reason
+static const char *SCVerifyRun(const char *study, const char *aearg, int timeout, int *nobj, char *fail,
+	int *chunks, char *txs, int txsize)
+	{
+	SCVerifyObj *o = NULL, *o2 = NULL;
+	ACRNemaAddress E;
+	char ae[20];
+	const char *why = NULL;
+	time_t deadline = time(NULL) + timeout;
+	unsigned int seq0 = SCSendSeq();		// local changes registered from now on
+	int n, n2 = 0, i, c;
+
+	*nobj = 0;
+	n = SCVerifyRead(study, &o);
+	if (n==SCV_DBERROR) return "database error";
+	if (n==SCV_NOFILE)  return "no local file";
+	if (n<0)            return "invalid local object";
+	*nobj = n;
+	if (n==0) return "empty";
+	if (SCVerifyWriting(study, o, n)) { SCVerifyFree(o, n); return "writing"; }
+
+	if (!GetACRNemaEntryByAE((char *)aearg, &E) || !(E.Flags & ACR_SC) || strchr(E.Name, '*') || strchr(E.IP, '*'))
+		{ SCVerifyFree(o, n); return "not an SC node"; }
+	memset(ae, 0, sizeof(ae));
+	strncpy(ae, E.Name, 16);
+	SCTrim(ae);
+	if (!SCIsAE(ae)) { SCVerifyFree(o, n); return "not an SC node"; }
+
+	for (c=0; c<n && !why; c+=OutgoingSCMaxBatch)
+		{
+		(*chunks)++;
+		why = SCVerifyChunk(ae, &E, o+c, n-c < OutgoingSCMaxBatch ? n-c : OutgoingSCMaxBatch, deadline, fail, txs, txsize-8);
+		}
+
+	if (!why)
+		{
+		// 6. the local side again: no write of the study before or after the second read, the
+		// same objects with the same fingerprints, no local change of them since the start
+		if (SCVerifyWriting(study, o, n)) why = "changed";
+		else
+			{
+			n2 = SCVerifyRead(study, &o2);
+			if (n2==SCV_DBERROR) why = "database error";
+			else if (n2!=n) why = "changed";
+			else
+				{
+				for (i=0; i<n && !why; i++) if (!SCVerifySame(o+i, o2+i)) why = "changed";
+				if (!why && SCVerifyWriting(study, o2, n2)) why = "changed";
+				for (i=0; i<n && !why; i++) if (SCChangedSince(o[i].inst, seq0)) why = "changed";
+				}
+			}
+		}
+	SCVerifyFree(o, n);
+	if (n2>0) SCVerifyFree(o2, n2);
+	return why;
+	}
+
+// milliseconds for durations in the log (wraps after 49 days; only differences are used)
+#ifndef WIN32
+#include <sys/time.h>
+#endif
+static unsigned int SCNowMs(void)
+	{
+#ifdef WIN32
+	return (unsigned int)GetTickCount();
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (unsigned int)((unsigned long long)tv.tv_sec*1000ULL + (unsigned long long)(tv.tv_usec/1000));
+#endif
+	}
+
+// in the server process (where results on new associations arrive): the worker runs here
+int SCVerifyInServer(void)
+	{
+	return SCWorkerRunning;
+	}
+
+// Verify now: 1 when the archive committed every local object of the study in this call, else 0
+// with the reason in reason ("disabled", "busy", "empty", "writing", "not an SC node", "no result",
+// "failed <n>", "changed", "database error", ...). timeout: 1..600 seconds.
+int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
+	{
+	char study[80], ae[80], fail[32], txs[1024];
+	const char *why = NULL;
+	int nobj = 0, chunks = 0;
+	unsigned int t0 = SCNowMs(), ms;
+
+	txs[0] = 0;
+	if (!OutgoingStorageCommitment)
+		{
+		snprintf(reason, size, "disabled");
+		OperatorConsole.printf("*** Storage commitment verify: OutgoingStorageCommitment is 0 (answer 0 disabled)\n");
+		return 0;
+		}
+	study[0] = ae[0] = 0;
+	if (StudyUID && strlen(StudyUID)<=64) { while (*StudyUID==' ') StudyUID++; strcpy(study, StudyUID); SCTrim(study); }
+	if (AE && strlen(AE)<=64)             { while (*AE==' ') AE++;             strcpy(ae, AE);          SCTrim(ae); }
+	if (!SCIsUID(study) || !SCIsAE(ae) || timeout<1 || timeout>600)
+		{
+		snprintf(reason, size, "usage");
+		OperatorConsole.printf("*** Storage commitment verify: use sc_verify_now:StudyUID,AE[,timeout 1..600 s] (answer 0 usage)\n");
+		return 0;
+		}
+
+	EnterCriticalSection(&SCVerifyCritical);
+	if (SCVerifyActive >= OutgoingSCVerifyMax) why = "busy";
+	else SCVerifyActive++;
+	LeaveCriticalSection(&SCVerifyCritical);
+	if (!why)
+		{
+		why = SCVerifyRun(study, ae, timeout, &nobj, fail, &chunks, txs, sizeof(txs));
+		EnterCriticalSection(&SCVerifyCritical);
+		SCVerifyActive--;
+		LeaveCriticalSection(&SCVerifyCritical);
+		}
+
+	if (why) snprintf(reason, size, "%s", why);
+	else     reason[0] = 0;
+	// one line per verification: study, AE, objects, chunks, TransactionUIDs, duration, result
+	ms = SCNowMs() - t0;
+	OperatorConsole.printf("Storage commitment verify: study %s, AE %s, %d object(s), %d chunk(s), transaction(s) %s, %u.%03u s: %s%s\n",
+		study, ae, nobj, chunks, txs[0] ? txs : "-", ms/1000, ms%1000, why ? "0 " : "1", why ? why : "");
+	return why ? 0 : 1;
+	}
+
+// sc_verify_now:<StudyUID>,<AE>[,<timeout s>] -> "1" or "0 <reason>"
+static void SCVerifyNowCommand(char *args, char *Response)
+	{
+	char *items[4], reason[128], *c;
+	int n, t = 60;
+
+	if (!OutgoingStorageCommitment)
+		{
+		strcpy(Response, "0 disabled");
+		OperatorConsole.printf("*** Storage commitment verify: OutgoingStorageCommitment is 0 (answer 0 disabled)\n");
+		return;
+		}
+	n = SCSplitArgs(args, items, 3);
+	if (n==3)
+		{
+		for (c=items[2]; *c; c++) if (*c<'0' || *c>'9') break;
+		t = (*c || !items[2][0] || strlen(items[2])>4) ? 0 : atoi(items[2]);
+		}
+	if (n<2 || n>3) t = 0;
+	if (SCVerifyNow(n>=1 ? items[0] : "", n>=2 ? items[1] : "", t, reason, sizeof(reason))==1)
+		strcpy(Response, "1");
+	else
+		sprintf(Response, "0 %s", reason);
 	}
 
 // results of SCSendChunk
@@ -28475,6 +29176,14 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 				      AAPtr->Options);	// 13th argument, unused by existing formats
 			}
 		fclose(g);
+		return true;
+		}
+
+	// outgoing storage commitment: verify now, before a local delete ("1" or "0 <reason>")
+	if (memcmp(SilentText, "sc_verify_now:", 14)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCVerifyNowCommand(SilentText+14, Response);
 		return true;
 		}
 

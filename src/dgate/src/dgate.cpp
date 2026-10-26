@@ -1399,6 +1399,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			lua/sc_delete_if_verified.lua (not enabled anywhere). The dgate log gets one line per
 			verification (study, AE, objects, chunks, TransactionUIDs, duration, result), one per
 			request, and one per result received or refused (request or new association)
+20261026	mmd	Outgoing storage commitment: the reconciliation of sc_unsafe_clear: makes every row of a
+			reconciled object CHANGED (Gen + 1), whatever its state (also FAILED, TIMEOUT, HELD,
+			CANCELLED: a late result could still make them COMMITTED); only CHANGED rows stay as they are
 
 ENDOFUPDATEHISTORY
 */
@@ -26997,12 +27000,15 @@ static void SCPurge(Database &DB, unsigned int now)
 	}
 
 // Reconciliation before "commitment unsafe" is cleared. A local overwrite whose invalidation
-// failed left the rows of its object as they were (COMMITTED, or REQUESTED/NOTED that a result can
-// still make COMMITTED, with the Gen of the old content). Rule: every NOTED, REQUESTED or COMMITTED
-// row whose LastSent (when its last send was noted) is not before the modification time of the
-// object's current local file (whole seconds) becomes CHANGED (Gen + 1, as SCLocalStored would
-// have done). No usable file (not local any more, not found, no time): every such row of the
-// object becomes CHANGED. Why LastSent and not CommittedAt: the send read the file before LastSent,
+// failed left the rows of its object as they were, with the Gen of the old content: COMMITTED, and
+// any other state that a late result can still turn into COMMITTED (a COMMITTED result applies
+// to every row WHERE Gen = member Gen, whatever its state: NOTED, REQUESTED, FAILED, TIMEOUT, HELD,
+// CANCELLED). Rule: an object is reconciled when any of its rows that is not CHANGED has a
+// LastSent (when its last send was noted) that is not before the modification time of the object's
+// current local file (whole seconds), or when it has no usable file (not local any more, not
+// found, no time). EVERY row of a reconciled object except the CHANGED ones becomes CHANGED
+// (Gen + 1, so no result of an earlier request applies; CANCELLED included): a reconciled object
+// always needs a new send. Why LastSent and not CommittedAt: the send read the file before LastSent,
 // and LastSent <= CommittedAt, so this catches every overwrite after the send, also one between the
 // send and its result. Why it is enough: a demotion that failed was preceded by the change in
 // memory, so a send recorded after it was stale (CHANGED) or is still queued (the clear is refused
@@ -27011,6 +27017,10 @@ static void SCPurge(Database &DB, unsigned int now)
 // side). Returns the number of objects made CHANGED, -1 on a database error.
 struct SCReconItem { char inst[65]; unsigned int last; };
 
+// a reconciled row: CHANGED whatever its state (unlike SCChangedUpdate, CANCELLED too)
+static const char *SCReconcileUpdate =
+	SC_GENINC ", TxUID = '', CommittedAt = 0, Attempts = 0, NoResend = 1, NextTry = 0, State = 'CHANGED'";
+
 static int SCReconcile(Database &DB)
 	{
 	SCReconItem *list = NULL, *nl;
@@ -27018,7 +27028,7 @@ static int SCReconcile(Database &DB)
 	char inst[80], last[32], where[256];
 	SQLLEN len;
 
-	if (!DB.Query("SCObject", "SOPInstUID, MIN(LastSent)", "State in ('NOTED', 'REQUESTED', 'COMMITTED') GROUP BY SOPInstUID", NULL))
+	if (!DB.Query("SCObject", "SOPInstUID, MIN(LastSent)", "State <> 'CHANGED' GROUP BY SOPInstUID", NULL))
 		return -1;
 	inst[0] = last[0] = 0;
 	DB.BindField(1, SQL_C_CHAR, inst, sizeof(inst), &len);
@@ -27051,9 +27061,8 @@ static int SCReconcile(Database &DB)
 		BOOL known = file && stat(file, &st)==0;
 		if (file) free(file);
 		if (known && (long long)st.st_mtime < (long long)list[i].last) continue;	// every send after the file was written
-		if (known) sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED') and LastSent <= %lld", list[i].inst, (long long)st.st_mtime);
-		else       sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED')", list[i].inst);
-		BOOL demoted = DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where);
+		sprintf(where, "SOPInstUID = '%s' and State <> 'CHANGED'", list[i].inst);
+		BOOL demoted = DB.UpdateRecords((char *)"SCObject", (char *)SCReconcileUpdate, where);
 		SCInvalidate();
 		if (!demoted) { free(list); return -1; }
 		OperatorConsole.printf("Storage commitment: reconciliation: %s made CHANGED (%s)\n", list[i].inst,

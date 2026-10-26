@@ -6,6 +6,7 @@
 // 20121214 mvh     Mode sa public
 // 20140528 lsp     Private copy constructor is not GNUC specific
 // 20261026 mmd     Outgoing TLS members and hooks (used only with HAVE_OPENSSL)
+// 20261026 mmd     Incoming TLS: TLSAccept and the ServerContext hook
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -94,6 +95,12 @@ class	Socket
 		int	TLSMode;
 		char	TLSPeerAE[20];		// node being connected, for the certificate checks
 		BOOL	SetTLS(int on, const char *AE);
+		// Incoming TLS (20261026 mmd): server side handshake on an accepted socket fd,
+		// with a time limit, before any DICOM data is read. On success the socket
+		// becomes this object's TLS connection (Connected is left as it was, so
+		// PDU_Service::Multiplex(fd) can take it over); on failure fd is closed.
+		// peer = text for messages (the caller's IP). Without HAVE_OPENSSL: FALSE.
+		BOOL	TLSAccept(int fd, const char *peer);
 	private:
 		BOOL	TLSOpen(char *host);
 		void	TLSFree(BOOL SendCloseNotify);
@@ -111,12 +118,14 @@ class	Socket
 //   BeforeHandshake: called with the new SSL* (e.g. to set the host name check)
 //   AfterHandshake:  called after a good handshake (e.g. certificate pin); FALSE aborts
 //   Log:             level 0 = operator message, 1 = debug
+//   ServerContext:   returns the SSL_CTX* for incoming TLS connections, or NULL
 typedef struct	_SocketTLSHooks
 	{
 	void	*(*ClientContext)(void);
 	BOOL	(*BeforeHandshake)(void *ssl, const char *AE, const char *host);
 	BOOL	(*AfterHandshake)(void *ssl, const char *AE, const char *host);
 	void	(*Log)(int level, const char *text);
+	void	*(*ServerContext)(void);
 	}	SocketTLSHooks;
 extern	SocketTLSHooks	SocketTLS;
 

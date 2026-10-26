@@ -1349,6 +1349,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			TIMEOUT on the next pass (transaction ABANDONED), not only after OutgoingSCReportTimeout
 20261026	mmd	Outgoing storage commitment: reads during OutgoingSCSameAssocWait are bounded by the rest
 			of the wait (at least 1 s); a result that does not arrive in full aborts the association
+20261026	mmd	Outgoing storage commitment: TransactionUID built with bounded buffers (UID root read
+			with a length limit, snprintf, length <= 64 checked); no GenUID into a fixed buffer
 
 ENDOFUPDATEHISTORY
 */
@@ -23950,24 +23952,39 @@ static BOOL SCStrictUID(const char *s)
 	return TRUE;
 	}
 
-// new TransactionUID: the server's UID root (UIDPrefix, as GenUID) + ".20." + 64 random bits.
-// If that root does not give a valid UID of at most 64 characters, 2.25 + 128 random bits.
-// FALSE when no random numbers are available: then nothing is sent.
+// new TransactionUID: the server's UID root (UIDPrefix + ".6", as GenUID uses it) + ".20." + 64
+// random bits. If that does not give a valid UID of at most 64 characters, 2.25 + 128 random bits.
+// The root is read here with a bounded length (not through GenUID, which writes into the caller's
+// buffer without a size); every UID is built with snprintf and its length checked before use.
+// FALSE when no random numbers are available, or no valid UID results: then nothing is sent.
+// out: at least 65 bytes. Worker thread only (the root is read once).
 static BOOL SCNewTxUID(char *out)
 	{
+	static char root[80];
+	static BOOL loaded = FALSE;
 	unsigned char r[16];
-	char dec[64], tmp[80];
-	GenUID(tmp);			// force load of the UID root
+	char dec[64], tmp[160], szRootSC[64], prefix[80];
+	int len;
+
+	out[0] = 0;
+	if (!loaded)
+		{
+		strcpy(prefix, "1.2.826.0.1.3680043.2.135.1066");
+		if (MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, szRootSC, 64, ConfigFile))
+			MyGetPrivateProfileString(szRootSC, "UIDPrefix", "1.2.826.0.1.3680043.2.135.1066", prefix, 64, ConfigFile);
+		prefix[64] = 0;
+		snprintf(root, sizeof(root), "%s.6", prefix);
+		loaded = TRUE;
+		}
 	if (!SCRandomBytes(r, 16)) return FALSE;
 	SCBytesToDecimal(r, 8, dec);
-	if (strlen(UIDPrefix)+4+strlen(dec) <= 64)
-		{
-		sprintf(out, "%s.20.%s", UIDPrefix, dec);
-		if (SCStrictUID(out)) return TRUE;
-		}
+	len = snprintf(tmp, sizeof(tmp), "%s.20.%s", root, dec);
+	if (len>0 && len<=64 && SCStrictUID(tmp)) { strcpy(out, tmp); return TRUE; }
 	SCBytesToDecimal(r, 16, dec);
-	sprintf(out, "2.25.%s", dec);
-	return SCStrictUID(out);
+	len = snprintf(tmp, sizeof(tmp), "2.25.%s", dec);
+	if (len<=0 || len>64 || !SCStrictUID(tmp)) return FALSE;
+	strcpy(out, tmp);
+	return TRUE;
 	}
 
 // UID element padded with NUL to even length

@@ -36,6 +36,8 @@
 20261026	mmd	Windows constructor: TLS members set before the WSAStartup early return
 20261026	mmd	TLS: the calls that make the socket non-blocking are checked; when one
 			fails the TLS connect, handshake or accept fails (never a blocking wait)
+20261026	mmd	TLSMode 2: the legacy client context (ClientContextLegacy hook); one console
+			line per legacy connection with the protocol and cipher
 
 */
 
@@ -92,7 +94,17 @@
 #endif
 
 // outgoing TLS hooks, set by the application (all NULL: TLS is refused)
-SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL, NULL };
+SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL, NULL, NULL };
+
+#ifdef	HAVE_OPENSSL
+// the client context for TLSMode 1 (strict) or 2 (legacy), or NULL
+static	void	*SocketClientContext(int mode)
+	{
+	if (mode == 2)
+		return SocketTLS.ClientContextLegacy ? SocketTLS.ClientContextLegacy() : NULL;
+	return SocketTLS.ClientContext ? SocketTLS.ClientContext() : NULL;
+	}
+#endif
 
 // TLS message to the application log (level 0 operator, 1 debug)
 static	void	SocketTLSPrint(int level, const char *fmt, ...)
@@ -443,7 +455,7 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 		return ( FALSE );
 		}
 #else
-	if ( TLSMode && !(SocketTLS.ClientContext && SocketTLS.ClientContext()) )
+	if ( TLSMode && !SocketClientContext(TLSMode) )
 		{
 		// TLS configuration not usable: do not even connect
 		Socketfd = 0;
@@ -823,12 +835,12 @@ Socket	::	 BindUDPClient (
 	return ( FALSE );
 	}
 
-// Ask for TLS (on=1) or plain (on=0) on the next Open; AE is the node being
+// Ask for TLS (on=1; on=2 legacy profile) or plain (on=0) on the next Open; AE is the node being
 // connected (used for its certificate checks). Returns FALSE when TLS is asked
 // for and this build has no TLS: Open will then refuse the connection.
 BOOL	Socket	::	SetTLS(int on, const char *AE)
 	{
-	TLSMode = on ? 1 : 0;
+	TLSMode = on == 2 ? 2 : on ? 1 : 0;	// 2 = legacy profile (map option L)
 	memset(TLSPeerAE, 0, sizeof(TLSPeerAE));
 	if (AE)
 		strncpy(TLSPeerAE, AE, sizeof(TLSPeerAE)-1);
@@ -970,7 +982,7 @@ BOOL	Socket	::	TLSOpen(char *host)
 	time_t	end;
 	BOOL	isname = FALSE;
 
-	ctx = SocketTLS.ClientContext ? (SSL_CTX *) SocketTLS.ClientContext() : NULL;
+	ctx = (SSL_CTX *) SocketClientContext(TLSMode);
 	if (!ctx)
 		{
 		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: no usable TLS client configuration", TLSPeerAE, host);
@@ -1045,7 +1057,10 @@ BOOL	Socket	::	TLSOpen(char *host)
 		return ( FALSE );
 		}
 
-	SocketTLSPrint(1, "TLS: connected to %s (%s) with %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+	if (TLSMode == 2)
+		SocketTLSPrint(0, "TLS legacy profile with %s (%s): %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+	else
+		SocketTLSPrint(1, "TLS: connected to %s (%s) with %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
 	return ( TRUE );
 	}
 

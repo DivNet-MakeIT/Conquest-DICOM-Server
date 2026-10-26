@@ -7,6 +7,7 @@
 // 20140528 lsp     Private copy constructor is not GNUC specific
 // 20261026 mmd     Outgoing TLS members and hooks (used only with HAVE_OPENSSL)
 // 20261026 mmd     Incoming TLS: TLSAccept and the ServerContext hook
+// 20261026 mmd     TLSMode 2 (legacy profile) and the ClientContextLegacy hook
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -91,6 +92,7 @@ class	Socket
 		// Outgoing TLS (20261026 mmd). TLSMode 0 = plain, exactly as before.
 		// TLSMode 1 = the next Open makes a TLS client connection, or fails:
 		// it never falls back to plain. Without HAVE_OPENSSL Open refuses it.
+		// TLSMode 2 = as 1, with the legacy client context (map option L).
 		void	*TLSHandle;		// SSL* while TLS is active, else NULL (void*: no OpenSSL headers needed here)
 		int	TLSMode;
 		char	TLSPeerAE[20];		// node being connected, for the certificate checks
@@ -120,6 +122,7 @@ class	Socket
 //   AfterHandshake:  called after a good handshake (e.g. certificate pin); FALSE aborts
 //   Log:             level 0 = operator message, 1 = debug
 //   ServerContext:   returns the SSL_CTX* for incoming TLS connections, or NULL
+//   ClientContextLegacy: the SSL_CTX* for TLSMode 2 (legacy profile), or NULL
 typedef struct	_SocketTLSHooks
 	{
 	void	*(*ClientContext)(void);
@@ -127,6 +130,7 @@ typedef struct	_SocketTLSHooks
 	BOOL	(*AfterHandshake)(void *ssl, const char *AE, const char *host);
 	void	(*Log)(int level, const char *text);
 	void	*(*ServerContext)(void);
+	void	*(*ClientContextLegacy)(void);
 	}	SocketTLSHooks;
 extern	SocketTLSHooks	SocketTLS;
 

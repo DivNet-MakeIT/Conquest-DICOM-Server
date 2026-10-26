@@ -12,6 +12,9 @@
                   entry copy/put/delete functions so that other files do not touch the array
    mmd  20261025: Optional 5th column (options T, SC, R, Rn, RI); the rest of the line after the
                   compression column is kept and written back; GetACRNemaEntryByAE
+   mmd  20261026: Option L (only with T, e.g. TL, TLSC): legacy TLS profile; L without T is
+                  ignored with a console line. FormatACRNemaOptions: the options token in the
+                  canonical order T L SC R... (write_amap), all letters kept
 */
    
 
@@ -82,8 +85,10 @@ static void AMapCopyField(char *dest, const char *src, int size)
 //   T        TLS              SC   storage commitment for data sent to the node
 //   TSC/SCT  both             R    re-send missing objects, limit from dicom.ini
 //   Rn       limit n (1..999) RI   until committed            R0   no re-send
-// T and SC in any order, R last (e.g. SCR5, TSCRI). Anything else gives no
-// options (the column may hold user data, e.g. lua/association.lua).
+//   L        legacy TLS profile (TLS 1.0-1.2, AES-CBC), only together with T
+// T, L and SC in any order, R last (e.g. SCR5, TSCRI, TLSC). Anything else gives no
+// options (the column may hold user data, e.g. lua/association.lua). L without T
+// is ignored (console line), the other options of the token stay.
 int
 ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn)
 	{
@@ -102,6 +107,7 @@ ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOO
 		{
 		if (p[0]=='S' && p[1]=='C' && !(flags & ACR_SC)) { flags |= ACR_SC; p += 2; continue; }
 		if (p[0]=='T' && !(flags & ACR_TLS)) { flags |= ACR_TLS; p += 1; continue; }
+		if (p[0]=='L' && !(flags & ACR_TLSLEGACY)) { flags |= ACR_TLSLEGACY; p += 1; continue; }
 		if (p[0]=='R')
 			{
 			if (p[1]==0) { flags |= ACR_RESEND; *ResendLimit = ACR_RESEND_INI; p += 1; continue; }
@@ -116,11 +122,16 @@ ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOO
 				}
 			}
 		// not an option token: no options for this line
-		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: 5th column '%s' is not an option (T, SC, R...), ignored\n", Name, tok);
+		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: 5th column '%s' is not an option (T, L, SC, R...), ignored\n", Name, tok);
 		*ResendLimit = 0;
 		return 0;
 		}
 
+	if ((flags & ACR_TLSLEGACY) && !(flags & ACR_TLS))
+		{
+		if (Warn) OperatorConsole.printf("*** TLS: acrnema.map: %s: L needs T, L ignored (no TLS for this entry)\n", Name);
+		flags &= ~ACR_TLSLEGACY;
+		}
 	if ((flags & ACR_RESEND) && !(flags & ACR_SC))
 		{
 		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: R needs SC, R ignored\n", Name);
@@ -132,6 +143,39 @@ ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOO
 		flags &= ~ACR_RESEND; *ResendLimit = 0;
 		}
 	return flags;
+	}
+
+// The options column for write_amap: when the first token holds options, its letters are
+// written upper case in the canonical order T, L, SC, R... (e.g. tlscr5 or SCTLR5 -> TLSCR5);
+// every letter of the token is kept, also one that is ignored (e.g. L without T, R0, R on a
+// wildcard entry), so nothing the user wrote is lost. The rest of the line follows unchanged.
+// A column that is not an option token is written as read.
+void
+FormatACRNemaOptions(const ACRNemaAddress *Entry, char *out, int outlen)
+	{
+	const char	*p = Entry->Options, *q;
+	char		tok[32], r[32];
+	int		t = 0, l = 0, sc = 0, n;
+
+	while (*p==' ' || *p=='\t') p++;
+	if (!Entry->Flags)
+		{
+		snprintf(out, outlen, "%s", Entry->Options);
+		return;
+		}
+	// the token parsed as options: T, L, SC once each in any order, then R... last
+	r[0] = 0;
+	for (q=p; *q && *q!=' ' && *q!='\t'; )
+		{
+		char c = toupper((unsigned char)*q);
+		if (c=='S') { sc = 1; q += 2; continue; }
+		if (c=='T') { t = 1; q++; continue; }
+		if (c=='L') { l = 1; q++; continue; }
+		for (n=0; *q && *q!=' ' && *q!='\t' && n<(int)sizeof(r)-1; q++) r[n++] = toupper((unsigned char)*q);
+		r[n] = 0;
+		}
+	snprintf(tok, sizeof(tok), "%s%s%s%s", t ? "T" : "", l ? "L" : "", sc ? "SC" : "", r);
+	snprintf(out, outlen, "%s%s", tok, q);
 	}
 
 static void

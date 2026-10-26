@@ -1299,6 +1299,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			N-EVENT-REPORT handling for results of storage commitment requests sent by this server
 			(result checked in full before anything is recorded; sender must connect from its
 			acrnema.map address unless OutgoingSCCheckIP = 0)
+20261026	mmd	OutgoingStorageCommitment: successful C-STORE to a node with SC in acrnema.map is noted
+			in a bounded in-memory queue (ExportConverter and ImportConverter forward, C-MOVE SCP
+			in nkiqrsop.cpp (not C-GET), Lua dicomstore); server command sc_queue: gives its length
 
 ENDOFUPDATEHISTORY
 */
@@ -6076,6 +6079,11 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
   
         RTCStorage.SetUID(iUID);
   
+        // outgoing storage commitment: UIDs as sent (Write empties the object)
+        char scCls[68], scInst[68], scStudy[68];
+        int scOn = OutgoingStorageCommitment;
+        if (scOn) SCCaptureUIDs(DDO, scCls, scInst, scStudy);
+
         if (!RTCStorage.Write(PDU+part, DDO))
         { OperatorConsole.printf("*** ExportConverter%d.%d: Forward failed to send DICOM image to %s\n", N, part, line+offset);
           PDU[part].Close();
@@ -6084,6 +6092,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
+        if (scOn) SCNoteSent(line+offset, scCls, scInst, scStudy);
       
         ImagesForwarded++;
         if (level==4) 
@@ -10481,12 +10490,18 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
 
 	RTCStorage.SetUID(iUID);
 
+	// outgoing storage commitment: UIDs as sent (Write empties the object)
+	char scCls[68], scInst[68], scStudy[68];
+	int scOn = OutgoingStorageCommitment;
+	if (scOn) SCCaptureUIDs(pDDO, scCls, scInst, scStudy);
+
 	if (!RTCStorage.Write(PDU+channel, pDDO))
 	{ if (N >= -2) OperatorConsole.printf("*** %sConverter%d.%d: Forward failed to send DICOM image to %s\n", ininame, N, channel, line+offset);
   	  PDU[channel].Close();
 	}
 	else
-	{ ImagesForwarded++;
+	{ if (scOn) SCNoteSent(line+offset, scCls, scInst, scStudy);
+	  ImagesForwarded++;
 
 	  if (level==4) 
 	  { MyGetPrivateProfileString(szRootSC, "ForwardAssociationRelease", "1", Temp, 64, ConfigFile);
@@ -22025,6 +22040,112 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 	return TRUE;
 	}
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// Outgoing storage commitment, part 2: noting sends. After a successful C-STORE to a node
+// with SC in acrnema.map the object is put in a bounded in-memory queue; the storage
+// commitment worker takes it from there. No database access in the send paths, and
+// nothing at all when OutgoingStorageCommitment is 0.
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// one successful C-STORE to a node, to be picked up by the storage commitment worker
+struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; };
+
+#define SC_NOTEDMAX 50000
+
+static SCNoted		SCNotedQueue[SC_NOTEDMAX];	// ring buffer
+static int		SCNotedHead = 0;		// oldest item
+static int		SCNotedCount = 0;		// items in the queue
+static unsigned int	SCNotedDropped = 0;		// items dropped because the queue was full
+static CRITICAL_SECTION	SCNotedCritical;
+static struct SCNotedCriticalInit
+	{
+	SCNotedCriticalInit() { InitializeCriticalSection(&SCNotedCritical); }
+	}	SCNotedCriticalInitObject;
+
+// called after a successful C-STORE; cheap: copies into a bounded in-memory queue
+// (no database access in the send path). Does nothing unless OutgoingStorageCommitment
+// and the AE has SC in acrnema.map. study may be "" (the worker looks it up).
+void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID)
+	{
+	ACRNemaAddress	E;
+	char		ae[20];
+	unsigned int	dropped = 0;
+	int		n = 0;
+
+	if (!OutgoingStorageCommitment) return;
+	if (!AE || !SOPClassUID || !SOPInstanceUID) return;
+
+	memset(ae, 0, sizeof(ae));
+	strncpy(ae, AE, 16);
+	SCTrim(ae);
+	if (!SCIsAE(ae)) return;
+	if (!GetACRNemaEntryByAE(ae, &E)) return;
+	if (!(E.Flags & ACR_SC)) return;
+	if (!SCIsUID(SOPClassUID) || !SCIsUID(SOPInstanceUID)) return;
+
+	EnterCriticalSection(&SCNotedCritical);
+	if (SCNotedCount >= SC_NOTEDMAX)
+		{
+		dropped = ++SCNotedDropped;
+		n = SCNotedCount;
+		}
+	else
+		{
+		SCNoted *q = SCNotedQueue + (SCNotedHead + SCNotedCount) % SC_NOTEDMAX;
+		strcpy(q->ae, ae);
+		strcpy(q->cls, SOPClassUID);
+		strcpy(q->inst, SOPInstanceUID);
+		if (StudyUID && SCIsUID(StudyUID)) strcpy(q->study, StudyUID);
+		else                               q->study[0] = 0;
+		q->t = (unsigned int)time(NULL);
+		SCNotedCount++;
+		}
+	LeaveCriticalSection(&SCNotedCritical);
+
+	// a dropped item is never confirmed (safe side); one line per 1000 drops
+	if (dropped && (dropped % 1000)==1)
+		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
+	}
+
+// read the three UIDs from an object before it is written (Write empties the object)
+// buffers of 68; empty string when absent or invalid
+void SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study)
+	{
+	cls[0] = inst[0] = study[0] = 0;
+	if (!DDO) return;
+	if (!SCVRUID(DDO->GetVR(0x0008, 0x0016), cls))   cls[0] = 0;
+	if (!SCVRUID(DDO->GetVR(0x0008, 0x0018), inst))  inst[0] = 0;
+	if (!SCVRUID(DDO->GetVR(0x0020, 0x000d), study)) study[0] = 0;
+	}
+
+// worker side: move up to max queued items into buf; returns the count
+int SCTakeNoted(SCNoted *buf, int max)
+	{
+	int n = 0;
+	if (!buf || max<=0) return 0;
+	EnterCriticalSection(&SCNotedCritical);
+	while (n<max && SCNotedCount>0)
+		{
+		buf[n++] = SCNotedQueue[SCNotedHead];
+		SCNotedHead = (SCNotedHead + 1) % SC_NOTEDMAX;
+		SCNotedCount--;
+		}
+	if (SCNotedCount==0) SCNotedHead = 0;
+	LeaveCriticalSection(&SCNotedCritical);
+	return n;
+	}
+
+// number of items waiting in the queue and dropped so far (for the sc_queue: server command)
+static int SCNotedLength(unsigned int *dropped)
+	{
+	int n;
+	EnterCriticalSection(&SCNotedCritical);
+	n = SCNotedCount;
+	*dropped = SCNotedDropped;
+	LeaveCriticalSection(&SCNotedCritical);
+	return n;
+	}
+
 void CloneDB(char *AE)
 { VR *vr1;
   VR *vr;
@@ -23426,6 +23547,16 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		DebugVRs = DebugLevel = atoi(SilentText+11);
+		return true;
+		}
+
+	// outgoing storage commitment: "queued dropped" (objects noted, not yet taken by the worker)
+	if (memcmp(SilentText, "sc_queue:", 9)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		unsigned int scDropped;
+		int scQueued = SCNotedLength(&scDropped);
+		sprintf(Response, "%d %u", scQueued, scDropped);
 		return true;
 		}
 
@@ -30590,10 +30721,16 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 
           RTCStorage.SetUID(uid);
 
+          // outgoing storage commitment: UIDs of the copy as sent (Write empties it)
+          char scCls[68], scInst[68], scStudy[68];
+          int scOn = OutgoingStorageCommitment;
+          if (scOn) SCCaptureUIDs(DDO, scCls, scInst, scStudy);
+
           if (!RTCStorage.Write(&PDU, DDO, DCO))
           { OperatorConsole.printf("*** dicomstore: failed to send DICOM image to %s\n", ae);
             nfail++;
 	  }
+	  else if (scOn) SCNoteSent(ae, scCls, scInst, scStudy);
 	  delete DDO;
 	}
 	

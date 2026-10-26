@@ -631,6 +631,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 		if(ACRNema[vr->Length-1]==' ')
 			ACRNema[vr->Length-1] = '\0';
 
+		memset(&QualifiedEntry, 0, sizeof(QualifiedEntry));
 		if(!QualifyOn(ACRNema, MyACR, IP, lPort, Compress))
 			{
 			CMoveRSP :: Write (PDU, DCO, 0xc003, 0, 0, 0, 0, NULL );
@@ -741,7 +742,10 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 		NewPDU.SetTimeOut(TCPIPTimeOut);
 
-		PrepareTLSForAE(NewPDU, (char *)ACRNema);
+		if (QualifiedEntry.Name[0])		// same lookup as IP/lPort
+			SCPrepareTLSForCalledAE(NewPDU, QualifiedEntry, QualifiedEntry.Name);
+		else					// a QualifyOn that does not fill it: look up again
+			PrepareTLSForAE(NewPDU, (char *)ACRNema);
 		if (!NewPDU.Connect (IP, lPort))
 			{
 			CMoveRSP :: Write ( PDU, DCO, 0xc005 , 0, 0, 0, 0, NULL );

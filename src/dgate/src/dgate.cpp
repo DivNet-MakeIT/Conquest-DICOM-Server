@@ -20304,26 +20304,6 @@ BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
 	return PDU.SetTLS(1, E.Name);
 	}
 
-// The same for a destination given by its AE title. An AE that is not in the map
-// (e.g. host:port) stays plain. NOT for connect sites: it is a second map lookup
-// after the address was resolved; use GetACRNemaForConnect there (fix round 1).
-BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE)
-	{
-	ACRNemaAddress	E;
-	char		ae[20];
-
-	if (!AE)
-		return PDU.SetTLS(0, NULL);
-	memset(ae, 0, sizeof(ae));
-	strncpy(ae, AE, sizeof(ae)-1);
-	while (ae[0] && ae[strlen(ae)-1]==' ')
-		ae[strlen(ae)-1] = 0;
-	if (!GetACRNemaEntryByAE(ae, &E))
-		return PDU.SetTLS(0, NULL);
-	strcpy(E.Name, ae);		// a wildcard entry: the node certificate is looked up by the called AE
-	return SCPrepareTLS(PDU, E);
-	}
-
 // Connect sites (fix round 1): resolve the called AE ONCE and take address, port,
 // compression AND transport from that single map entry. GetACRNema followed by a
 // second lookup for the TLS flag could see two map versions (read_amap/put_amap in

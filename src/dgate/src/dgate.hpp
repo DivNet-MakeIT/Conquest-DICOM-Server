@@ -207,7 +207,6 @@ int	ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit,
 BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// TLS for nodes with T in acrnema.map
-BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE);	// the same, looked up by AE title (not for connect sites)
 BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE);	// from an entry, pin of called AE
 BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char *compress);	// one lookup: address + transport
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport

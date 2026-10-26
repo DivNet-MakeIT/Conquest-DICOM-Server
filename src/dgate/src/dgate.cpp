@@ -20279,6 +20279,12 @@ static	void	TLSLogLine(int level, const char *text)
 #	include	<openssl/evp.h>
 #	include	<openssl/x509v3.h>
 
+// OpenSSL 1.1.1 or later (1.1.1 and 3.x are both supported): TLS 1.3 constants,
+// SSL_CTX_set_num_tickets; 3.x only changes SSL_get1_peer_certificate (see below)
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
+#error "TLS support (HAVE_OPENSSL) needs OpenSSL 1.1.1 or later"
+#endif
+
 // RFC 9325 for TLS 1.2: only ECDHE with AES-GCM or CHACHA20-POLY1305
 #define	TLS_DEFAULT_CIPHERS	"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" \
 				"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" \

@@ -33,6 +33,7 @@
 			accepted socket) and the ServerContext hook
 20261026	mmd	TLS mode only: the TCP connect is non-blocking with a deadline of TimeOut
 			(TCPIPTimeOut at the connect sites); plain connect unchanged
+20261026	mmd	Windows constructor: TLS members set before the WSAStartup early return
 
 */
 
@@ -117,6 +118,9 @@ Socket	::	Socket ()
 	{
 	WORD		VersionNeeded;
 
+	TLSHandle = NULL;	// first: the destructor tests it even when WSAStartup failed
+	TLSMode = 0;
+	TLSPeerAE[0] = 0;
 	TimeOut = 60 * 5;	// 5 minutes	
 	UDP = 0;
 	if(! WinSockUsed )
@@ -141,9 +145,6 @@ Socket	::	Socket ()
 	ListenSocketfd = 0;
 	Connected = 0;
 	Listened = 0;
-	TLSHandle = NULL;
-	TLSMode = 0;
-	TLSPeerAE[0] = 0;
 	}
 
 Socket	::	~Socket ()

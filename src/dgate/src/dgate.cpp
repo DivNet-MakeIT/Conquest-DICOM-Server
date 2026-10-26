@@ -20734,7 +20734,24 @@ static	BOOL	TLSParseFingerprint(const char *s, unsigned char *fp)
 	return k == 2*TLS_FP_BYTES;
 	}
 
+
+// A structural error in the node certificate file: never publish a partial table (that
+// would leave nodes after the error unbound); keep the table loaded before, if any.
+static BOOL TLSNodeCertsKeep(const char *path, const char *why)
+	{
+	int have, n;
+	EnterCriticalSection(&TLSNodeCertCritical);
+	have = TLSNodeCertHave; n = TLSNodeCertCount; TLSNodeCertTried = 1;
+	LeaveCriticalSection(&TLSNodeCertCritical);
+	if (have)
+		OperatorConsole.printf("*** TLS: node certificate file %s %s: the node certificates loaded before (%d AEs) are kept\n", path, why, n);
+	else
+		OperatorConsole.printf("*** TLS: node certificate file %s %s: none loaded, no TLS node is bound to a certificate\n", path, why);
+	return FALSE;
+	}
+
 // Load (or reload) TLSNodeCertsFile. Returns FALSE when TLSNodeCertsFile is set and cannot be read.
+
 static	BOOL	LoadTLSNodeCerts(BOOL tell)
 	{
 	char		path[256], *buf, *p, *q, *line, *next, *fps, *one;
@@ -20766,6 +20783,11 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 		if (buf && fread(buf, 1, size, f) != (size_t)size) { free(buf); buf = NULL; }
 		fclose(f);
 		if (buf) buf[size] = 0;
+		if (buf && memchr(buf, 0, size))
+			{
+			free(buf);
+			return TLSNodeCertsKeep(path, "contains a NUL byte");
+			}
 		}
 	if (!buf)
 		{
@@ -20786,7 +20808,12 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 			{
 			p += 2;
 			while (*p && !(p[0]=='*' && p[1]=='/')) { if (*p=='\n') *q++ = '\n'; p++; }
-			if (*p) p += 2;
+			if (!*p)
+				{
+				free(buf);
+				return TLSNodeCertsKeep(path, "has a /* comment without */");
+				}
+			p += 2;
 			}
 		else
 			*q++ = *p++;
@@ -20866,7 +20893,12 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 		if (count == cap)
 			{
 			TLSNodeCertEntry *t = (TLSNodeCertEntry *) realloc(table, (cap ? 2*cap : 64) * sizeof(TLSNodeCertEntry));
-			if (!t) { OperatorConsole.printf("*** TLS: node certificate file %s: out of memory\n", path); break; }
+			if (!t)
+				{
+				free(buf);
+				if (table) free(table);
+				return TLSNodeCertsKeep(path, "could not be loaded (out of memory)");
+				}
 			table = t;
 			cap = cap ? 2*cap : 64;
 			}

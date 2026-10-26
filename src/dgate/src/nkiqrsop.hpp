@@ -128,7 +128,7 @@ class	ExtendedPDU_Service	:
 		  return FALSE;
 		};
 
-		// incoming TLS (20261026 mmd): TLSPin_<AE> on the TLS port, T nodes refused on
+		// incoming TLS (20261026 mmd): TLSNodeCertsFile on the TLS port, T nodes refused on
 		// the plain port (TLSEnforceForMappedNodes); see TLSCheckCallingAE in dgate.cpp
 		BOOL	ShouldIAcceptRemoteTransport(BYTE	*A)
 		{ return TLSCheckCallingAE(this, A);

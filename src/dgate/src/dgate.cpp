@@ -1354,10 +1354,13 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing TLS: every connect site resolves the destination once (GetACRNemaForConnect,
 			QualifyOn entry for C-MOVE): address and TLS come from the same acrnema.map entry
 20261026	mmd	TLS fixes: bounded TLS connect, locks for warnings and contexts, verify mode per
-			connection; incoming checks use one canonical calling AE form on both ports, pins found
+			connection; incoming checks use one canonical calling AE form on both ports, keys found
 			without regard to case; TLS ini values read through cache-size buffers
 20261026	mmd	TLSAcceptSelfSigned (default 0): 1 accepts self-signed peer certificates (both
 			directions; only the self-signed errors are forgiven), logged once per AE
+20261026	mmd	Node certificates (SHA-256) in a separate file TLSNodeCertsFile (default empty = none)
+			instead of TLSPin_<AE> keys; server command read_tlscerts:; unreadable lines and duplicate AEs
+			make that AE refused (fail closed)
 
 ENDOFUPDATEHISTORY
 */
@@ -14240,6 +14243,7 @@ PrintOptions ()
 	fprintf(stderr, "    --delete_amap:index       Delete entry in memory for ACRNEMA.MAP\n" );
 	fprintf(stderr, "    --write_amap:             Write ACRNEMA.MAP from memory to disk\n" );
 	fprintf(stderr, "    --read_amap:              Re-read ACRNEMA.MAP from disk to memory\n" );
+	fprintf(stderr, "    --read_tlscerts:           Re-read the TLS node certificates (TLSNodeCertsFile)\n" );
 	fprintf(stderr, "    --get_sop:index,fmt       List any accepted service class UID\n" );
 	fprintf(stderr, "    --put_sop:index,UID,name  Write/add accepted service class UID\n" );
 	fprintf(stderr, "    --delete_sop:index        Delete accepted service class UID\n" );
@@ -20166,13 +20170,13 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 // on that port only (the DICOM port TCPPort stays exactly as it was). The TLS
 // handshake runs in the child thread, with a time limit, before the association
 // is parsed. Client certificates are checked with TLSCAFile and TLSVerifyPeer;
-// after the A-ASSOCIATE-RQ, TLSPin_<calling AE> (if set) must match the client
-// certificate. With TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
+// after the A-ASSOCIATE-RQ, the certificate of the calling AE in TLSNodeCertsFile (if any) must
+// match the client certificate. With TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
 // calling AE with T in acrnema.map is rejected on the plain port.
 //
 // dicom.ini [sscscp] keys (all optional). The first five are read when the first
-// TLS connection is made (a change needs a restart); TLSVerifyHostname and
-// TLSPin_<AE> are read for every TLS connection.
+// TLS connection is made (a change needs a restart); TLSVerifyHostname is read for
+// every TLS connection; TLSNodeCertsFile at startup and with read_tlscerts:.
 //   TLSCertificate     our certificate (PEM, chain allowed), also sent as client certificate
 //   TLSPrivateKey      its key (PEM); default: the TLSCertificate file
 //   TLSCAFile          trusted CA or peer certificates (PEM); needed unless TLSVerifyPeer = ignore
@@ -20183,10 +20187,21 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //                      ECDHE with AES-GCM or CHACHA20-POLY1305). TLS 1.3: OpenSSL defaults
 //   TLSVerifyHostname  0 (default) | 1: the certificate (SAN) must match the host name or IP
 //                      address of the node in acrnema.map
-//   TLSPin_<AE>        one or two SHA-256 certificate fingerprints for node AE (hex, colons
-//                      optional, comma separated); when set, the certificate must match one
+//   TLSNodeCertsFile   node certificates, a separate file (many nodes); empty (default) =
+//                      no node certificates. A name without a path is in the dgate directory
+//                      (as acrnema.map), e.g. tlscerts.map. One line per AE:
+//                      "AE  fingerprint[,fingerprint2]",
+//                      fingerprint = SHA-256 of the DER certificate, 64 hex digits, colons
+//                      optional, any case; at most 2 per AE (certificate change). Comments
+//                      #, // and /* */ as in acrnema.map. AE titles are compared without
+//                      regard to case. When an AE is listed, its certificate must match one
 //                      (outgoing: the server certificate of AE; incoming: the client
-//                      certificate of calling AE AE)
+//                      certificate of calling AE AE). Read at startup and by the server
+//                      command read_tlscerts: (built aside, swapped in under a lock). Fail
+//                      closed: a line that cannot be read, or an AE listed twice, makes that
+//                      AE "certificate invalid": all its TLS connections are refused until
+//                      fixed. A file that cannot be read keeps the entries loaded before
+//                      (none at startup: no node bound to a certificate, said on the console).
 //   TLSAcceptSelfSigned 0 (default) | 1: 0 = a self-signed peer certificate is accepted only
 //                      when it (or its issuer) is in TLSCAFile (normal chain verification).
 //                      1 = also accept a self-signed peer certificate (outgoing: server of a
@@ -20194,9 +20209,9 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //                      "self-signed certificate" and "self-signed certificate in chain" are
 //                      forgiven; expired, not yet valid, bad signature (also of the self-signed
 //                      certificate itself), wrong purpose and a host name mismatch
-//                      (TLSVerifyHostname = 1) still fail. TLSPin_<AE> still applies on top.
+//                      (TLSVerifyHostname = 1) still fail. An entry in TLSNodeCertsFile still applies.
 //                      Once per AE and process a console line says that a self-signed
-//                      certificate was accepted; without TLSPin_<AE> it says that the identity
+//                      certificate was accepted; without an entry in TLSNodeCertsFile it says that the identity
 //                      is NOT verified (anyone can make a self-signed certificate). With 1,
 //                      TLSCAFile may be empty (then only self-signed peers are accepted).
 //                      Read with the other keys when the TLS context is made.
@@ -20208,12 +20223,12 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //   TLSCertificate/TLSPrivateKey are the server certificate (required for TLSPort),
 //   TLSCAFile checks client certificates, TLSVerifyPeer: require (default) = client
 //   certificate required, verify = checked when sent, ignore = not asked for (a
-//   TLSPin_<AE> then refuses that AE: there is no certificate to compare)
+//   listed AE in TLSNodeCertsFile is then refused: there is no certificate to compare)
 ////////////////////////////////////////////////////////////////////////////////
 
 // Set the transport of PDU for a connection to the map entry E: TLS when E has
 // T in acrnema.map, else plain (as before). E.Name must be the called AE title
-// (it selects TLSPin_<AE>). Returns FALSE when the node needs TLS and this dgate
+// (it selects its entry in TLSNodeCertsFile). Returns FALSE when the node needs TLS and this dgate
 // has no TLS support; Connect then refuses the connection (never plain).
 // For the storage commitment worker: call it with the map entry before Connect.
 BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
@@ -20239,7 +20254,7 @@ BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE)
 		ae[strlen(ae)-1] = 0;
 	if (!GetACRNemaEntryByAE(ae, &E))
 		return PDU.SetTLS(0, NULL);
-	strcpy(E.Name, ae);		// a wildcard entry: the pin key uses the called AE
+	strcpy(E.Name, ae);		// a wildcard entry: the node certificate is looked up by the called AE
 	return SCPrepareTLS(PDU, E);
 	}
 
@@ -20267,7 +20282,7 @@ BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char
 	}
 
 // The transport of PDU from map entry E (one lookup done by the caller) for called AE
-// title AE (it selects TLSPin_<AE>; for a wildcard entry the pin is that of the called AE).
+// title AE (it selects the entry in TLSNodeCertsFile; for a wildcard map entry, that of the called AE).
 BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE)
 	{
 	ACRNemaAddress	EE = E;
@@ -20284,7 +20299,7 @@ BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE
 
 // A TLS key from the dicom.ini server section, read into a buffer as large as an ini
 // cache value and then cut to the caller's size (gpps.cpp now bounds its cache copies;
-// this keeps long values, e.g. two pins with colons, whole). Key names are compared
+// this keeps long values, e.g. a long cipher list, whole). Key names are compared
 // without regard to case (gpps.cpp stricmp, as GetPrivateProfileString).
 #define	TLS_INI_VALUE	1024		// = IniValues[][1024] in gpps.cpp
 static	void	TLSIni(const char *key, const char *def, char *out, int outlen)
@@ -20422,7 +20437,7 @@ static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
 // Verify callback of both contexts. With TLSAcceptSelfSigned = 1 (kept in the context's
 // app data, so each connection reads its own context: no global) the two self-signed
 // errors are forgiven and the connection is marked (SSL app data) so that the log line
-// and the pin check after the handshake know it. Every other error keeps failing.
+// and the node certificate check after the handshake know it. Every other error keeps failing.
 static	int	TLSVerifyCallback(int ok, X509_STORE_CTX *x)
 	{
 	SSL	*ssl;
@@ -20540,7 +20555,7 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 		{
 		SSL_CTX_set_app_data(ctx, (void *) 1);
 		X509_VERIFY_PARAM_set_flags(SSL_CTX_get0_param(ctx), X509_V_FLAG_CHECK_SS_SIGNATURE);
-		OperatorConsole.printf("TLS: TLSAcceptSelfSigned = 1: self-signed %s certificates are accepted (set TLSPin_<AE> for such nodes)\n", server ? "client" : "server");
+		OperatorConsole.printf("TLS: TLSAcceptSelfSigned = 1: self-signed %s certificates are accepted (put such nodes in TLSNodeCertsFile)\n", server ? "client" : "server");
 		}
 	else
 		SSL_CTX_set_app_data(ctx, NULL);
@@ -20582,7 +20597,7 @@ static	void	*TLSClientContext(void)
 	return ctx;
 	}
 
-// Once per node and process: a TLS node with neither TLSPin_<AE> nor TLSVerifyHostname
+// Once per node and process: a TLS node with neither an entry in TLSNodeCertsFile nor TLSVerifyHostname
 // is accepted on any certificate from TLSCAFile, so that file should hold a dedicated
 // DICOM CA (or the node certificates) only
 // (the list is shared by all connection threads: read and changed under a lock,
@@ -20613,19 +20628,19 @@ static	void	TLSWarnUnbound(const char *AE)
 	{
 	if (!TLSFirstTime('U', AE))
 		return;
-	OperatorConsole.printf("*** TLS: %s is accepted on any certificate signed by a CA in TLSCAFile (no TLSPin_%s, TLSVerifyHostname = 0); use a dedicated DICOM CA or set a pin\n", AE, AE);
+	OperatorConsole.printf("*** TLS: %s is accepted on any certificate signed by a CA in TLSCAFile (not in TLSNodeCertsFile, TLSVerifyHostname = 0); use a dedicated DICOM CA or add the certificate of %s to TLSNodeCertsFile\n", AE, AE);
 	}
 
 // Once per AE and process, when the verify callback accepted a self-signed certificate
-// for this connection (TLSAcceptSelfSigned = 1). pinned: TLSPin_<AE> is set (and checked).
-static	void	TLSNoteSelfSigned(SSL *ssl, const char *AE, const char *peer, BOOL pinned)
+// for this connection (TLSAcceptSelfSigned = 1). listed: AE is in TLSNodeCertsFile (checked).
+static	void	TLSNoteSelfSigned(SSL *ssl, const char *AE, const char *peer, BOOL listed)
 	{
-	if (!SSL_get_app_data(ssl) || !TLSFirstTime(pinned ? 'P' : 'S', AE))
+	if (!SSL_get_app_data(ssl) || !TLSFirstTime(listed ? 'P' : 'S', AE))
 		return;
-	if (pinned)
-		OperatorConsole.printf("TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1); identity checked by TLSPin_%s\n", AE, peer, AE);
+	if (listed)
+		OperatorConsole.printf("TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1); identity checked against its certificate in TLSNodeCertsFile\n", AE, peer);
 	else
-		OperatorConsole.printf("*** TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1) WITHOUT TLSPin_%s: the identity of %s is NOT verified (anyone can make a self-signed certificate); set TLSPin_%s\n", AE, peer, AE, AE, AE);
+		OperatorConsole.printf("*** TLS: self-signed certificate of %s (%s) accepted (TLSAcceptSelfSigned = 1) WITHOUT an entry in TLSNodeCertsFile: the identity of %s is NOT verified (anyone can make a self-signed certificate); add the certificate of %s to TLSNodeCertsFile\n", AE, peer, AE, AE);
 	}
 
 // TLSVerifyHostname from dicom.ini
@@ -20664,57 +20679,272 @@ static	BOOL	TLSCertMatchesHost(X509 *cert, const char *host)
 	return r == 1;
 	}
 
-// Compare the SHA-256 fingerprint of cert with pins, the value of dicom.ini key
-// (one or two fingerprints, comma separated, colons and blanks ignored). hex gets
-// the certificate's fingerprint (2*EVP_MAX_MD_SIZE+1 bytes). Returns 1 when one
-// matches, 0 when none does, -1 without a certificate (or digest).
-static	int	TLSCertMatchesPins(X509 *cert, const char *key, const char *pins, char *hex)
+////////////////////////////////////////////////////////////////////////////////
+// Node certificates: TLSNodeCertsFile (fix round 1, T9). One mechanism, no dicom.ini keys
+// per AE. The table is built aside and swapped in under TLSNodeCertCritical; lookups copy
+// the entry out under the lock (as acrnema.map in amap.cpp).
+#define	TLS_FP_BYTES	32		// SHA-256
+typedef	struct	_TLSNodeCertEntry
 	{
-	char		pin[2*EVP_MAX_MD_SIZE+1];
+	char		AE[17];
+	int		n;			// 1 or 2 fingerprints
+	int		invalid;		// line not readable or AE listed twice: refuse
+	unsigned char	fp[2][TLS_FP_BYTES];
+	}	TLSNodeCertEntry;
+static	CRITICAL_SECTION	TLSNodeCertCritical;
+static	struct	TLSNodeCertCriticalInit
+	{
+	TLSNodeCertCriticalInit() { InitializeCriticalSection(&TLSNodeCertCritical); }
+	}	TLSNodeCertCriticalInitObject;
+static	TLSNodeCertEntry	*TLSNodeCertTable = NULL;
+static	int		TLSNodeCertCount = 0;
+static	int		TLSNodeCertTried = 0;		// a load was attempted in this process
+static	int		TLSNodeCertHave = 0;			// the file was loaded (kept when a reload fails)
+static	char		TLSNodeCertFileName[256] = "";	// the file the table came from
+
+// TLSNodeCertsFile: a name without a path is in the dgate directory, as acrnema.map
+static	void	TLSNodeCertsFilePath(char *path, int len)
+	{
+	char	name[256];
+	TLSIni("TLSNodeCertsFile", "", name, sizeof(name));
+	if (!name[0])
+		path[0] = 0;
+	else if (strrchr(name, PATHSEPCHAR) || strchr(name, '/'))
+		snprintf(path, len, "%s", name);
+	else
+		snprintf(path, len, "%s%s", BaseDir, name);
+	}
+
+// 64 hex digits (colons ignored, any case) into fp; FALSE when it is not that
+static	BOOL	TLSParseFingerprint(const char *s, unsigned char *fp)
+	{
+	int	k = 0, v;
+	for (; *s; s++)
+		{
+		if (*s==':') continue;
+		if (*s>='0' && *s<='9') v = *s-'0';
+		else if (*s>='a' && *s<='f') v = *s-'a'+10;
+		else if (*s>='A' && *s<='F') v = *s-'A'+10;
+		else return FALSE;
+		if (k >= 2*TLS_FP_BYTES) return FALSE;
+		if (k%2==0) fp[k/2] = (unsigned char)(v<<4);
+		else        fp[k/2] |= (unsigned char)v;
+		k++;
+		}
+	return k == 2*TLS_FP_BYTES;
+	}
+
+// Load (or reload) TLSNodeCertsFile. Returns FALSE when TLSNodeCertsFile is set and cannot be read.
+static	BOOL	LoadTLSNodeCerts(BOOL tell)
+	{
+	char		path[256], *buf, *p, *q, *line, *next, *fps, *one;
+	FILE		*f;
+	long		size;
+	int		count = 0, cap = 0, bad = 0, lineno = 0, i, have;
+	TLSNodeCertEntry	*table = NULL, *old, e;
+
+	TLSNodeCertsFilePath(path, sizeof(path));
+	if (!path[0])
+		{
+		EnterCriticalSection(&TLSNodeCertCritical);
+		old = TLSNodeCertTable; TLSNodeCertTable = NULL; TLSNodeCertCount = 0; TLSNodeCertTried = 1; TLSNodeCertHave = 0;
+		TLSNodeCertFileName[0] = 0;
+		LeaveCriticalSection(&TLSNodeCertCritical);
+		if (old) free(old);
+		if (tell) OperatorConsole.printf("TLS: TLSNodeCertsFile is not set: no node certificates\n");
+		return TRUE;
+		}
+
+	f = fopen(path, "rb");
+	buf = NULL;
+	if (f)
+		{
+		fseek(f, 0, SEEK_END);
+		size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		buf = size >= 0 ? (char *)malloc(size + 2) : NULL;
+		if (buf && fread(buf, 1, size, f) != (size_t)size) { free(buf); buf = NULL; }
+		fclose(f);
+		if (buf) buf[size] = 0;
+		}
+	if (!buf)
+		{
+		EnterCriticalSection(&TLSNodeCertCritical);
+		have = TLSNodeCertHave; i = TLSNodeCertCount; TLSNodeCertTried = 1;
+		LeaveCriticalSection(&TLSNodeCertCritical);
+		if (have)
+			OperatorConsole.printf("*** TLS: node certificate file %s cannot be read: the node certificates loaded before (%d AEs) are kept\n", path, i);
+		else
+			OperatorConsole.printf("*** TLS: node certificate file %s cannot be read: none loaded, no TLS node is bound to a certificate\n", path);
+		return FALSE;
+		}
+
+	// remove /* */ comments (they may span lines; their line breaks are kept)
+	for (p = q = buf; *p; )
+		{
+		if (p[0]=='/' && p[1]=='*')
+			{
+			p += 2;
+			while (*p && !(p[0]=='*' && p[1]=='/')) { if (*p=='\n') *q++ = '\n'; p++; }
+			if (*p) p += 2;
+			}
+		else
+			*q++ = *p++;
+		}
+	*q = 0;
+
+	for (line = buf; line && *line; line = next)
+		{
+		next = strchr(line, '\n');
+		if (next) *next++ = 0;
+		lineno++;
+		for (p = line; *p; p++)					// one-line comments, tabs
+			{
+			if (*p=='#' || (p[0]=='/' && p[1]=='/')) { *p = 0; break; }
+			if (*p=='\t' || *p=='\r') *p = ' ';
+			}
+		while (*line==' ') line++;
+		if (!*line) continue;
+
+		memset(&e, 0, sizeof(e));
+		fps = strchr(line, ' ');
+		if (fps) *fps++ = 0; else fps = line + strlen(line);
+		if (strlen(line) > 16)
+			{
+			OperatorConsole.printf("*** TLS: %s line %d: AE title %s is longer than 16 characters: line ignored\n", path, lineno, line);
+			bad++;
+			continue;
+			}
+		for (p = line; *p; p++)
+			if ((unsigned char)*p < 0x21 || (unsigned char)*p > 0x7e) break;
+		if (*p)
+			{
+			OperatorConsole.printf("*** TLS: %s line %d: AE title has control or non-ASCII characters: line ignored\n", path, lineno);
+			bad++;
+			continue;
+			}
+		strcpy(e.AE, line);
+		if (strchr(line, '*'))
+			{
+			// a wildcard cannot have a node certificate; an AE title with that literal
+			// text is refused rather than left unbound
+			OperatorConsole.printf("*** TLS: %s line %d: %s: wildcards cannot have a node certificate: an AE with this title is refused\n", path, lineno, line);
+			e.invalid = 1;
+			bad++;
+			}
+
+		// fingerprints: comma separated, blanks ignored
+		for (p = q = fps; *p; p++) if (*p!=' ') *q++ = *p;
+		*q = 0;
+		BOOL wild = e.invalid;
+		if (!fps[0]) e.invalid = 1;
+		for (one = fps; *one && !e.invalid; )
+			{
+			q = strchr(one, ',');
+			if (q) *q = 0;
+			if (e.n >= 2 || !TLSParseFingerprint(one, e.fp[e.n])) e.invalid = 1;
+			else e.n++;
+			one = q ? q+1 : one + strlen(one);
+			if (q && !*one) e.invalid = 1;			// trailing comma
+			}
+		if (e.invalid && !wild)
+			{
+			OperatorConsole.printf("*** TLS: %s line %d: certificate of %s cannot be read (1 or 2 SHA-256 fingerprints of 64 hex digits): %s is refused until this is fixed\n", path, lineno, e.AE, e.AE);
+			bad++;
+			}
+
+		for (i=0; i<count; i++)
+			if (stricmp(table[i].AE, e.AE)==0)
+				break;
+		if (i<count)
+			{
+			OperatorConsole.printf("*** TLS: %s line %d: %s is listed twice: %s is refused until this is fixed\n", path, lineno, e.AE, table[i].AE);
+			table[i].invalid = 1;
+			bad++;
+			continue;
+			}
+		if (count == cap)
+			{
+			TLSNodeCertEntry *t = (TLSNodeCertEntry *) realloc(table, (cap ? 2*cap : 64) * sizeof(TLSNodeCertEntry));
+			if (!t) { OperatorConsole.printf("*** TLS: node certificate file %s: out of memory\n", path); break; }
+			table = t;
+			cap = cap ? 2*cap : 64;
+			}
+		table[count++] = e;
+		}
+	free(buf);
+
+	EnterCriticalSection(&TLSNodeCertCritical);
+	old = TLSNodeCertTable; TLSNodeCertTable = table; TLSNodeCertCount = count; TLSNodeCertTried = 1; TLSNodeCertHave = 1;
+	snprintf(TLSNodeCertFileName, sizeof(TLSNodeCertFileName), "%s", path);
+	LeaveCriticalSection(&TLSNodeCertCritical);
+	if (old) free(old);
+	OperatorConsole.printf("TLS: %d node certificate(s) loaded from %s%s\n", count, path, bad ? " (with errors, see above)" : "");
+	return TRUE;
+	}
+
+// The node certificate fingerprints of AE (compared without case). Returns 0 = AE not
+// listed, 1 = listed (fp, n), -1 = the line of AE is invalid: refuse. file gets the
+// file name for messages.
+// A process that did not load the file at startup loads it on first use.
+static	int	TLSNodeCertLookup(const char *AE, unsigned char fp[2][TLS_FP_BYTES], int *n, char *file, int filelen)
+	{
+	int	i, r = 0, tried;
+
+	EnterCriticalSection(&TLSNodeCertCritical);
+	tried = TLSNodeCertTried;
+	LeaveCriticalSection(&TLSNodeCertCritical);
+	if (!tried)
+		LoadTLSNodeCerts(FALSE);
+
+	*n = 0;
+	EnterCriticalSection(&TLSNodeCertCritical);
+	snprintf(file, filelen, "%s", TLSNodeCertFileName[0] ? TLSNodeCertFileName : "TLSNodeCertsFile");
+	for (i=0; i<TLSNodeCertCount; i++)
+		if (stricmp(TLSNodeCertTable[i].AE, AE)==0)
+			{
+			if (TLSNodeCertTable[i].invalid)
+				r = -1;
+			else
+				{
+				*n = TLSNodeCertTable[i].n;
+				memcpy(fp, TLSNodeCertTable[i].fp, sizeof(TLSNodeCertTable[i].fp));
+				r = 1;
+				}
+			break;
+			}
+	LeaveCriticalSection(&TLSNodeCertCritical);
+	return r;
+	}
+
+// The SHA-256 fingerprint of cert against the n listed fingerprints. hex gets the certificate's
+// fingerprint (2*EVP_MAX_MD_SIZE+1 bytes). 1 = one matches, 0 = none, -1 = no certificate.
+static	int	TLSNodeCertMatches(X509 *cert, unsigned char fp[2][TLS_FP_BYTES], int n, char *hex)
+	{
 	unsigned char	md[EVP_MAX_MD_SIZE];
-	unsigned int	n = 0, i;
-	int		k, good = 0;
-	const char	*q;
+	unsigned int	len = 0, i;
 
 	hex[0] = 0;
-	if (!cert || X509_digest(cert, EVP_sha256(), md, &n)!=1)
+	if (!cert || X509_digest(cert, EVP_sha256(), md, &len)!=1 || len != TLS_FP_BYTES)
 		return -1;
-	for (i=0; i<n; i++)
+	for (i=0; i<len; i++)
 		sprintf(hex+2*i, "%02x", md[i]);
-	hex[2*n] = 0;
-
-	q = pins;
-	while (*q)
-		{
-		k = 0;
-		while (*q && *q!=',')
-			{
-			if (isxdigit((unsigned char)*q) && k < (int)sizeof(pin)-1)
-				pin[k++] = tolower((unsigned char)*q);
-			else if (*q!=':' && *q!=' ' && *q!='\t')
-				k = sizeof(pin);		// not a fingerprint
-			q++;
-			}
-		if (*q==',') q++;
-		if (k == (int)(2*n))
-			{
-			pin[k] = 0;
-			if (strcmp(pin, hex)==0) good = 1;
-			}
-		else if (k)
-			OperatorConsole.printf("*** TLS: %s contains an entry that is not a SHA-256 fingerprint\n", key);
-		}
-	return good;
+	hex[2*len] = 0;
+	for (i=0; i<(unsigned int)n; i++)
+		if (memcmp(md, fp[i], TLS_FP_BYTES)==0)
+			return 1;
+	return 0;
 	}
 
 // Socket hook after the handshake: the host name check when certificates are not
-// verified (TLSVerifyPeer = ignore), and the certificate pin TLSPin_<AE>
+// verified (TLSVerifyPeer = ignore), and the certificate of AE in TLSNodeCertsFile
 static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	{
 	SSL		*ssl = (SSL *) s;
 	X509		*cert;
-	char		key[64], pins[TLS_INI_VALUE], hex[2*EVP_MAX_MD_SIZE+1];
-	int		good = 0;
+	char		file[256], hex[2*EVP_MAX_MD_SIZE+1];
+	unsigned char	fp[2][TLS_FP_BYTES];
+	int		good = 0, n = 0, r;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 	cert = SSL_get1_peer_certificate(ssl);
@@ -20730,9 +20960,14 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		return FALSE;
 		}
 
-	snprintf(key, sizeof(key), "TLSPin_%s", AE);
-	TLSIni(key, "", pins, sizeof(pins));
-	if (!pins[0])
+	r = TLSNodeCertLookup(AE, fp, &n, file, sizeof(file));
+	if (r < 0)
+		{
+		OperatorConsole.printf("*** TLS: certificate of %s in %s is invalid (see the load warning); connection refused\n", AE, file);
+		if (cert) X509_free(cert);
+		return FALSE;
+		}
+	if (r == 0)
 		{
 		// identity then rests on TLSCAFile alone: say so once per node
 		if (SSL_get_app_data(ssl)) TLSNoteSelfSigned(ssl, AE, host, FALSE);
@@ -20741,20 +20976,20 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		return TRUE;
 		}
 
-	good = TLSCertMatchesPins(cert, key, pins, hex);
+	good = TLSNodeCertMatches(cert, fp, n, hex);
 	if (cert) X509_free(cert);
 	if (good < 0)
 		{
-		OperatorConsole.printf("*** TLS: no certificate of %s to compare with %s; connection refused\n", AE, key);
+		OperatorConsole.printf("*** TLS: no certificate of %s to compare with the certificate of %s in %s; connection refused\n", AE, AE, file);
 		return FALSE;
 		}
 
 	if (!good)
 		{
-		OperatorConsole.printf("*** TLS: certificate of %s (%s) does not match %s (its SHA-256 is %s); connection refused\n", AE, host, key, hex);
+		OperatorConsole.printf("*** TLS: node certificate (SHA-256 fingerprint) of %s (%s) does not match the certificate of %s in %s (its SHA-256 is %s); connection refused\n", AE, host, AE, file, hex);
 		return FALSE;
 		}
-	SystemDebug.printf("TLS: certificate of %s matches %s\n", AE, key);
+	SystemDebug.printf("TLS: certificate of %s matches the certificate of %s in %s\n", AE, AE, file);
 	TLSNoteSelfSigned(ssl, AE, host, TRUE);
 	return TRUE;
 	}
@@ -20769,18 +21004,23 @@ static	void	*TLSServerContext(void)
 	return ctx;
 	}
 
-// Incoming TLS: TLSPin_<calling AE> against the client certificate of this
-// connection. TRUE without a pin (identity rests on TLSCAFile and TLSVerifyPeer).
-static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *peer)
+// Incoming TLS: the certificate of the calling AE in TLSNodeCertsFile against the client certificate of this
+// connection. TRUE when AE is not listed (identity rests on TLSCAFile and TLSVerifyPeer).
+static	BOOL	TLSCheckIncomingNodeCert(PDU_Service *PDU, const char *AE, const char *peer)
 	{
 	SSL	*ssl = (SSL *) PDU->Link.TLSHandle;
 	X509	*cert;
-	char	key[64], pins[TLS_INI_VALUE], hex[2*EVP_MAX_MD_SIZE+1];
-	int	good;
+	char		file[256], hex[2*EVP_MAX_MD_SIZE+1];
+	unsigned char	fp[2][TLS_FP_BYTES];
+	int		good, n = 0, r;
 
-	snprintf(key, sizeof(key), "TLSPin_%s", AE);	// key compared without case
-	TLSIni(key, "", pins, sizeof(pins));
-	if (!pins[0])
+	r = TLSNodeCertLookup(AE, fp, &n, file, sizeof(file));	// AE compared without case
+	if (r < 0)
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: certificate of %s in %s is invalid (see the load warning)\n", AE, peer, AE, file);
+		return FALSE;
+		}
+	if (r == 0)
 		{
 		TLSNoteSelfSigned(ssl, AE, peer, FALSE);
 		return TRUE;
@@ -20791,21 +21031,34 @@ static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *pe
 #else
 	cert = SSL_get_peer_certificate(ssl);
 #endif
-	good = TLSCertMatchesPins(cert, key, pins, hex);
+	good = TLSNodeCertMatches(cert, fp, n, hex);
 	if (cert) X509_free(cert);
 	if (good < 0)
 		{
-		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: no client certificate to compare with %s\n", AE, peer, key);
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: no client certificate to compare with the certificate of %s in %s\n", AE, peer, AE, file);
 		return FALSE;
 		}
 	if (!good)
 		{
-		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: client certificate does not match %s (its SHA-256 is %s)\n", AE, peer, key, hex);
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: client certificate (SHA-256 fingerprint) does not match the certificate of %s in %s (its SHA-256 is %s)\n", AE, peer, AE, file, hex);
 		return FALSE;
 		}
-	SystemDebug.printf("TLS: client certificate of %s matches %s\n", AE, key);
+	SystemDebug.printf("TLS: client certificate of %s matches the certificate of %s in %s\n", AE, AE, file);
 	TLSNoteSelfSigned(ssl, AE, peer, TRUE);
 	return TRUE;
+	}
+
+// Server start: load TLSNodeCertsFile (when set); server command read_tlscerts:
+void	StartTLSNodeCerts(void)
+	{
+	char	path[256];
+	TLSNodeCertsFilePath(path, sizeof(path));
+	if (path[0]) LoadTLSNodeCerts(TRUE);
+	}
+
+BOOL	ReadTLSNodeCerts(void)
+	{
+	return LoadTLSNodeCerts(TRUE);
 	}
 
 // Startup of the incoming TLS listener (server, threaded mode): only when TLSPort
@@ -20876,6 +21129,14 @@ static	struct	TLSHooksInit
 
 #else
 
+// without OpenSSL: node certificates are not used; read_tlscerts: says so
+void	StartTLSNodeCerts(void) { }
+BOOL	ReadTLSNodeCerts(void)
+	{
+	OperatorConsole.printf("*** TLS: read_tlscerts: this dgate was built without TLS support\n");
+	return FALSE;
+	}
+
 // without OpenSSL: TLSPort set only gives a console line, there is no TLS listener
 void	StartTLSListener(void)
 	{
@@ -20897,11 +21158,12 @@ static	struct	TLSHooksInit
 // AE title (TLSCanonicalAE): printable ASCII up to the first NUL, only padding after
 // it, leading/trailing spaces removed; anything else is rejected.
 //  - TLS port: a title with a space inside is rejected (other code cuts it at the
-//    first space). TLSPin_<calling AE> (key compared without case, as acrnema.map
-//    lookups) must match the client certificate when set; when it is not set and the
-//    title resolves to a non-wildcard acrnema.map entry, the pin of that entry's name
-//    applies. Wildcard entries cannot carry pins: TLSPin_<name with *> is never read;
-//    a node behind a wildcard entry is pinned by TLSPin_<its own AE>.
+//    first space). The certificate of the calling AE in TLSNodeCertsFile (AE compared
+//    without case, as acrnema.map lookups) must match the client certificate; when the
+//    AE has no line and resolves to a non-wildcard acrnema.map entry, the line of that
+//    entry's name applies. Wildcard entries cannot have a node certificate (a line with
+//    * is refused at load); a node behind a wildcard entry is bound by a line for its
+//    own AE.
 //  - plain port: with TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
 //    calling AE with T in acrnema.map is rejected; a title with a space inside is
 //    checked as a whole and cut at the first space. With TLSPort empty (default)
@@ -20944,15 +21206,15 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 			return FALSE;
 			}
 
-		// the pin of this AE: TLSPin_<calling AE>, else the pin of the non-wildcard
-		// acrnema.map entry the calling AE resolves to (map lookups ignore case)
-		char	pinae[20], key[64], pins[TLS_INI_VALUE];
-		strcpy(pinae, ae);
-		snprintf(key, sizeof(key), "TLSPin_%s", ae);
-		TLSIni(key, "", pins, sizeof(pins));
-		if (!pins[0] && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
-			strcpy(pinae, E.Name);
-		return TLSCheckIncomingPin(PDU, pinae, peer);
+		// the line of this AE, else the line of the non-wildcard acrnema.map entry the
+		// calling AE resolves to (map lookups ignore case)
+		char		certae[20], file[256];
+		unsigned char	fp[2][TLS_FP_BYTES];
+		int		n;
+		strcpy(certae, ae);
+		if (TLSNodeCertLookup(ae, fp, &n, file, sizeof(file))==0 && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
+			strcpy(certae, E.Name);
+		return TLSCheckIncomingNodeCert(PDU, certae, peer);
 #else
 		return FALSE;				// cannot happen: no TLS in this build
 #endif
@@ -26979,6 +27241,13 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		return true;
 		}
 
+	if (memcmp(SilentText, "read_tlscerts:", 13)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		ReadTLSNodeCerts();		// built aside, swapped in under a lock
+		return true;
+		}
+
 	if (memcmp(SilentText, "read_amap:", 10)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
@@ -29995,6 +30264,9 @@ main ( int	argc, char	*argv[] )
 			// outgoing storage commitment worker: only when switched on in dicom.ini
 			if (OutgoingStorageCommitment && !NoThread)
 				StartSCWorkerThread();
+
+			// node certificates (TLSNodeCertsFile; nothing when it is not set)
+			StartTLSNodeCerts();
 
 			// incoming DICOM TLS listener: only when TLSPort is set in dicom.ini
 			StartTLSListener();

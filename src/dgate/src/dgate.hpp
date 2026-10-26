@@ -211,6 +211,8 @@ BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE);	// the same, looked up b
 BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE);	// from an entry, pin of called AE
 BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char *compress);	// one lookup: address + transport
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport
+void	StartTLSNodeCerts(void);	// load TLSNodeCertsFile at server start (nothing when not set)
+BOOL	ReadTLSNodeCerts(void);	// server command read_tlscerts:
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);
 BOOL	RemoveFromPACS(DICOMDataObject *, BOOL KeepImages = FALSE);
 BOOL	BuildColumnString(DBENTRY	*DBE, char	*TableName, VR	*vr,	char	*TempString);

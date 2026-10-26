@@ -1345,6 +1345,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			or re-send whose compression may change the pixel data (lossy, NKI, clip, downsize)
 20261026	mmd	Outgoing storage commitment: RI nodes keep cycling (re-send and new requests after the
 			requests are used up) with OutgoingSCResendMissing 1 as well as 2; never TIMEOUT
+20261026	mmd	Outgoing storage commitment: REQUESTED objects past OutgoingSCDeadline (not RI) become
+			TIMEOUT on the next pass (transaction ABANDONED), not only after OutgoingSCReportTimeout
 
 ENDOFUPDATEHISTORY
 */
@@ -23711,7 +23713,8 @@ static void SimplifyDicom(DICOMDataObject *pDDO)
 // Started only when OutgoingStorageCommitment = 1. Every OutgoingSCScanInterval seconds:
 //   1. objects noted by the send paths (SCTakeNoted) are recorded in SCObject (NOTED)
 //   2. OPEN transactions without result after OutgoingSCReportTimeout are ABANDONED,
-//      their objects are asked again later (new TxUID) or become TIMEOUT
+//      their objects are asked again later (new TxUID) or become TIMEOUT; REQUESTED objects
+//      past OutgoingSCDeadline (not RI) abandon their transaction at once and become TIMEOUT
 //   3. NOTED objects older than OutgoingSCDeadline become TIMEOUT (not for RI nodes: OVERDUE)
 //   3b. FAILED objects of nodes with R are re-sent (SCProcessResends)
 //   4. per (destination, study), after OutgoingSCQuietTime, an N-ACTION is sent on a
@@ -24221,6 +24224,44 @@ static void SCCheckReportTimeouts(Database &DB, unsigned int now)
 	for (i=0; i<n; i++)
 		{
 		OperatorConsole.printf("*** Storage commitment: no result from %s for transaction %s within %d s\n", list[i].ae, list[i].tx, OutgoingSCReportTimeout);
+		SCAbandon(DB, list[i].ae, list[i].tx, now, FALSE);
+		}
+	free(list);
+	}
+
+// step 2b: REQUESTED objects past FirstSent + OutgoingSCDeadline (not on RI nodes) do not wait
+// for the report timeout: their transaction is ABANDONED at once, they become TIMEOUT (alarm, in
+// SCRequeue) and the other objects of that transaction are asked again later. A result that still
+// comes for the abandoned transaction is checked against its members as before.
+static void SCCheckRequestedDeadline(Database &DB, unsigned int now)
+	{
+	char where[256], cols[96], tx[72], ae[24];
+	SQLLEN len;
+	int n = 0, i;
+	struct SCTx { char tx[68]; char ae[20]; } *list;
+	long long limit = (long long)now - OutgoingSCDeadline;
+
+	list = (struct SCTx *)malloc(sizeof(struct SCTx)*SC_TXMAX);
+	if (!list) return;
+	sprintf(cols, "TxUID, %s", SCAEGroup(DB));
+	sprintf(where, "State = 'REQUESTED' and FirstSent < %lld GROUP BY TxUID, %s", limit, SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL))
+		{ OperatorConsole.printf("*** Storage commitment: database query failed (deadline of requested objects)\n"); free(list); return; }
+	tx[0] = ae[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, tx, 70, &len);
+	DB.BindField(2, SQL_C_CHAR, ae, 20, &len);
+	while (n<SC_TXMAX && DB.NextRecord())
+		{
+		SCTrim(tx);
+		if (SCIsUID(tx) && SCCleanAE(ae, list[n].ae)) { strcpy(list[n].tx, tx); n++; }
+		tx[0] = ae[0] = 0;
+		}
+	for (i=0; i<n; i++)
+		{
+		ACRNemaAddress E;
+		if (SCResendLimit(list[i].ae, &E)==ACR_RESEND_ALWAYS) continue;	// RI: OVERDUE, never TIMEOUT
+		OperatorConsole.printf("*** Storage commitment: deadline of %d s passed for objects of %s waiting for transaction %s: transaction ABANDONED\n",
+			OutgoingSCDeadline, list[i].ae, list[i].tx);
 		SCAbandon(DB, list[i].ae, list[i].tx, now, FALSE);
 		}
 	free(list);
@@ -25070,6 +25111,7 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
+	SCCheckRequestedDeadline(DB, now);
 	SCCheckDeadline(DB, now);
 	SCCheckOverdue(DB, now);
 	SCProcessResends(DB, now);

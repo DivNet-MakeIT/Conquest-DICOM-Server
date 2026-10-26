@@ -105,10 +105,11 @@ typedef	struct	_ACRNemaAddress
 		int	ResendLimit;	// R option: ACR_RESEND_INI, n (1..999) or ACR_RESEND_ALWAYS
 	}	ACRNemaAddress;
 
-// options in the 5th column of acrnema.map (T, SC, R, Rn, RI); none = as before
+// options in the 5th column of acrnema.map (T, L, SC, R, Rn, RI); none = as before
 #define	ACR_TLS			1
 #define	ACR_SC			2
 #define	ACR_RESEND		4
+#define	ACR_TLSLEGACY		8	// L (only with T): legacy TLS profile for OsiriX-class peers
 #define	ACR_RESEND_INI		-1	// R without number: limit from dicom.ini
 #define	ACR_RESEND_ALWAYS	0x7fffffff	// RI: until committed
 
@@ -204,6 +205,7 @@ BOOL	GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry);
 BOOL	PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress, const char *Options=NULL);
 BOOL	GetACRNemaEntryByAE(char *ACRNema, ACRNemaAddress *Entry);
 int	ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn);
+void	FormatACRNemaOptions(const ACRNemaAddress *Entry, char *out, int outlen);	// 5th column for write_amap
 BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// TLS for nodes with T in acrnema.map

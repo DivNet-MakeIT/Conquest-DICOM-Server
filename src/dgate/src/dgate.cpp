@@ -1405,6 +1405,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: a fetch error (Database FetchError) is no longer taken for the
 			end of the rows where the reconciliation, sc_unsafe_clear:, sc_verify_now: and the confirmed
 			check read rows: the clear is refused, the verification answers 0 database error
+20261026	mmd	Outgoing TLS legacy profile: a node with TL in acrnema.map is connected with a separate
+			client context (TLS 1.0-1.2, AES-CBC with SHA-1 only, never NULL/RC4/EXPORT/DES/3DES,
+			peer key of at least 112 bits); one console line per connection; T without L unchanged;
+			write_amap writes the options in the canonical order T L SC R... (e.g. TLSCR5)
 
 ENDOFUPDATEHISTORY
 */
@@ -20375,10 +20379,22 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //   TLSCAFile checks client certificates, TLSVerifyPeer: require (default) = client
 //   certificate required, verify = checked when sent, ignore = not asked for (a
 //   listed AE in TLSNodeCertsFile is then refused: there is no certificate to compare)
+//
+// Legacy profile (OsiriX-class peers, TLS 1.0 with AES-CBC): opt in per node and port only.
+//   outgoing: L next to T in the 5th column of acrnema.map (TL, TLSC, ...) connects that node
+//   with a separate client context: TLS 1.0 to 1.2, cipher suites TLS_LEGACY_CIPHERS only
+//   (AES-CBC with SHA-1; DHE, then ECDHE, then RSA key exchange; never NULL, RC4, EXPORT,
+//   DES or 3DES; the legacy server takes its own order and has DH parameters, so a client
+//   offering DHE gets forward secrecy),
+//   OpenSSL security level 0 in that context only (TLS 1.0/1.1 need it), and a peer
+//   certificate key of at least 112 bits (e.g. RSA 2048). Certificates, TLSCAFile,
+//   TLSVerifyPeer, TLSAcceptSelfSigned, TLSVerifyHostname and TLSNodeCertsFile apply as for T.
+//   TLSMinVersion and TLSCipherList do not apply to it (fixed policy). One console line
+//   per connection gives the protocol and cipher. T without L: unchanged (strict profile).
 ////////////////////////////////////////////////////////////////////////////////
 
 // Set the transport of PDU for a connection to the map entry E: TLS when E has
-// T in acrnema.map, else plain (as before). E.Name must be the called AE title
+// T in acrnema.map (with L: the legacy profile), else plain (as before). E.Name must be the called AE title
 // (it selects its entry in TLSNodeCertsFile). Returns FALSE when the node needs TLS and this dgate
 // has no TLS support; Connect then refuses the connection (never plain).
 // For the storage commitment worker: call it with the map entry before Connect.
@@ -20386,7 +20402,7 @@ BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
 	{
 	if (!(E.Flags & ACR_TLS))
 		return PDU.SetTLS(0, NULL);
-	return PDU.SetTLS(1, E.Name);
+	return PDU.SetTLS((E.Flags & ACR_TLSLEGACY) ? 2 : 1, E.Name);
 	}
 
 // Connect sites (fix round 1): resolve the called AE ONCE and take address, port,
@@ -20500,6 +20516,7 @@ static	struct	TLSCtxCriticalInit
 	}	TLSCtxCriticalInitObject;
 static	SSL_CTX	*TLSClientCtx = NULL;		// made once, on the first TLS connection
 static	SSL_CTX	*TLSServerCtx = NULL;		// incoming: made once, when the TLS listener starts
+static	SSL_CTX	*TLSLegacyClientCtx = NULL;	// legacy profile (map option L): made once, on first use
 // Both contexts are made under TLSCtxCritical. TLSVerifyPeer is kept in each context
 // (SSL_CTX_set_verify) and read back per connection with SSL_get_verify_mode: no
 // global written while a context is made (the client context can be made by the
@@ -20565,6 +20582,78 @@ static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
 	return TRUE;
 	}
 
+// Legacy profile (map option L, TLSLegacyPort): TLS 1.0 to 1.2 with these AES-CBC suites
+// only, forward secrecy first (DHE is what OsiriX offers; ECDHE for modern peers; RSA key
+// transport last). Never NULL, RC4, EXPORT, DES or 3DES (checked again after the list is set).
+#define	TLS_LEGACY_CIPHERS	"DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA:" \
+				"ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:AES256-SHA:AES128-SHA"
+#define	TLS_LEGACY_MIN_BITS	112		// peer key strength (RSA 2048, EC 224)
+
+static	BOOL	TLSSetLegacyCiphers(SSL_CTX *ctx)
+	{
+	char	allowed[512], item[128], err[256];
+	const char	*name;
+	STACK_OF(SSL_CIPHER)	*sk;
+	int	i;
+
+	// security level 0 in this context only: OpenSSL 3 refuses TLS 1.0/1.1 above it
+	if (SSL_CTX_set_cipher_list(ctx, TLS_LEGACY_CIPHERS ":@SECLEVEL=0")!=1)
+		{
+		OperatorConsole.printf("*** TLS: legacy cipher list not accepted: %s\n", TLSErrorText(err, sizeof(err)));
+		return FALSE;
+		}
+	snprintf(allowed, sizeof(allowed), ":%s:", TLS_LEGACY_CIPHERS);
+	sk = SSL_CTX_get_ciphers(ctx);
+	for (i=0; sk && i<sk_SSL_CIPHER_num(sk); i++)
+		{
+		name = SSL_CIPHER_get_name(sk_SSL_CIPHER_value(sk, i));
+		if (name && strncmp(name, "TLS_", 4)==0) continue;	// TLS 1.3 suites: max version is 1.2
+		snprintf(item, sizeof(item), ":%s:", name ? name : "?");
+		if (!name || !strstr(allowed, item))
+			{
+			OperatorConsole.printf("*** TLS: legacy cipher list has %s, not allowed\n", name ? name : "?");
+			return FALSE;
+			}
+		}
+	return TRUE;
+	}
+
+// TRUE when ssl was made from a legacy context (map option L or TLSLegacyPort)
+static	SSL_CTX	*TLSLegacyServerCtx = NULL;	// incoming TLSLegacyPort (L2); NULL until then
+static	BOOL	TLSIsLegacy(SSL *ssl)
+	{
+	SSL_CTX	*c = ssl ? SSL_get_SSL_CTX(ssl) : NULL;
+	BOOL	r;
+	EnterCriticalSection(&TLSCtxCritical);
+	r = c && (c==TLSLegacyClientCtx || c==TLSLegacyServerCtx);
+	LeaveCriticalSection(&TLSCtxCritical);
+	return r;
+	}
+
+// Legacy profile: the peer certificate key must have at least TLS_LEGACY_MIN_BITS of
+// security (security level 0 lets OpenSSL accept any key size). TRUE without a certificate
+// (TLSVerifyPeer decides that); what names the peer in messages.
+static	BOOL	TLSLegacyKeyStrong(SSL *ssl, const char *what)
+	{
+	X509		*cert;
+	EVP_PKEY	*key;
+	int		bits = 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	cert = SSL_get1_peer_certificate(ssl);
+#else
+	cert = SSL_get_peer_certificate(ssl);
+#endif
+	if (!cert)
+		return TRUE;
+	key = X509_get0_pubkey(cert);
+	if (key) bits = EVP_PKEY_security_bits(key);
+	X509_free(cert);
+	if (bits >= TLS_LEGACY_MIN_BITS)
+		return TRUE;
+	OperatorConsole.printf("*** TLS: legacy profile: certificate key of %s too weak (%d security bits, at least %d needed); connection refused\n", what, bits, TLS_LEGACY_MIN_BITS);
+	return FALSE;
+	}
+
 // Verify callback of both contexts. With TLSAcceptSelfSigned = 1 (kept in the context's
 // app data, so each connection reads its own context: no global) the two self-signed
 // errors are forgiven and the connection is marked (SSL app data) so that the log line
@@ -20589,9 +20678,11 @@ static	int	TLSVerifyCallback(int ok, X509_STORE_CTX *x)
 // Make the client (server=FALSE) or server (server=TRUE, incoming TLSPort) SSL_CTX
 // from dicom.ini. Returns NULL (with a console line) on any configuration problem,
 // so that T nodes are refused, or no TLS listener started, rather than half secured.
-static	SSL_CTX	*TLSMakeContext(BOOL server)
+// legacy=TRUE: the legacy profile (TLS 1.0-1.2, TLS_LEGACY_CIPHERS; TLSMinVersion and
+// TLSCipherList are not used); everything else as for the strict context.
+static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 	{
-	const char	*side = server ? "server" : "client";
+	const char	*side = server ? (legacy ? "legacy server" : "server") : (legacy ? "legacy client" : "client");
 	char	cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256], selfsigned[32];
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
@@ -20614,7 +20705,9 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 		TLSVerifyMode = 2;
 		}
 
-	if (strcmp(minv, "1.3")==0)
+	if (legacy)
+		minversion = TLS1_VERSION;		// fixed policy: TLSMinVersion is not used
+	else if (strcmp(minv, "1.3")==0)
 		minversion = TLS1_3_VERSION;
 	else if (strcmp(minv, "1.2")!=0)
 		OperatorConsole.printf("*** TLS: TLSMinVersion = %s not supported, using 1.2\n", minv);
@@ -20631,11 +20724,24 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 		SSL_CTX_free(ctx);
 		return NULL;
 		}
+	if (legacy && SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION)!=1)
+		{
+		OperatorConsole.printf("*** TLS: cannot set maximum version: %s\n", TLSErrorText(err, sizeof(err)));
+		SSL_CTX_free(ctx);
+		return NULL;
+		}
 	SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
-	if (!TLSSetCiphers(ctx, ciphers, minversion))
+	if (legacy ? !TLSSetLegacyCiphers(ctx) : !TLSSetCiphers(ctx, ciphers, minversion))
 		{
 		SSL_CTX_free(ctx);
 		return NULL;
+		}
+	if (legacy && server)
+		{
+		// DHE suites: DH group sized from the server certificate (RSA 2048 = ffdhe2048);
+		// our order wins, so DHE (forward secrecy) is taken whenever the client offers it
+		SSL_CTX_set_dh_auto(ctx, 1);
+		SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 		}
 
 	if (cert[0])
@@ -20711,7 +20817,8 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 		if (!TLSVerifyMode)
 			OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: server certificates are not verified\n");
 		}
-	OperatorConsole.printf("TLS: %s context ready (minimum TLS %s, verify %s)\n", side, minversion==TLS1_3_VERSION ? "1.3" : "1.2",
+	OperatorConsole.printf("TLS: %s context ready (%s, verify %s)\n", side,
+		legacy ? "TLS 1.0 to 1.2, AES-CBC only" : minversion==TLS1_3_VERSION ? "minimum TLS 1.3" : "minimum TLS 1.2",
 		TLSVerifyMode==2 ? "require" : TLSVerifyMode==1 ? "verify" : "ignore");
 	return ctx;
 	}
@@ -20724,6 +20831,18 @@ static	void	*TLSClientContext(void)
 	if (!TLSClientCtx)
 		TLSClientCtx = TLSMakeContext(FALSE);
 	ctx = TLSClientCtx;
+	LeaveCriticalSection(&TLSCtxCritical);
+	return ctx;
+	}
+
+// Socket hook: the legacy client SSL_CTX (map option L), made once under the same lock
+static	void	*TLSLegacyClientContext(void)
+	{
+	SSL_CTX	*ctx;
+	EnterCriticalSection(&TLSCtxCritical);
+	if (!TLSLegacyClientCtx)
+		TLSLegacyClientCtx = TLSMakeContext(FALSE, TRUE);
+	ctx = TLSLegacyClientCtx;
 	LeaveCriticalSection(&TLSCtxCritical);
 	return ctx;
 	}
@@ -21109,6 +21228,10 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	unsigned char	fp[2][TLS_FP_BYTES];
 	int		good = 0, n = 0, r;
 
+	// legacy profile: no weak peer key (security level 0 in that context accepts any size)
+	if (TLSIsLegacy(ssl) && !TLSLegacyKeyStrong(ssl, AE))
+		return FALSE;
+
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 	cert = SSL_get1_peer_certificate(ssl);
 #else
@@ -21287,6 +21410,7 @@ static	struct	TLSHooksInit
 		SocketTLS.AfterHandshake  = TLSAfterHandshake;
 		SocketTLS.Log             = TLSLogLine;
 		SocketTLS.ServerContext   = TLSServerContext;
+		SocketTLS.ClientContextLegacy = TLSLegacyClientContext;
 		}
 	}	TLSHooksInitObject;
 
@@ -29293,8 +29417,12 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		fprintf(f, "\n");
 		while (GetACRNemaEntry(r, &AAEntry))
 			{
-			if (AAPtr->Options[0])		// keep the 5th column and anything after it
-				fprintf(f, "%-17s %-30s %-10s %-16s %s\n", AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress, AAPtr->Options);
+			if (AAPtr->Options[0])		// keep the 5th column (options in canonical order) and anything after it
+				{
+				char opts[sizeof(AAPtr->Options)+8];
+				FormatACRNemaOptions(AAPtr, opts, sizeof(opts));
+				fprintf(f, "%-17s %-30s %-10s %-16s %s\n", AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress, opts);
+				}
 			else
 				fprintf(f, p, AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress);
 			r++;

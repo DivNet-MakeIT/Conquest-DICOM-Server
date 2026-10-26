@@ -1332,6 +1332,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			association is parsed; TLSVerifyPeer for client certificates; TLSPin_<AE> checked
 			for the calling AE; TLSEnforceForMappedNodes (default 1, only with TLSPort set)
 			rejects calling AEs with T in acrnema.map on the plain port
+20261026	mmd	Outgoing storage commitment: content generation Gen in SCObject/SCTxMember (added to
+			tables of earlier builds); a result only applies to the generation asked about; an
+			object stored again locally becomes CHANGED at once (not confirmed until sent again),
+			and sends that started before that are stale; "study confirmed" is 0 while a send of
+			the study is still in the in-memory queue
 
 ENDOFUPDATEHISTORY
 */
@@ -3867,6 +3872,10 @@ OffsetDatesInDICOMObject(DICOMObject *DO, const char *Exceptions, int Offset, Da
 int
 SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE);
 
+void SCLocalWritten(const char *inst);
+unsigned int SCSendSeq(void);
+void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+
 void TestCompress(char *filename, const char *modes, ExtendedPDU_Service *PDU);
 void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Service *PDU);
 void TestSyntax(char *filename, int syntax, ExtendedPDU_Service *PDU);
@@ -5617,6 +5626,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
 
   DICOMDataObject  *DDO = NULL;
   ExtendedPDU_Service PDU2;  // not used as script context
+  unsigned int scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: before the object is read
 
   PDU2.AttachRTC(&VRType);
 
@@ -6136,7 +6146,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
-        if (scOn) SCNoteSentEx(line+offset, scCls, scInst, scStudy, script[0]!=0);	// script clause: sent copy may differ
+        if (scOn) SCNoteSentSeq(line+offset, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
       
         ImagesForwarded++;
         if (level==4) 
@@ -9898,6 +9908,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
   int threadnum = 0;
   if (PDU) threadnum = PDU->ThreadNum;
   pszFileName[0]=0;
+  unsigned int scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: send sequence
 
   if (DDO==NULL)
   { if (N>=0 && N<MAXExportConverters) 
@@ -10572,7 +10583,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
   	  PDU[channel].Close();
 	}
 	else
-	{ if (scOn) SCNoteSentEx(line+offset, scCls, scInst, scStudy, script[0]!=0);	// script clause: sent copy may differ
+	{ if (scOn) SCNoteSentSeq(line+offset, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
 	  ImagesForwarded++;
 
 	  if (level==4) 
@@ -13700,6 +13711,9 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 		NewDeleteSopFromDB(patid, szStudy, szSeries, szSop, *DB);
 		return FALSE;
 		}
+
+	// outgoing storage commitment: sends of a rewritten object that read the old file are stale
+	if (OutgoingStorageCommitment && !*rRoot) SCLocalWritten(szSop);
 
 	if (MirrorDevice[0])
 		{
@@ -22478,6 +22492,7 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 //   SCTxMember     the objects of each transaction, written before the N-ACTION is sent;
 //                  Outcome (1 committed, 2 failed) and Reason keep the result as received
 // Object states: NOTED REQUESTED COMMITTED FAILED TIMEOUT UNSUPPORTED HELD CANCELLED
+//                CHANGED (stored again locally after it was sent: not confirmed until sent again)
 // Transaction states: OPEN CLOSED ABANDONED (replaced by a newer request for the same objects)
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -22544,7 +22559,27 @@ static BOOL SCVRString(VR *vr, char *buf, int size)
 	return buf[0]!=0;
 	}
 
+// add column Gen (int, 0 for existing rows) to a table made by an earlier development build
+static BOOL SCAddGenColumn(Database &DB, const char *table, const char *probe)
+	{
+	char sql[256], where[64];
+	sprintf(where, "%s = '0'", probe);
+	if (DB.Query(table, "Gen", where, NULL)) return TRUE;
+	OperatorConsole.printf("Outgoing storage commitment: adding column Gen to table %s\n", table);
+	sprintf(sql, "ALTER TABLE %s ADD Gen int DEFAULT 0", table);
+	if (!DB.Exec(sql))
+		{
+		OperatorConsole.printf("*** Outgoing storage commitment: could not add column Gen to table %s\n", table);
+		return FALSE;
+		}
+	if (strcmp(table, "SCObject")==0) DB.CreateIndex("SCObject", "scobj_inst", "SOPInstUID");
+	return TRUE;
+	}
+
 // create the tables when they do not exist yet; FALSE when the database cannot hold them
+// Gen (SCObject, SCTxMember): content generation of the object as sent to the destination;
+// every noted send and every local overwrite increments it; a result only applies to the
+// generation that was asked about (SCTxMember.Gen)
 BOOL SCEnsureTables(Database &DB)
 	{
 	BOOL ok = TRUE;
@@ -22569,9 +22604,10 @@ BOOL SCEnsureTables(Database &DB)
 			{
 			ok = DB.CreateTable("SCTxMember",
 				"TxUID varchar(64), SOPInstUID varchar(64), SOPClassUID varchar(64), "
-				"Outcome int, Reason int");
+				"Outcome int, Reason int, Gen int DEFAULT 0");
 			if (ok) DB.CreateIndex("SCTxMember", "scmem_tx", "TxUID");
 			}
+		else if (ok) ok = SCAddGenColumn(DB, "SCTxMember", "TxUID");
 		if (ok && !DB.Query("SCObject", "SOPInstUID", "SOPInstUID = '0'", NULL))
 			{
 			ok = DB.CreateTable("SCObject",
@@ -22579,10 +22615,12 @@ BOOL SCEnsureTables(Database &DB)
 				"StudyUID varchar(64), State varchar(12), TxUID varchar(64), Attempts int, "
 				"Resends int, ResendRes int, FirstSent int, LastSent int, NextTry int, "
 				"CommittedAt int, FailReason int, DestIP varchar(128), DestPort varchar(16), "
-				"DestTLS int, MapGen int, NoResend int");
+				"DestTLS int, MapGen int, NoResend int, Gen int DEFAULT 0");
 			if (ok) DB.CreateIndex("SCObject", "scobj_key", "CalledAE, SOPInstUID");
 			if (ok) DB.CreateIndex("SCObject", "scobj_state", "State");
+			if (ok) DB.CreateIndex("SCObject", "scobj_inst", "SOPInstUID");
 			}
+		else if (ok) ok = SCAddGenColumn(DB, "SCObject", "SOPInstUID");
 		if (ok) OperatorConsole.printf("Outgoing storage commitment tables ready\n");
 		else    OperatorConsole.printf("*** Outgoing storage commitment: could not create tables\n");
 		SCTablesReady = ok;
@@ -22663,6 +22701,8 @@ static void SCImageSeriesJoin(char *out)
 	sprintf(out, "%s.%s = %s.%s", ImageTableName, UniqueLink(ImageDB), SeriesTableName, UniqueKey(SeriesDB));
 	}
 
+static BOOL SCNotedPending(const char *ae, const char *study);
+
 // Confirmed check with the number of local objects of the study in *objects.
 // Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
 // have SCObject rows for this study and SC in acrnema.map (none: 0, never sent = not confirmed).
@@ -22696,6 +22736,11 @@ static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char 
 			}
 		naes = nAE;
 		}
+
+	// a send of the study (to that AE) still in the in-memory queue: not confirmed (not recorded yet)
+	if (nAE==0 && SCNotedPending(NULL, StudyUID)) { r = 0; goto done; }
+	for (i=0; i<naes; i++)
+		if (SCNotedPending(aes[i], StudyUID)) { r = 0; goto done; }
 
 	// the local objects of the study: image table joined to the series table
 	sprintf(tables, "%s, %s", ImageTableName, SeriesTableName);
@@ -22871,7 +22916,7 @@ usage:
 	OperatorConsole.printf("*** sc_confirmed_list: use sc_confirmed_list:since_epoch[,AE...] (at most %d AEs)\n", SC_MAXCONFIRMAES);
 	}
 
-struct SCMember { char inst[65]; char cls[65]; int seen; int reason; int outcome; int oreason; };
+struct SCMember { char inst[65]; char cls[65]; int seen; int reason; int outcome; int oreason; int gen; };
 
 static int SCMemberCompare(const void *a, const void *b)
 	{ return strcmp(((const SCMember*)a)->inst, ((const SCMember*)b)->inst); }
@@ -22918,7 +22963,7 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 	SCConfirmedStudy **Confirmed, int *nConfirmed)
 	{
 	Database DB;
-	char TxUID[68], txae[20], txstate[16], fi[68], fc[68], fo[16], fr[16], where[512], upd[256], aew[64];
+	char TxUID[68], txae[20], txstate[16], fi[68], fc[68], fo[16], fr[16], fg[16], where[512], upd[256], aew[64];
 	SQLLEN len;
 	SCMember *m = NULL;
 	int nm = 0, nok = 0, nfail = 0, i;
@@ -22954,12 +22999,13 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 	// the members of the transaction
 	m = (SCMember *)malloc(sizeof(SCMember)*SC_MAXMEMBERS);
 	if (!m) { why = "out of memory"; goto done; }
-	if (!DB.Query("SCTxMember", "SOPInstUID, SOPClassUID, Outcome, Reason", where, NULL)) { why = "database query failed"; goto done; }
-	fi[0] = fc[0] = fo[0] = fr[0] = 0;
+	if (!DB.Query("SCTxMember", "SOPInstUID, SOPClassUID, Outcome, Reason, Gen", where, NULL)) { why = "database query failed"; goto done; }
+	fi[0] = fc[0] = fo[0] = fr[0] = fg[0] = 0;
 	DB.BindField(1, SQL_C_CHAR, fi, sizeof(fi), &len);
 	DB.BindField(2, SQL_C_CHAR, fc, sizeof(fc), &len);
 	DB.BindField(3, SQL_C_CHAR, fo, sizeof(fo), &len);
 	DB.BindField(4, SQL_C_CHAR, fr, sizeof(fr), &len);
+	DB.BindField(5, SQL_C_CHAR, fg, sizeof(fg), &len);
 	while (DB.NextRecord())
 		{
 		if (nm>=SC_MAXMEMBERS) { why = "transaction too large"; goto done; }
@@ -22970,8 +23016,9 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 		m[nm].reason = 0;
 		m[nm].outcome = atoi(fo);
 		m[nm].oreason = atoi(fr);
+		m[nm].gen = atoi(fg);
 		nm++;
-		fi[0] = fc[0] = fo[0] = fr[0] = 0;
+		fi[0] = fc[0] = fo[0] = fr[0] = fg[0] = 0;
 		}
 	if (nm==0) { why = "transaction has no members"; goto done; }
 	qsort(m, nm, sizeof(SCMember), SCMemberCompare);
@@ -23017,13 +23064,15 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 		}
 
 	// record: committed always wins; a failure never overwrites a committed object, and a
-	// failure from a replaced (abandoned) transaction is ignored: a newer request is pending
+	// failure from a replaced (abandoned) transaction is ignored: a newer request is pending.
+	// Both only for the content generation that was asked about (Gen): an object sent again
+	// or changed locally since the request is not confirmed (nor failed) by this result
 	for (i=0; i<nm; i++)
 		{
 		if (m[i].seen==1)
 			{
 			sprintf(upd, "State = 'COMMITTED', CommittedAt = %u, FailReason = 0", (unsigned int)time(NULL));
-			sprintf(where, "%s and SOPInstUID = '%s'", aew, m[i].inst);
+			sprintf(where, "%s and SOPInstUID = '%s' and Gen = %d", aew, m[i].inst, m[i].gen);
 			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 			}
 		}
@@ -23034,7 +23083,7 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 				{
 				// NextTry: earliest re-send (only used for nodes with R); a cancelled object stays cancelled
 				sprintf(upd, "State = 'FAILED', FailReason = %d, NextTry = %u", m[i].reason, (unsigned int)time(NULL) + OutgoingSCResendDelay);
-				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and State <> 'CANCELLED' and TxUID = '%s'", aew, m[i].inst, TxUID);
+				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and State <> 'CANCELLED' and TxUID = '%s' and Gen = %d", aew, m[i].inst, TxUID, m[i].gen);
 				if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 				}
 
@@ -23213,20 +23262,69 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 // nothing at all when OutgoingStorageCommitment is 0.
 //////////////////////////////////////////////////////////////////////////////////////////
 
-// one successful C-STORE to a node, to be picked up by the storage commitment worker
-struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; int differ; };
+// one successful C-STORE to a node, to be picked up by the storage commitment worker;
+// seq: SCSendSeq() taken when the send started (before the object was read)
+struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; int differ; unsigned int seq; };
 
 #define SC_NOTEDMAX 50000
+#define SC_CHANGEMAX 4096
 
 static SCNoted		SCNotedQueue[SC_NOTEDMAX];	// ring buffer
 static int		SCNotedHead = 0;		// oldest item
-static int		SCNotedCount = 0;		// items in the queue
+static int		SCNotedCount = 0;		// items in the queue (including those the worker is recording)
 static unsigned int	SCNotedDropped = 0;		// items dropped because the queue was full
 static CRITICAL_SECTION	SCNotedCritical;
 static struct SCNotedCriticalInit
 	{
 	SCNotedCriticalInit() { InitializeCriticalSection(&SCNotedCritical); }
 	}	SCNotedCriticalInitObject;
+
+// Local changes: objects stored again locally (overwrite) while outgoing storage commitment is on.
+// Every change gets the next sequence number; a send that started before the change of its
+// object sent the old content, so its result must never confirm the object (stale send).
+// The last SC_CHANGEMAX changes are kept; an older send than that is treated as stale.
+struct SCChange { char inst[65]; unsigned int seq; };
+static SCChange		SCChanges[SC_CHANGEMAX];	// ring buffer, newest at (SCChangeSeq-1) % SC_CHANGEMAX
+static unsigned int	SCChangeSeq = 0;		// number of changes so far (= sequence of the next one)
+
+// sequence number for a send that starts now: take it before the object is read, pass it to SCNoteSent...
+unsigned int SCSendSeq(void)
+	{
+	unsigned int r;
+	if (!OutgoingStorageCommitment) return 0;
+	EnterCriticalSection(&SCNotedCritical);
+	r = SCChangeSeq;
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
+	}
+
+// record a local change of inst; returns its sequence number
+static unsigned int SCRegisterChange(const char *inst)
+	{
+	unsigned int r;
+	EnterCriticalSection(&SCNotedCritical);
+	r = SCChangeSeq++;
+	strncpy(SCChanges[r % SC_CHANGEMAX].inst, inst, 64);
+	SCChanges[r % SC_CHANGEMAX].inst[64] = 0;
+	SCChanges[r % SC_CHANGEMAX].seq = r;
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
+	}
+
+// was inst changed locally after a send that started at seq (or can that no longer be told)?
+static BOOL SCChangedSince(const char *inst, unsigned int seq)
+	{
+	BOOL r = FALSE;
+	unsigned int n, i;
+	EnterCriticalSection(&SCNotedCritical);
+	n = SCChangeSeq - seq;				// changes since the send started (wraps correctly)
+	if (n > SC_CHANGEMAX) r = TRUE;			// not all of them kept: assume changed
+	else
+		for (i=0; i<n && !r; i++)
+			if (strcmp(SCChanges[(seq + i) % SC_CHANGEMAX].inst, inst)==0) r = TRUE;
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
+	}
 
 // called after a successful C-STORE; cheap: copies into a bounded in-memory queue
 // (no database access in the send path). Does nothing unless OutgoingStorageCommitment
@@ -23235,7 +23333,9 @@ static struct SCNotedCriticalInit
 // applied to the sent copy only: forward "script" clause, RetrieveConverter0, a Lua object).
 // Such an object is never re-sent automatically (NoResend): a re-send would send the archive
 // copy, e.g. not anonymised where the sent copy was.
-void SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer)
+// seq: SCSendSeq() from the start of the send; a local change of the object after it makes the
+// send stale (never confirmed).
+void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
 	{
 	ACRNemaAddress	E;
 	char		ae[20];
@@ -23269,6 +23369,7 @@ void SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstan
 		else                               q->study[0] = 0;
 		q->t = (unsigned int)time(NULL);
 		q->differ = MayDiffer ? 1 : 0;
+		q->seq = seq;
 		SCNotedCount++;
 		}
 	LeaveCriticalSection(&SCNotedCritical);
@@ -23276,6 +23377,12 @@ void SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstan
 	// a dropped item is never confirmed (safe side); one line per 1000 drops
 	if (dropped && (dropped % 1000)==1)
 		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
+	}
+
+// without a send sequence: the send is taken as started now
+void SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer)
+	{
+	SCNoteSentSeq(AE, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, SCSendSeq());
 	}
 
 void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID)
@@ -23294,21 +23401,47 @@ void SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study)
 	if (!SCVRUID(DDO->GetVR(0x0020, 0x000d), study)) study[0] = 0;
 	}
 
-// worker side: move up to max queued items into buf; returns the count
+// worker side: copy up to max queued items into buf; returns the count. The items stay in the
+// queue (so that "study confirmed" still sees them) until SCDropNoted after they are recorded.
 int SCTakeNoted(SCNoted *buf, int max)
 	{
 	int n = 0;
 	if (!buf || max<=0) return 0;
 	EnterCriticalSection(&SCNotedCritical);
-	while (n<max && SCNotedCount>0)
+	while (n<max && n<SCNotedCount)
 		{
-		buf[n++] = SCNotedQueue[SCNotedHead];
-		SCNotedHead = (SCNotedHead + 1) % SC_NOTEDMAX;
-		SCNotedCount--;
+		buf[n] = SCNotedQueue[(SCNotedHead + n) % SC_NOTEDMAX];
+		n++;
 		}
-	if (SCNotedCount==0) SCNotedHead = 0;
 	LeaveCriticalSection(&SCNotedCritical);
 	return n;
+	}
+
+// worker side: remove the n oldest items (taken by SCTakeNoted and recorded)
+static void SCDropNoted(int n)
+	{
+	EnterCriticalSection(&SCNotedCritical);
+	if (n > SCNotedCount) n = SCNotedCount;
+	SCNotedHead = (SCNotedHead + n) % SC_NOTEDMAX;
+	SCNotedCount -= n;
+	if (SCNotedCount==0) SCNotedHead = 0;
+	LeaveCriticalSection(&SCNotedCritical);
+	}
+
+// is a send to ae (NULL: any destination) of an object of study still in the queue, i.e. not
+// recorded yet? An item with unknown study counts for every study (safe side).
+static BOOL SCNotedPending(const char *ae, const char *study)
+	{
+	BOOL r = FALSE;
+	EnterCriticalSection(&SCNotedCritical);
+	for (int i=0; i<SCNotedCount && !r; i++)
+		{
+		SCNoted *q = SCNotedQueue + (SCNotedHead + i) % SC_NOTEDMAX;
+		if (ae && strcmp(q->ae, ae)!=0) continue;
+		if (q->study[0]==0 || strcmp(q->study, study)==0) r = TRUE;
+		}
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
 	}
 
 // number of items waiting in the queue and dropped so far (for the sc_queue: server command)
@@ -23322,6 +23455,57 @@ static int SCNotedLength(unsigned int *dropped)
 	return n;
 	}
 
+// SQL that makes the objects of a where clause unconfirmed after a local change: Gen + 1 (a result
+// for an earlier request no longer applies), state CHANGED (not asked, not re-sent: the archive
+// copy is not what was sent) unless CANCELLED; the next noted send starts the object over
+static const char *SCChangedUpdate =
+	"Gen = Gen + 1, TxUID = '', CommittedAt = 0, Attempts = 0, NoResend = 1, NextTry = 0, "
+	"State = CASE WHEN State = 'CANCELLED' THEN 'CANCELLED' ELSE 'CHANGED' END";
+
+// An object is being stored locally (SaveToDataBase, before its image record is written).
+// JustAdd: it was not in the local database before (a new object).
+// With outgoing storage commitment on, an object stored again (overwrite) may differ from what was
+// sent: its SCObject rows (all destinations) become CHANGED at once, so its study is no longer
+// confirmed, and sends of it that started before are stale (never confirmed). A new object costs
+// one indexed query; it is handled the same way only when rows exist for it (it was deleted
+// locally after a send and has now arrived again, possibly with other content).
+void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
+	{
+	char inst[68], where[160], cnt[32];
+	SQLLEN len;
+	int n = -1;
+
+	if (!OutgoingStorageCommitment || !DDO) return;
+	if (!SCVRUID(DDO->GetVR(0x0008, 0x0018), inst)) return;
+	if (!SCEnsureTables(DB)) return;
+
+	sprintf(where, "SOPInstUID = '%s'", inst);
+	if (DB.Query("SCObject", "COUNT(*)", where, NULL))
+		{
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		if (DB.NextRecord()) n = atoi(cnt);
+		}
+	if (JustAdd && n==0) return;			// new object, never sent: nothing to do
+
+	SCRegisterChange(inst);				// first: a send recorded from now on sees the change
+	if (n==0) return;
+	if (!DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		OperatorConsole.printf("*** Storage commitment ALARM: %s stored again locally, but its commitment state could not be reset\n", inst);
+	else
+		OperatorConsole.printf("Storage commitment: %s stored again locally: CHANGED for every destination (not confirmed until it is sent again)\n", inst);
+	}
+
+// The file of an object that was stored again has been written (SaveToDisk): sends that started
+// between SCLocalStored and now may have read the old file; mark them stale as well.
+void SCLocalWritten(const char *inst)
+	{
+	char uid[68];
+	if (!OutgoingStorageCommitment || !inst || strlen(inst)>64) return;
+	strcpy(uid, inst);
+	SCTrim(uid);
+	if (SCIsUID(uid)) SCRegisterChange(uid);
+	}
 void CloneDB(char *AE)
 { VR *vr1;
   VR *vr;
@@ -23477,7 +23661,7 @@ static void SimplifyDicom(DICOMDataObject *pDDO)
 #define SC_WARNMAX	64		// destinations remembered for once-only warnings
 
 // one object of a chunk to be asked for
-struct SCItem { char inst[68]; char cls[68]; char ip[132]; char port[68]; int tls; };
+struct SCItem { char inst[68]; char cls[68]; char ip[132]; char port[68]; int tls; int gen; };
 
 // one (destination, study) group of NOTED objects
 struct SCGroup { char ae[20]; char study[68]; unsigned int last; unsigned int next; int n; };
@@ -23754,8 +23938,26 @@ static void SCLookupStudy(Database &DB, const char *inst, char *study)
 	if (SCIsUID(st)) strcpy(study, st);
 	}
 
-// record one noted send: new row NOTED; an object in a final state (or cancelled/held) was
-// sent again and starts over; NOTED or REQUESTED only gets the new LastSent
+// After a noted send is recorded: if the object was stored again locally after that send started,
+// the send carried the old content. The row is made CHANGED (as by the local store), so this send
+// can never confirm it. Checked after the write: a local store that comes in between either is
+// seen here or changes the row itself afterwards (it registers before it updates the table).
+static void SCCheckStale(Database &DB, const char *aew, SCNoted *it)
+	{
+	char where[256];
+	if (!SCChangedSince(it->inst, it->seq)) return;
+	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
+	if (DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send)\n", it->inst, it->ae);
+	else
+		OperatorConsole.printf("*** Storage commitment ALARM: stale send of %s to %s, but the database update failed\n", it->inst, it->ae);
+	}
+
+// record one noted send; every send raises the content generation Gen by one: new row NOTED;
+// an object in a final state (or CHANGED, cancelled, held) was sent again and starts over;
+// NOTED gets the new LastSent; REQUESTED becomes NOTED again (the pending request asked about
+// the earlier generation, its result no longer applies). A send that started before the object
+// was stored again locally (stale) leaves it CHANGED: such a send never confirms the object.
 static void SCRecordNoted(Database &DB, SCNoted *it)
 	{
 	char ae[20], aew[64], where[256], upd[1024], cols[256], vals[1024], state[16], study[68];
@@ -23782,9 +23984,12 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 
 	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
 		{
-		sprintf(upd, it->differ ? "LastSent = %u, NoResend = 1" : "LastSent = %u", t);
+		sprintf(upd, "LastSent = %u, Gen = Gen + 1%s%s", t,
+			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
+			it->differ ? ", NoResend = 1" : "");
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
-			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
+			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae); return; }
+		SCCheckStale(DB, aew, it);
 		return;
 		}
 
@@ -23797,19 +24002,22 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	if (exists)
 		{
 		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
-			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d",
+			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d, "
+			"Gen = Gen + 1",
 			t, t, study, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
-			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
+			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae); return; }
+		SCCheckStale(DB, aew, it);
 		return;
 		}
 
 	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
-		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend");
-	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d",
+		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend, Gen");
+	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d, 1",
 		ae, it->inst, it->cls, study, t, t, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
 	if (!DB.AddRecord("SCObject", cols, vals))
-		OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae);
+		{ OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae); return; }
+	SCCheckStale(DB, aew, it);
 	}
 
 // objects of a transaction still REQUESTED: TIMEOUT when the attempts are used up or the
@@ -24216,8 +24424,8 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 		}
 	for (i=0; i<n; i++)
 		{
-		sprintf(vals, "'%s', '%s', '%s', 0, 0", TxUID, it[i].inst, it[i].cls);
-		if (!DB.AddRecord("SCTxMember", "TxUID, SOPInstUID, SOPClassUID, Outcome, Reason", vals))
+		sprintf(vals, "'%s', '%s', '%s', 0, 0, %d", TxUID, it[i].inst, it[i].cls, it[i].gen);
+		if (!DB.AddRecord("SCTxMember", "TxUID, SOPInstUID, SOPClassUID, Outcome, Reason, Gen", vals))
 			{
 			OperatorConsole.printf("*** Storage commitment: database insert failed, nothing sent to %s\n", ae);
 			SCAbandon(DB, ae, TxUID, now, FALSE);
@@ -24226,7 +24434,9 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 		}
 	SCAEWhere(DB, aew, ae);
 	sprintf(upd, "State = 'REQUESTED', TxUID = '%s', Attempts = Attempts + 1", TxUID);
-	sprintf(where, "%s and State = 'NOTED' and SOPInstUID in (SELECT SOPInstUID FROM SCTxMember WHERE TxUID = '%s')", aew, TxUID);
+	// only objects still at the generation the request asks about (a newer send or a local change
+	// in between leaves them out; their result will not apply)
+	sprintf(where, "%s and State = 'NOTED' and SOPInstUID in (SELECT SOPInstUID FROM SCTxMember WHERE TxUID = '%s' and SCTxMember.Gen = SCObject.Gen)", aew, TxUID);
 	if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 		{
 		OperatorConsole.printf("*** Storage commitment: database update failed, nothing sent to %s\n", ae);
@@ -24255,7 +24465,7 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 static void SCProcessGroups(Database &DB, unsigned int now)
 	{
 	char where[512], cols[192], ae[24], study[72], last[32], next[32], cnt[32], aew[64];
-	char inst[72], cls[72], ip[132], port[68], tls[16];
+	char inst[72], cls[72], ip[132], port[68], tls[16], gen[16];
 	SQLLEN len;
 	SCGroup *g;
 	SCItem *it;
@@ -24301,14 +24511,15 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 		for (round=0; round<1000; round++)
 			{
 			sprintf(where, "%s and StudyUID = '%s' and State = 'NOTED' and NextTry <= %u", aew, g[i].study, now);
-			if (!DB.Query("SCObject", "SOPInstUID, SOPClassUID, DestIP, DestPort, DestTLS", where, NULL))
+			if (!DB.Query("SCObject", "SOPInstUID, SOPClassUID, DestIP, DestPort, DestTLS, Gen", where, NULL))
 				{ OperatorConsole.printf("*** Storage commitment: database query failed (objects)\n"); break; }
-			inst[0] = cls[0] = ip[0] = port[0] = tls[0] = 0;
+			inst[0] = cls[0] = ip[0] = port[0] = tls[0] = gen[0] = 0;
 			DB.BindField(1, SQL_C_CHAR, inst, 70, &len);
 			DB.BindField(2, SQL_C_CHAR, cls, 70, &len);
 			DB.BindField(3, SQL_C_CHAR, ip, 130, &len);
 			DB.BindField(4, SQL_C_CHAR, port, 66, &len);
 			DB.BindField(5, SQL_C_CHAR, tls, sizeof(tls), &len);
+			DB.BindField(6, SQL_C_CHAR, gen, sizeof(gen), &len);
 			n = 0;
 			while (n<OutgoingSCMaxBatch && DB.NextRecord())
 				{
@@ -24320,9 +24531,10 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 					strcpy(it[n].ip, ip);
 					strcpy(it[n].port, port);
 					it[n].tls = atoi(tls);
+					it[n].gen = atoi(gen);
 					n++;
 					}
-				inst[0] = cls[0] = ip[0] = port[0] = tls[0] = 0;
+				inst[0] = cls[0] = ip[0] = port[0] = tls[0] = gen[0] = 0;
 				}
 			if (n==0) break;
 			r = SCSendChunk(DB, g[i].ae, it, n, now);
@@ -24547,7 +24759,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		delete DDO;
 		// back into the normal cycle: asked again with a new TxUID after the quiet time
 		// (not through SCNoteSent; FirstSent is kept)
-		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0", now);
+		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0, Gen = Gen + 1", now);
 		if (!SCResendUpdate(DB, aew, it[i].inst, upd))
 			OperatorConsole.printf("*** Storage commitment ALARM: %s re-sent to %s but the database update failed\n", it[i].inst, ae);
 		else
@@ -24746,6 +24958,7 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 
 	n = SCTakeNoted(buf, SC_DRAINMAX);
 	for (i=0; i<n; i++) SCRecordNoted(DB, buf+i);
+	SCDropNoted(n);				// visible to "study confirmed" until recorded
 
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
@@ -24802,9 +25015,9 @@ void StartSCWorkerThread(void)
 // not_local, overdue (RI nodes: objects past OutgoingSCDeadline still in the cycle)
 static void SCStatusText(char *out, int size)
 	{
-	static const char *states[] = { "NOTED", "REQUESTED", "COMMITTED", "FAILED", "TIMEOUT", "UNSUPPORTED", "HELD", "CANCELLED" };
-	const int ns = 8;
-	struct SCStat { char ae[20]; int c[8]; unsigned int oldest; int r[6]; } *s;
+	static const char *states[] = { "NOTED", "REQUESTED", "COMMITTED", "FAILED", "TIMEOUT", "UNSUPPORTED", "HELD", "CANCELLED", "CHANGED" };
+	const int ns = 9;
+	struct SCStat { char ae[20]; int c[9]; unsigned int oldest; int r[6]; } *s;
 	Database DB;
 	char cols[128], where[512], ae[24], st[24], cnt[32], first[32], line[640], qw[160];
 	SQLLEN len;
@@ -24907,7 +25120,7 @@ static void SCStatusText(char *out, int size)
 	}
 
 // sc_cancel:<AE>[,<StudyUID>]: objects of that destination (and study) in NOTED, REQUESTED,
-// FAILED, TIMEOUT or HELD become CANCELLED (no more requests or re-sends); Response = count,
+// FAILED, TIMEOUT, HELD or CHANGED become CANCELLED (no more requests or re-sends); Response = count,
 // or -1 on error. A result that arrives later can still make an object COMMITTED.
 static void SCCancelCommand(const char *arg, char *Response)
 	{
@@ -24937,7 +25150,7 @@ static void SCCancelCommand(const char *arg, char *Response)
 	if (!SCEnsureTables(DB)) { DB.Close(); return; }
 
 	SCAEWhere(DB, aew, ae);
-	sprintf(where, "%s%s%s%s and State in ('NOTED', 'REQUESTED', 'FAILED', 'TIMEOUT', 'HELD')",
+	sprintf(where, "%s%s%s%s and State in ('NOTED', 'REQUESTED', 'FAILED', 'TIMEOUT', 'HELD', 'CHANGED')",
 		aew, study[0] ? " and StudyUID = '" : "", study, study[0] ? "'" : "");
 	if (DB.Query("SCObject", "COUNT(*)", where, NULL))
 		{
@@ -33376,6 +33589,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
   static int luadicomstore(lua_State *L)
   { const char *ae    = lua_tostring(L,1);
     BOOL flag=FALSE;
+    unsigned int scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: send sequence
     if (lua_isuserdata(L, 2)) 
     { DICOMDataObject *O = NULL;
       Array < DICOMDataObject * > *A = NULL;  
@@ -33470,7 +33684,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
           { OperatorConsole.printf("*** dicomstore: failed to send DICOM image to %s\n", ae);
             nfail++;
 	  }
-	  else if (scOn) SCNoteSentEx(ae, scCls, scInst, scStudy, 1);	// a Lua object: may differ from the archive
+	  else if (scOn) SCNoteSentSeq(ae, scCls, scInst, scStudy, 1, scSeq);	// a Lua object: may differ from the archive
 	  delete DDO;
 	}
 	

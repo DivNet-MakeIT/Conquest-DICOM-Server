@@ -474,6 +474,8 @@ IARQ (AAssociateRQ	&ARQ, BOOL showall);
 extern	int	OutgoingStorageCommitment;
 void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID);
 void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer);
+void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+unsigned int	SCSendSeq(void);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
 
 BOOL	StandardRetrieveNKI	::	Read (
@@ -501,6 +503,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 	char		Called[20], Calling[20];
 	BOOL		StripGroup2, Cancelled;
 	int             splitinto=1, splitselect=0;
+	unsigned int	scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: before any object is read
 
 	GetUID(MyUID);
 
@@ -896,7 +899,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
-				if (scOn) SCNoteSentEx((char *)ACRNema, scCls, scInst, scStudy, scDiffer);
+				if (scOn) SCNoteSentSeq((char *)ACRNema, scCls, scInst, scStudy, scDiffer, scSeq);
 				delete iDDO;
 				}
 			}

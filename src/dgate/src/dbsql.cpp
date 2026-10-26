@@ -1268,6 +1268,10 @@ void clear_UpdateCache(void)
 	LeaveCriticalSection(&UpdateCritical);
 	}
 
+// outgoing storage commitment (dgate.cpp): an object stored again locally is no longer confirmed
+extern	int	OutgoingStorageCommitment;
+void	SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd);
+
 BOOL
 SaveToDataBase(
 	Database		&DB,
@@ -1380,6 +1384,9 @@ SaveToDataBase(
 	    }
 	  }
 	}
+
+	// outgoing storage commitment: an object stored again is no longer confirmed (one int test when off)
+	if (OutgoingStorageCommitment) SCLocalStored(DB, DDOPtr, JustAdd);
 
 	if (!UpdateOrAddToTable(DB, ImageDB,   ImageTableName,   DDOPtr, filename, device, LastPatid, NULL, &AddedImage, JustAdd, FALSE))
 		return FALSE;

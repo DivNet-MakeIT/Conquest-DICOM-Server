@@ -483,6 +483,35 @@ void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPIns
 int	SCModeMayDiffer(const char *mode);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
 
+// A QualifyOn of a retrieve class must fill QualifiedEntry (every class in dgate.cpp
+// does). One that does not (a class added later) leaves the transport unknown, and
+// it is never taken from a second map lookup: that lookup could see another map
+// version than the address did, and a T node could get plain text. The move then
+// goes on plain only when the destination's entry in the map now is a plain one with
+// the very address QualifyOn returned; a T node, an entry that is gone or that has
+// another address is refused (fail closed) with a console line.
+static	BOOL	QualifiedEntryPlainOnly(ACRNemaAddress *Q, char *AE, const char *ip, const char *port)
+	{
+	ACRNemaAddress	E;
+	const char	*why = NULL;
+
+	if (!GetACRNemaEntryByAE(AE, &E))
+		why = "it is not in acrnema.map now";
+	else if (E.Flags & ACR_TLS)
+		why = "it has T in acrnema.map";
+	else if (strcmp(E.IP, ip) || strcmp(E.Port, port))
+		why = "its acrnema.map entry changed";
+	if (why)
+		{
+		OperatorConsole.printf("*** TLS: C-MOVE to %s refused: the retrieve class did not give the acrnema.map entry of the destination (QualifyOn), and %s\n", AE, why);
+		return FALSE;
+		}
+	*Q = E;
+	memset(Q->Name, 0, sizeof(Q->Name));
+	strncpy(Q->Name, AE, sizeof(Q->Name)-1);
+	return TRUE;
+	}
+
 BOOL	StandardRetrieveNKI	::	Read (
 	ExtendedPDU_Service		*PDU,
 	DICOMCommandObject		*DCO,
@@ -642,6 +671,12 @@ BOOL	StandardRetrieveNKI	::	Read (
 			SystemDebug.printf("Retrieve: move destination not allowed or known\n: %s", ACRNema);
 			return ( TRUE );
 			}
+		if (!QualifiedEntry.Name[0] &&
+		    !QualifiedEntryPlainOnly(&QualifiedEntry, (char *)ACRNema, (char *)IP, (char *)lPort))
+			{
+			CMoveRSP :: Write (PDU, DCO, 0xc003, 0, 0, 0, 0, NULL );
+			return ( TRUE );
+			}
 		}
 	else
 		{
@@ -746,10 +781,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 		NewPDU.SetTimeOut(TCPIPTimeOut);
 
-		if (QualifiedEntry.Name[0])		// same lookup as IP/lPort
-			SCPrepareTLSForCalledAE(NewPDU, QualifiedEntry, QualifiedEntry.Name);
-		else					// a QualifyOn that does not fill it: look up again
-			PrepareTLSForAE(NewPDU, (char *)ACRNema);
+		// transport from the same lookup as IP/lPort (always filled, see above)
+		SCPrepareTLSForCalledAE(NewPDU, QualifiedEntry, QualifiedEntry.Name);
 		if (!NewPDU.Connect (IP, lPort))
 			{
 			CMoveRSP :: Write ( PDU, DCO, 0xc005 , 0, 0, 0, 0, NULL );

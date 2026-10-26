@@ -34,6 +34,8 @@
 20261026	mmd	TLS mode only: the TCP connect is non-blocking with a deadline of TimeOut
 			(TCPIPTimeOut at the connect sites); plain connect unchanged
 20261026	mmd	Windows constructor: TLS members set before the WSAStartup early return
+20261026	mmd	TLS: the calls that make the socket non-blocking are checked; when one
+			fails the TLS connect, handshake or accept fails (never a blocking wait)
 
 */
 
@@ -511,6 +513,11 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 				SocketTLSPrint(0, "*** TLS: connection to %s (%s) timed out after %d s", TLSPeerAE, ip, TimeOut > 0 ? TimeOut : 300);
 				break;
 				}
+			if ( r == 3 )
+				{
+				SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: the socket cannot be made non-blocking", TLSPeerAE, ip);
+				break;
+				}
 			Error = r ? -1 : 0;
 			}
 		else
@@ -837,6 +844,22 @@ BOOL	Socket	::	SetTLS(int on, const char *AE)
 #define	TLS_HANDSHAKE_SECONDS	30	// limit for the TLS handshake
 #define	TLS_CLOSE_SECONDS	2	// limit for sending close_notify
 
+// Make a TLS socket non-blocking. Every wait of the TLS code has a time limit only
+// because of this mode, so a failure must end the connection: FALSE when the call
+// (fcntl or ioctlsocket) fails.
+static	BOOL	SocketSetNonBlocking(int fd)
+	{
+#ifdef	WINDOWS
+	u_long	nb = 1;
+	return ( ioctlsocket(fd, FIONBIO, &nb) == 0 );
+#else
+	int	fl = fcntl(fd, F_GETFL, 0);
+	if (fl == -1)
+		return ( FALSE );
+	return ( fcntl(fd, F_SETFL, fl | O_NONBLOCK) != -1 );
+#endif
+	}
+
 // Wait until the socket can be read (ForWrite=0) or written (ForWrite=1).
 // Returns 1 when ready, 0 on timeout, -1 on error.
 int	Socket	::	TLSWait(int ForWrite, int Seconds)
@@ -882,7 +905,8 @@ static	void	SocketTLSErrorText(SSL *ssl, int e, char *buf, int len)
 
 // TCP connect for TLS mode: non-blocking, ends at time end (seconds since the
 // epoch). Returns 0 connected, 1 failed (e.g. refused; the caller may retry),
-// 2 timed out. The socket stays non-blocking (TLSOpen needs that anyway).
+// 2 timed out, 3 the socket could not be made non-blocking (no retry). The socket
+// stays non-blocking (TLSOpen needs that anyway).
 int	Socket	::	TLSConnect(long end)
 	{
 	fd_set		wfds, efds;
@@ -890,13 +914,12 @@ int	Socket	::	TLSConnect(long end)
 	int		r, err, left;
 #ifdef	WINDOWS
 	int		len = sizeof(err);
-	u_long	nb = 1;
-	ioctlsocket(Socketfd, FIONBIO, &nb);
 #else
 	socklen_t	len = sizeof(err);
-	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
 #endif
 
+	if (!SocketSetNonBlocking(Socketfd))
+		return 3;
 	r = connect(Socketfd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in));
 	if (r == 0)
 		return 0;
@@ -961,12 +984,12 @@ BOOL	Socket	::	TLSOpen(char *host)
 		}
 
 	// non-blocking from here: every wait below has a time limit
-#ifdef	WINDOWS
-	u_long	nb = 1;
-	ioctlsocket(Socketfd, FIONBIO, &nb);
-#else
-	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
-#endif
+	if (!SocketSetNonBlocking(Socketfd))
+		{
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: the socket cannot be made non-blocking", TLSPeerAE, host);
+		SSL_free(ssl);
+		return ( FALSE );
+		}
 	SSL_set_fd(ssl, Socketfd);
 	SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 	TLSHandle = ssl;
@@ -1056,12 +1079,14 @@ BOOL	Socket	::	TLSAccept(int fd, const char *peer)
 		}
 
 	// non-blocking from here: every wait below has a time limit
-#ifdef	WINDOWS
-	u_long	nb = 1;
-	ioctlsocket(Socketfd, FIONBIO, &nb);
-#else
-	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
-#endif
+	if (!SocketSetNonBlocking(Socketfd))
+		{
+		SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: the socket cannot be made non-blocking", peer);
+		SSL_free(ssl);
+		closesocket(fd);
+		Socketfd = 0;
+		return ( FALSE );
+		}
 	SSL_set_fd(ssl, Socketfd);
 	SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 	TLSHandle = ssl;

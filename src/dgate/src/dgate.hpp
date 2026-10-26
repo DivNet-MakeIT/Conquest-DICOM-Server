@@ -205,6 +205,8 @@ BOOL	GetACRNemaEntryByAE(char *ACRNema, ACRNemaAddress *Entry);
 int	ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn);
 BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
+BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// TLS for nodes with T in acrnema.map
+BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE);	// the same, looked up by AE title
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);
 BOOL	RemoveFromPACS(DICOMDataObject *, BOOL KeepImages = FALSE);
 BOOL	BuildColumnString(DBENTRY	*DBE, char	*TableName, VR	*vr,	char	*TempString);

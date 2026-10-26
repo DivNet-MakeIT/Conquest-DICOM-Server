@@ -20,6 +20,7 @@
 20140610    mvh    Merged
 20160827    mvh    PDU size configurable 
 20220824    mvh    Added LoadDICOMDataObjectTrunc
+20261026    mmd    Added SetTLS: TLS (or plain) for the next Connect
 */
 
 /****************************************************************************
@@ -232,6 +233,10 @@ class	PDU_Service	:
 
 		int		Multiplex(BYTE *);
 		int		Listen(int);
+		// TLS (on=1) or plain (on=0, the default) for the next Connect; AE = called node.
+		// FALSE when TLS is asked for in a build without TLS (Connect then fails).
+		BOOL	SetTLS(int on, const char *AE)
+			{ return ( Link.SetTLS(on, AE) ); };
 		BOOL	SetTimeOut(int TimeOut)
 			{ return ( Link.SetTimeOut(TimeOut) ); };
 				PDU_Service();

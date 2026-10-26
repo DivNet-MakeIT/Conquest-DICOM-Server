@@ -5,6 +5,7 @@
 // 20100707 mvh     Merged
 // 20121214 mvh     Mode sa public
 // 20140528 lsp     Private copy constructor is not GNUC specific
+// 20261026 mmd     Outgoing TLS members and hooks (used only with HAVE_OPENSSL)
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -85,8 +86,37 @@ class	Socket
 		// UDP Extensions
 		BOOL	BindUDPServer(char *port);
 		BOOL	BindUDPClient(char *host, const char *port);
+
+		// Outgoing TLS (20261026 mmd). TLSMode 0 = plain, exactly as before.
+		// TLSMode 1 = the next Open makes a TLS client connection, or fails:
+		// it never falls back to plain. Without HAVE_OPENSSL Open refuses it.
+		void	*TLSHandle;		// SSL* while TLS is active, else NULL (void*: no OpenSSL headers needed here)
+		int	TLSMode;
+		char	TLSPeerAE[20];		// node being connected, for the certificate checks
+		BOOL	SetTLS(int on, const char *AE);
+	private:
+		BOOL	TLSOpen(char *host);
+		void	TLSFree(BOOL SendCloseNotify);
+		int	TLSWait(int ForWrite, int Seconds);
+		BOOL	TLSSend(BYTE *, UINT);
+		INT	TLSRead(BYTE *, UINT);
 	private:// This will prevent it from being copied (it has a pointer)
 		Socket(const Socket&);
 		const	Socket & operator = (const Socket&);
 	};
+
+// Hooks for outgoing TLS, installed by the application (dgate). With no
+// ClientContext hook a TLS connection is refused. Only used with HAVE_OPENSSL.
+//   ClientContext:   returns the SSL_CTX* for client connections, or NULL
+//   BeforeHandshake: called with the new SSL* (e.g. to set the host name check)
+//   AfterHandshake:  called after a good handshake (e.g. certificate pin); FALSE aborts
+//   Log:             level 0 = operator message, 1 = debug
+typedef struct	_SocketTLSHooks
+	{
+	void	*(*ClientContext)(void);
+	BOOL	(*BeforeHandshake)(void *ssl, const char *AE, const char *host);
+	BOOL	(*AfterHandshake)(void *ssl, const char *AE, const char *host);
+	void	(*Log)(int level, const char *text);
+	}	SocketTLSHooks;
+extern	SocketTLSHooks	SocketTLS;
 

@@ -735,6 +735,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 		NewPDU.SetTimeOut(TCPIPTimeOut);
 
+		PrepareTLSForAE(NewPDU, (char *)ACRNema);
 		if (!NewPDU.Connect (IP, lPort))
 			{
 			CMoveRSP :: Write ( PDU, DCO, 0xc005 , 0, 0, 0, 0, NULL );

@@ -21,6 +21,7 @@
 20160827    mvh    PDU size configurable 
 20220824    mvh    Added LoadDICOMDataObjectTrunc
 20261026    mmd    Added SetTLS: TLS (or plain) for the next Connect
+20261026    mmd    Added ConnectedAE/Host/Port/TLS: destination actually used by the last Connect
 */
 
 /****************************************************************************
@@ -239,6 +240,14 @@ class	PDU_Service	:
 			{ return ( Link.SetTLS(on, AE) ); };
 		BOOL	SetTimeOut(int TimeOut)
 			{ return ( Link.SetTimeOut(TimeOut) ); };
+		// The destination actually used by the last Connect (set when the connection is made,
+		// empty when it failed or a value did not fit): the called AE title as sent in the
+		// A-ASSOCIATE-RQ, host and port as passed to Connect, and 1 when it is TLS.
+		// For outgoing storage commitment, which must record where an object really went.
+		char	ConnectedAE[20];
+		char	ConnectedHost[128];
+		char	ConnectedPort[64];
+		int	ConnectedTLS;
 				PDU_Service();
 		virtual	~PDU_Service();
 	private:// This will prevent it from being copied (it has pointers)

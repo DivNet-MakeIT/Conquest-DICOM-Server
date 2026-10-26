@@ -51,6 +51,7 @@
 20230608    mvh    Copy AAssociateRQ SCPSCURoles to AAssociateAC
 20261008    mvh    Log AE title if rejected
 20261019    mmd    Connect keeps SCPSCURoles proposed by caller (for storage commitment event)
+20261026    mmd    Connect records ConnectedAE/Host/Port/TLS (destination actually used)
 */
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -103,6 +104,8 @@ pdusize(32768)
 	// PDU Level services are always big endian architecture
 	Buffer :: SetIncomingEndian(BIG_ENDIAN);
 	Buffer :: SetOutgoingEndian(BIG_ENDIAN);
+	ConnectedAE[0] = ConnectedHost[0] = ConnectedPort[0] = 0;
+	ConnectedTLS = 0;
 	}
 
 PDU_Service	::	~PDU_Service()
@@ -1053,11 +1056,23 @@ BOOL	PDU_Service	::	Connect ( BYTE *ip, BYTE *port )
 
 	AAssociateRQ :: SetUserInformation ( UserInfo );
 
+	// the destination of this connection (only kept when it succeeds and everything fits)
+	ConnectedAE[0] = ConnectedHost[0] = ConnectedPort[0] = 0;
+	ConnectedTLS = 0;
+
 	// ok, every thing proposed, now try and contact the remote end
 	if ( ! Link.Open ( (char*) ip, (char*)port ) )
 		{
 		DicomError(DCM_ERROR_DEBUG, "connect failed on socket level (called not running)", 0);
 		return ( FALSE );
+		}
+	if (ip && port && strlen((char *)ip) < sizeof(ConnectedHost) && strlen((char *)port) < sizeof(ConnectedPort))
+		{
+		memset(ConnectedAE, 0, sizeof(ConnectedAE));
+		memcpy(ConnectedAE, AAssociateRQ :: CalledApTitle, 16);
+		strcpy(ConnectedHost, (char *)ip);
+		strcpy(ConnectedPort, (char *)port);
+		ConnectedTLS = Link.TLSMode ? 1 : 0;
 		}
 
 	AAssociateRQ :: Size();

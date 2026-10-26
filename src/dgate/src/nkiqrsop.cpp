@@ -476,6 +476,7 @@ void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer);
 void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 unsigned int	SCSendSeq(void);
+void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
 
 BOOL	StandardRetrieveNKI	::	Read (
@@ -899,7 +900,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
-				if (scOn) SCNoteSentSeq((char *)ACRNema, scCls, scInst, scStudy, scDiffer, scSeq);
+				if (scOn) SCNoteSentPDU(UsedPDU, scCls, scInst, scStudy, scDiffer, scSeq);	// move destination, address from QualifyOn
 				delete iDDO;
 				}
 			}

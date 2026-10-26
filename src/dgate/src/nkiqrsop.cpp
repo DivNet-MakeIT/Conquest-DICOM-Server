@@ -476,6 +476,8 @@ void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer);
 void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 unsigned int	SCSendSeq(void);
+extern int	SCTestDelayAfterRead;
+void	SCTestSleep(int ms);
 void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 int	SCModeMayDiffer(const char *mode);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
@@ -839,6 +841,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 				++Failed;
 			else
 				{
+				// test only (default 0): widen the window between reading the object and its send
+				if (OutgoingStorageCommitment && SCTestDelayAfterRead>0 && !cget) SCTestSleep(SCTestDelayAfterRead);
 				// non NKI client
 			        if (DCO==NULL)
 					{

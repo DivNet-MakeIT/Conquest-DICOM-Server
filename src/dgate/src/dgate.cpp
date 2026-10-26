@@ -1361,6 +1361,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Node certificates (SHA-256) in a separate file TLSNodeCertsFile (default empty = none)
 			instead of TLSPin_<AE> keys; server command read_tlscerts:; unreadable lines and duplicate AEs
 			make that AE refused (fail closed)
+20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
+			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
+			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
 
 ENDOFUPDATEHISTORY
 */
@@ -1538,6 +1541,8 @@ int	OutgoingSCKeepDays=7;				// committed objects and closed transactions are pu
 int	OutgoingSCResendMissing=1;			// re-send to nodes with R: 0 never, 1 failed (transient reason), 2 also no result
 int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
 int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
+int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
+int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -3896,7 +3901,23 @@ OffsetDatesInDICOMObject(DICOMObject *DO, const char *Exceptions, int Offset, Da
 int
 SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE);
 
-void SCLocalWritten(const char *inst);
+int  SCWriteBegin(const char *inst);
+void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written);
+extern int SCTestDelayBeforeWrite;
+
+// Outgoing storage commitment: a local (re)write of one object, from before its database record
+// is written until its file is written (SaveToDisk). Ends on every return path (destructor).
+struct SCWriteGuard
+	{
+	int		slot;
+	const char	*inst;
+	Database	*db;
+	BOOL		active;
+	SCWriteGuard() : slot(-2), inst(NULL), db(NULL), active(FALSE) {}
+	void Begin(Database *d, const char *i) { db = d; inst = i; slot = SCWriteBegin(i); active = slot!=-2; }
+	void Written() { if (active) { active = FALSE; SCWriteEnd(db, slot, inst, TRUE); } }
+	~SCWriteGuard() { if (active) SCWriteEnd(db, slot, inst, FALSE); }
+	};
 unsigned int SCSendSeq(void);
 void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
@@ -13607,6 +13628,11 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 	  rewrite=FALSE;
 	}
 
+	// outgoing storage commitment: the write of this object is in progress from here until its
+	// file is written (also on every failure return); nothing when OutgoingStorageCommitment is 0
+	SCWriteGuard scWrite;
+	if (OutgoingStorageCommitment) scWrite.Begin(DB, szSop);
+
 	// try to enter object into database (object is not saved when this fails)
 	if(!SaveToDataBase(*DB, DDOPtr, rFilename, Device2, *rRoot))
 		{
@@ -13718,6 +13744,9 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 		  }
 		}
 		
+	// test only (default 0): widen the window between the database update and the file write
+	if (OutgoingStorageCommitment && SCTestDelayBeforeWrite>0 && !*rRoot) Sleep(SCTestDelayBeforeWrite);
+
 	int t = time(NULL);
 	if (!UseChapter10)
 		PDU->SaveDICOMDataObject(Filename, ACRNEMA_VR_DUMP, DDOPtr);
@@ -13736,8 +13765,9 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 		return FALSE;
 		}
 
-	// outgoing storage commitment: sends of a rewritten object that read the old file are stale
-	if (OutgoingStorageCommitment && !*rRoot) SCLocalWritten(szSop);
+	// outgoing storage commitment: the new file is there; sends that read the old one are stale,
+	// and the rows of the object are demoted again (synchronously, before the write counts as done)
+	scWrite.Written();
 
 	if (MirrorDevice[0])
 		{
@@ -23764,7 +23794,7 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 // ae/ip/port/tls: the destination actually used (called AE of the association, address, TLS);
 // seq: SCSendSeq() taken when the send started (before the object was read)
 struct SCNoted { char ae[20]; char ip[128]; char port[20]; int tls; char cls[68]; char inst[68]; char study[68];
-		 unsigned int t; int differ; unsigned int seq; };
+		 unsigned int t; int differ; unsigned int seq; int stale; };
 
 #define SC_NOTEDMAX 50000
 #define SC_CHANGEMAX 4096
@@ -23787,6 +23817,54 @@ struct SCChange { char inst[65]; unsigned int seq; };
 static SCChange		SCChanges[SC_CHANGEMAX];	// ring buffer, newest at (SCChangeSeq-1) % SC_CHANGEMAX
 static unsigned int	SCChangeSeq = 0;		// number of changes so far (= sequence of the next one)
 
+// Local writes in progress (SaveToDisk, SCWriteGuard): one slot per write, from before its database
+// record is written until its file is written. A slot becomes "relevant" when SCLocalStored decides
+// the write replaces content that may have been sent (it registers a change and demotes the rows).
+// While a relevant write of an object is in progress, a send of it that is noted (SCNoteSentEx2) or
+// recorded (SCCheckStale) is stale: it may have read either file. All under SCNotedCritical.
+// No free slot: the write counts as relevant for every object (SCWritesUnknown) until it ends.
+#define SC_WRITEMAX 256
+struct SCWriting { char inst[65]; int used; int relevant; };
+static SCWriting	SCWrites[SC_WRITEMAX];
+static int		SCWritesUnknown = 0;		// writes in progress without a slot
+
+// caller holds SCNotedCritical
+static BOOL SCWriteInProgressLocked(const char *inst)
+	{
+	if (SCWritesUnknown>0) return TRUE;
+	for (int i=0; i<SC_WRITEMAX; i++)
+		if (SCWrites[i].used && SCWrites[i].relevant && strcmp(SCWrites[i].inst, inst)==0) return TRUE;
+	return FALSE;
+	}
+
+// a write of inst starts; returns its slot, -1 when no slot was free (counted as unknown), -2 when
+// nothing is tracked (outgoing storage commitment off, or not a usable UID)
+int SCWriteBegin(const char *inst)
+	{
+	int i, r = -1;
+	if (!OutgoingStorageCommitment || !inst || strlen(inst)>64) return -2;
+	EnterCriticalSection(&SCNotedCritical);
+	for (i=0; i<SC_WRITEMAX; i++)
+		if (!SCWrites[i].used)
+			{
+			strcpy(SCWrites[i].inst, inst);
+			SCTrim(SCWrites[i].inst);
+			SCWrites[i].used = 1;
+			SCWrites[i].relevant = 0;
+			r = i;
+			break;
+			}
+	if (r<0) SCWritesUnknown++;
+	LeaveCriticalSection(&SCNotedCritical);
+	return r;
+	}
+
+// test only (SCTestDelayAfterRead): sleep ms milliseconds (used from nkiqrsop.cpp)
+void SCTestSleep(int ms)
+	{
+	if (ms>0) Sleep(ms);
+	}
+
 // sequence number for a send that starts now: take it before the object is read, pass it to SCNoteSent...
 unsigned int SCSendSeq(void)
 	{
@@ -23798,11 +23876,14 @@ unsigned int SCSendSeq(void)
 	return r;
 	}
 
-// record a local change of inst; returns its sequence number
+// record a local change of inst; returns its sequence number. A write of inst in progress becomes
+// relevant at the same moment (sends noted or recorded from now until it ends are stale).
 static unsigned int SCRegisterChange(const char *inst)
 	{
 	unsigned int r;
 	EnterCriticalSection(&SCNotedCritical);
+	for (int i=0; i<SC_WRITEMAX; i++)
+		if (SCWrites[i].used && strcmp(SCWrites[i].inst, inst)==0) SCWrites[i].relevant = 1;
 	r = SCChangeSeq++;
 	strncpy(SCChanges[r % SC_CHANGEMAX].inst, inst, 64);
 	SCChanges[r % SC_CHANGEMAX].inst[64] = 0;
@@ -23811,12 +23892,14 @@ static unsigned int SCRegisterChange(const char *inst)
 	return r;
 	}
 
-// was inst changed locally after a send that started at seq (or can that no longer be told)?
+// was inst changed locally after a send that started at seq (or can that no longer be told), or
+// is a write of it in progress now?
 static BOOL SCChangedSince(const char *inst, unsigned int seq)
 	{
 	BOOL r = FALSE;
 	unsigned int n, i;
 	EnterCriticalSection(&SCNotedCritical);
+	r = SCWriteInProgressLocked(inst);
 	n = SCChangeSeq - seq;				// changes since the send started (wraps correctly)
 	if (n > SC_CHANGEMAX) r = TRUE;			// not all of them kept: assume changed
 	else
@@ -23883,6 +23966,7 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		q->t = (unsigned int)time(NULL);
 		q->differ = MayDiffer ? 1 : 0;
 		q->seq = seq;
+		q->stale = SCWriteInProgressLocked(q->inst) ? 1 : 0;	// noted while the object is rewritten
 		SCNotedCount++;
 		}
 	LeaveCriticalSection(&SCNotedCritical);
@@ -24040,7 +24124,8 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 		}
 	if (JustAdd && n==0) return;			// new object, never sent: nothing to do
 
-	SCRegisterChange(inst);				// first: a send recorded from now on sees the change
+	SCRegisterChange(inst);				// first: a send recorded from now on sees the change,
+							// and a write of inst in progress (SaveToDisk) becomes relevant
 	if (n==0) return;
 	if (!DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
 		OperatorConsole.printf("*** Storage commitment ALARM: %s stored again locally, but its commitment state could not be reset\n", inst);
@@ -24048,15 +24133,48 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 		OperatorConsole.printf("Storage commitment: %s stored again locally: CHANGED for every destination (not confirmed until it is sent again)\n", inst);
 	}
 
-// The file of an object that was stored again has been written (SaveToDisk): sends that started
-// between SCLocalStored and now may have read the old file; mark them stale as well.
-void SCLocalWritten(const char *inst)
+// A local write started by SCWriteBegin ends (SaveToDisk; written: the new file is complete).
+// When the write was relevant (SCLocalStored registered a change: rewrite, or rows existed) or its
+// slot is unknown: a second change is registered (a send that started before this point is stale)
+// and the SCObject rows are demoted synchronously, exactly as before the write (Gen + 1, CHANGED);
+// rows that are CHANGED already are left as they are (never asked, never confirmed; every request
+// taken before they became CHANGED carries an older Gen, because that step raised Gen).
+// Only then the write stops being "in progress". Why no recorded send can outlive the write:
+//  - a send recorded before SCLocalStored demoted the rows: that demotion overrides it (Gen + 1);
+//  - a send noted or recorded while the write is in progress: stale at once (CHANGED);
+//  - a send recorded after this point that started before it: its seq is older than the change
+//    registered here, so SCCheckStale makes it CHANGED;
+//  - a transaction member taken before either demotion carries an older Gen: its result no
+//    longer applies (COMMITTED and FAILED only WHERE Gen = member Gen).
+// The change is registered before the in-progress mark is removed, both under SCNotedCritical, so
+// a check in between always sees one of them. Failure to demote: alarm line (the in-progress and
+// ring checks still apply to every send recorded after the first demotion).
+void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written)
 	{
-	char uid[68];
-	if (!OutgoingStorageCommitment || !inst || strlen(inst)>64) return;
-	strcpy(uid, inst);
-	SCTrim(uid);
-	if (SCIsUID(uid)) SCRegisterChange(uid);
+	char uid[68], where[160];
+	int relevant = 1;
+
+	if (slot==-2) return;
+	uid[0] = 0;
+	if (inst && strlen(inst)<=64) { strcpy(uid, inst); SCTrim(uid); }
+
+	EnterCriticalSection(&SCNotedCritical);
+	if (slot>=0 && slot<SC_WRITEMAX) relevant = SCWrites[slot].relevant;
+	LeaveCriticalSection(&SCNotedCritical);
+
+	if (relevant && SCIsUID(uid))
+		{
+		SCRegisterChange(uid);
+		sprintf(where, "SOPInstUID = '%s' and State <> 'CHANGED'", uid);
+		if (!DB || !SCEnsureTables(*DB) || !DB->UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+			OperatorConsole.printf("*** Storage commitment ALARM: %s %s locally, but its commitment state could not be reset again\n",
+				uid, written ? "rewritten" : "write failed");
+		}
+
+	EnterCriticalSection(&SCNotedCritical);
+	if (slot>=0 && slot<SC_WRITEMAX) { SCWrites[slot].used = 0; SCWrites[slot].relevant = 0; }
+	else if (slot==-1 && SCWritesUnknown>0) SCWritesUnknown--;
+	LeaveCriticalSection(&SCNotedCritical);
 	}
 void CloneDB(char *AE)
 { VR *vr1;
@@ -24283,6 +24401,9 @@ void SCReadWorkerConfig(const char *root)
 	OutgoingSCResendMissing = SCIniInt(root, "OutgoingSCResendMissing", 1,     0, 2);
 	OutgoingSCResendMax     = SCIniInt(root, "OutgoingSCResendMax",     3,     0, 999);
 	OutgoingSCResendDelay   = SCIniInt(root, "OutgoingSCResendDelay",   300,   0, 31536000);
+	// test-only keys (default 0 = no effect): widen race windows so the tests can hit them
+	SCTestDelayBeforeWrite  = SCIniInt(root, "SCTestDelayBeforeWrite",  0,     0, 60000);
+	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
 	SCReadRetryInterval(root);
 	}
 
@@ -24508,13 +24629,15 @@ static void SCLookupStudy(Database &DB, const char *inst, char *study)
 	}
 
 // After a noted send is recorded: if the object was stored again locally after that send started,
-// the send carried the old content. The row is made CHANGED (as by the local store), so this send
-// can never confirm it. Checked after the write: a local store that comes in between either is
-// seen here or changes the row itself afterwards (it registers before it updates the table).
+// or a rewrite of it is in progress now or was when the send was noted, the send may have carried
+// the old content. The row is made CHANGED (as by the local store), so this send can never confirm
+// it. Checked after the write: a local store that comes in between either is seen here or changes
+// the row itself afterwards (it registers before it updates the table, and again after its file
+// write, see SCWriteEnd).
 static void SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 	{
 	char where[256];
-	if (!SCChangedSince(it->inst, it->seq)) return;
+	if (!it->stale && !SCChangedSince(it->inst, it->seq)) return;
 	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
 	if (DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
 		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send)\n", it->inst, it->ae);

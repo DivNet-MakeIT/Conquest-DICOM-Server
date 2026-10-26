@@ -1318,6 +1318,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			virtual server, grab, echo, storage commitment event; keys TLSCertificate, TLSPrivateKey,
 			TLSCAFile, TLSVerifyPeer, TLSMinVersion, TLSCipherList, TLSVerifyHostname, TLSPin_<AE>;
 			no plain fallback; a build without HAVE_OPENSSL refuses T nodes; others unchanged
+20261026	mmd	Outgoing storage commitment: re-send of missing objects to nodes with R, Rn or RI in
+			acrnema.map (OutgoingSCResendMissing, OutgoingSCResendMax, OutgoingSCResendDelay): object
+			from the local archive, same AE/address/TLS, reservation before each C-STORE; RI is not
+			stopped by OutgoingSCDeadline (daily OVERDUE alarm); server command sc_cancel:; nodes
+			without R unchanged
 
 ENDOFUPDATEHISTORY
 */
@@ -1492,6 +1497,9 @@ int	OutgoingSCRetryDelayCount=4;
 int	OutgoingSCDeadline=86400;			// after first send + this the object is TIMEOUT
 int	OutgoingSCScanInterval=15;			// storage commitment worker loop period
 int	OutgoingSCKeepDays=7;				// committed objects and closed transactions are purged after this
+int	OutgoingSCResendMissing=1;			// re-send to nodes with R: 0 never, 1 failed (transient reason), 2 also no result
+int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
+int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -22119,7 +22127,7 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 //   SCTransaction  one row per N-ACTION (TransactionUID); not changed once closed
 //   SCTxMember     the objects of each transaction, written before the N-ACTION is sent;
 //                  Outcome (1 committed, 2 failed) and Reason keep the result as received
-// Object states: NOTED REQUESTED COMMITTED FAILED TIMEOUT UNSUPPORTED HELD
+// Object states: NOTED REQUESTED COMMITTED FAILED TIMEOUT UNSUPPORTED HELD CANCELLED
 // Transaction states: OPEN CLOSED ABANDONED (replaced by a newer request for the same objects)
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -22674,8 +22682,9 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 		for (i=0; i<nm; i++)
 			if (m[i].seen==2)
 				{
-				sprintf(upd, "State = 'FAILED', FailReason = %d", m[i].reason);
-				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and TxUID = '%s'", aew, m[i].inst, TxUID);
+				// NextTry: earliest re-send (only used for nodes with R); a cancelled object stays cancelled
+				sprintf(upd, "State = 'FAILED', FailReason = %d, NextTry = %u", m[i].reason, (unsigned int)time(NULL) + OutgoingSCResendDelay);
+				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and State <> 'CANCELLED' and TxUID = '%s'", aew, m[i].inst, TxUID);
 				if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 				}
 
@@ -23092,7 +23101,8 @@ static void SimplifyDicom(DICOMDataObject *pDDO)
 //   1. objects noted by the send paths (SCTakeNoted) are recorded in SCObject (NOTED)
 //   2. OPEN transactions without result after OutgoingSCReportTimeout are ABANDONED,
 //      their objects are asked again later (new TxUID) or become TIMEOUT
-//   3. NOTED objects older than OutgoingSCDeadline become TIMEOUT
+//   3. NOTED objects older than OutgoingSCDeadline become TIMEOUT (not for RI nodes: OVERDUE)
+//   3b. FAILED objects of nodes with R are re-sent (SCProcessResends)
 //   4. per (destination, study), after OutgoingSCQuietTime, an N-ACTION is sent on a
 //      new association, in chunks of OutgoingSCMaxBatch; everything is written to the
 //      tables before it is sent, so a restart resumes from the tables
@@ -23173,6 +23183,9 @@ void SCReadWorkerConfig(const char *root)
 	OutgoingSCDeadline      = SCIniInt(root, "OutgoingSCDeadline",      86400, 1, 315360000);
 	OutgoingSCScanInterval  = SCIniInt(root, "OutgoingSCScanInterval",  15,    1, 3600);
 	OutgoingSCKeepDays      = SCIniInt(root, "OutgoingSCKeepDays",      7,     1, 36500);
+	OutgoingSCResendMissing = SCIniInt(root, "OutgoingSCResendMissing", 1,     0, 2);
+	OutgoingSCResendMax     = SCIniInt(root, "OutgoingSCResendMax",     3,     0, 999);
+	OutgoingSCResendDelay   = SCIniInt(root, "OutgoingSCResendDelay",   300,   0, 31536000);
 	SCReadRetryInterval(root);
 	}
 
@@ -23201,6 +23214,54 @@ static BOOL SCCleanAE(const char *in, char *out)
 	strncpy(out, in, 19); out[19] = 0;
 	SCTrim(out);
 	return SCIsAE(out);
+	}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Re-send of missing objects (R, Rn, RI in the 5th column of acrnema.map).
+// A FAILED object of a node with R is re-sent from the local archive when the destination
+// reported a reason that may pass (0x0110, 0x0112, 0x0213), or, with
+// OutgoingSCResendMissing = 2, when no result came after all requests (FailReason
+// SC_REASON_NORESULT). It stays FAILED while it waits (NextTry = earliest re-send), so
+// switching the re-send off leaves it FAILED. Before each re-send ResendRes + 1 is written
+// (a failed connect or a crash also uses up the limit); after a successful C-STORE the
+// object is NOTED again (Resends + 1, Attempts 0, no TxUID) and asked with a new TxUID.
+// Never sent to another AE, address, port or TLS setting than the first send (HELD).
+//////////////////////////////////////////////////////////////////////////////////////////
+
+#define SC_REASON_NORESULT	65536	// no result after all requests (mode 2): re-send queued
+#define SC_REASON_RESENDLIMIT	65537	// re-send limit reached
+#define SC_REASON_NOTLOCAL	65538	// object to re-send not found in the local archive
+#define SC_RESENDROWS		2000	// queued objects of one destination read per pass
+
+// re-send limit for destination ae now: 0 = no re-send (switches off, not in the map, no SC
+// or R, wildcard entry), n, or ACR_RESEND_ALWAYS (RI); *E gets the map entry (one snapshot)
+static int SCResendLimit(const char *ae, ACRNemaAddress *E)
+	{
+	if (!OutgoingStorageCommitment || OutgoingSCResendMissing<=0) return 0;
+	if (!GetACRNemaEntryByAE((char *)ae, E)) return 0;
+	if (!(E->Flags & ACR_SC) || !(E->Flags & ACR_RESEND)) return 0;
+	if (strchr(E->Name, '*')) return 0;
+	if (E->ResendLimit==ACR_RESEND_INI) return OutgoingSCResendMax;
+	if (E->ResendLimit<=0) return 0;
+	return E->ResendLimit;
+	}
+
+// SQL condition for objects waiting for a re-send
+static void SCQueuedWhere(char *out)
+	{
+	sprintf(out, "State = 'FAILED' and NoResend = 0 and FailReason in (272, 274, 531%s)",
+		OutgoingSCResendMissing==2 ? ", 65536" : "");
+	}
+
+// delay before trying again after re-send number n (1 = first) did not succeed:
+// OutgoingSCResendDelay, doubled each time up to the last OutgoingSCRetryInterval value
+static unsigned int SCResendBackoff(int n)
+	{
+	long long d = OutgoingSCResendDelay, cap = OutgoingSCRetryDelays[OutgoingSCRetryDelayCount>0 ? OutgoingSCRetryDelayCount-1 : 0];
+	if (cap < d) cap = d;
+	for (int i=1; i<n && d<cap; i++) d *= 2;
+	if (d > cap) d = cap;
+	return (unsigned int)d;
 	}
 
 // GROUP BY expression for the destination: exact (binary) on MySQL/MariaDB
@@ -23397,12 +23458,41 @@ static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned 
 	{
 	char aew[64], where[512], upd[256], cnt[32];
 	SQLLEN len;
-	int i, n, ntimeout = 0;
+	int i, n, ntimeout = 0, nresend = 0;
 	long long limit = (long long)now - OutgoingSCDeadline;
+	ACRNemaAddress E;
+	int rlimit = SCResendLimit(ae, &E);	// 0: no re-send to this destination (as before)
 
 	SCAEWhere(DB, aew, ae);
-	sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and (Attempts > %d or FirstSent < %lld)",
-		aew, TxUID, OutgoingSCRetries, limit);
+
+	// OutgoingSCResendMissing = 2 and R: requests used up before the deadline (RI: any time)
+	// -> FAILED without result, re-sent after OutgoingSCResendDelay instead of TIMEOUT
+	if (rlimit && OutgoingSCResendMissing==2)
+		{
+		if (rlimit==ACR_RESEND_ALWAYS)
+			sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts > %d", aew, TxUID, OutgoingSCRetries);
+		else
+			sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts > %d and FirstSent >= %lld",
+				aew, TxUID, OutgoingSCRetries, limit);
+		if (!DB.Query("SCObject", "COUNT(*)", where, NULL)) return FALSE;
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		if (DB.NextRecord()) nresend = atoi(cnt);
+		if (nresend)
+			{
+			sprintf(upd, "State = 'FAILED', FailReason = %d, NextTry = %u", SC_REASON_NORESULT, now + OutgoingSCResendDelay);
+			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) return FALSE;
+			OperatorConsole.printf("*** Storage commitment: %d object(s) for %s without result after all requests: re-send queued (transaction %s)\n",
+				nresend, ae, TxUID);
+			}
+		}
+
+	// RI: the deadline does not end it
+	if (rlimit==ACR_RESEND_ALWAYS)
+		sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and Attempts > %d", aew, TxUID, OutgoingSCRetries);
+	else
+		sprintf(where, "%s and TxUID = '%s' and State = 'REQUESTED' and (Attempts > %d or FirstSent < %lld)",
+			aew, TxUID, OutgoingSCRetries, limit);
 	if (!DB.Query("SCObject", "COUNT(*)", where, NULL)) return FALSE;
 	cnt[0] = 0;
 	DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
@@ -23500,6 +23590,8 @@ static void SCCheckDeadline(Database &DB, unsigned int now)
 		}
 	for (i=0; i<n; i++)
 		{
+		ACRNemaAddress E;
+		if (SCResendLimit(aes[i], &E)==ACR_RESEND_ALWAYS) continue;	// RI: OVERDUE, not TIMEOUT
 		SCAEWhere(DB, aew, aes[i]);
 		sprintf(where, "%s and State = 'NOTED' and FirstSent < %lld", aew, limit);
 		strcpy(upd, "State = 'TIMEOUT'");
@@ -23884,6 +23976,384 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 	free(it);
 	}
 
+// one object waiting for a re-send
+struct SCResendItem { char inst[68]; char cls[68]; char study[68]; char ip[132]; char port[68]; int tls; int res; unsigned int first; char *file; };
+
+// change one object that is still FAILED (an operator may have cancelled it meanwhile)
+static BOOL SCResendUpdate(Database &DB, const char *aew, const char *inst, const char *upd)
+	{
+	char where[256];
+	sprintf(where, "%s and SOPInstUID = '%s' and State = 'FAILED'", aew, inst);
+	return DB.UpdateRecords((char *)"SCObject", (char *)upd, where);
+	}
+
+// the state of one object now ("" when unknown)
+static void SCObjectState(Database &DB, const char *aew, const char *inst, char *state)
+	{
+	char where[256];
+	SQLLEN len;
+	state[0] = 0;
+	sprintf(where, "%s and SOPInstUID = '%s'", aew, inst);
+	if (!DB.Query("SCObject", "State", where, NULL)) return;
+	DB.BindField(1, SQL_C_CHAR, state, 16, &len);
+	if (!DB.NextRecord()) state[0] = 0;
+	SCTrim(state);
+	}
+
+// the file of an object in the local archive (malloc'ed full name), NULL when not there
+static char *SCLocalFile(Database &DB, const char *inst)
+	{
+	char Filename[1024], FullFilename[1024], Device[64];
+	VR *vr;
+	BOOL ok;
+	SetStringVR(&vr, 0x0008, 0x0018, inst);
+	Filename[0] = Device[0] = 0;
+	ok = GetFileName(vr, Filename, Device, DB, FALSE);
+	delete vr;
+	if (!ok || !FindPhysicalDevice(Device, FullFilename, Filename)) return NULL;
+	if (strlen(FullFilename)+strlen(Filename) >= sizeof(FullFilename)) return NULL;
+	strcat(FullFilename, Filename);
+	if (DFileSize(FullFilename)==0) return NULL;
+	return strdup(FullFilename);
+	}
+
+// still allowed to re-send this object now (checked again right before the C-STORE)
+static BOOL SCResendStillAllowed(Database &DB, const char *ae, const char *aew, SCResendItem *x, unsigned int now)
+	{
+	ACRNemaAddress E;
+	char state[16];
+	int rlimit = SCResendLimit(ae, &E);
+	if (!rlimit) return FALSE;
+	if (strcmp(x->ip, E.IP)!=0 || strcmp(x->port, E.Port)!=0 || x->tls!=((E.Flags & ACR_TLS) ? 1 : 0)) return FALSE;
+	if (rlimit!=ACR_RESEND_ALWAYS && ((long long)x->first < (long long)now - OutgoingSCDeadline || x->res > rlimit)) return FALSE;
+	SCObjectState(DB, aew, x->inst, state);
+	return strcmp(state, "FAILED")==0;
+	}
+
+// re-send one batch (one destination, one study) on one association; returns SC_CHUNK_DOWN
+// when the destination could not be reached, else SC_CHUNK_DONE
+static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, unsigned int now)
+	{
+	static char warntls[SC_WARNMAX][20];
+	static int nwarntls = 0;
+	ACRNemaAddress E;
+	ExtendedPDU_Service PDU;
+	PDU_Service LoadPDU;
+	RunTimeClassStorage RTCStorage;
+	UID uid;
+	char aew[64], upd[256], compress[64], cls[68], inst[68], *p;
+	int i, k, tls, rlimit, nheld = 0, nsent = 0;
+
+	SCAEWhere(DB, aew, ae);
+	rlimit = SCResendLimit(ae, &E);			// checked again at reservation
+	if (!rlimit) return SC_CHUNK_DONE;
+	tls = (E.Flags & ACR_TLS) ? 1 : 0;
+
+	// sent to another address or TLS setting than the map has now -> HELD, never to the new address
+	for (i=k=0; i<n; i++)
+		{
+		if (strcmp(it[i].ip, E.IP)!=0 || strcmp(it[i].port, E.Port)!=0 || it[i].tls!=tls)
+			{
+			if (nheld++==0)
+				OperatorConsole.printf("*** Storage commitment ALARM: %s changed in acrnema.map (sent to %s %s%s, now %s %s%s), no re-send\n",
+					ae, it[i].ip, it[i].port, it[i].tls ? " TLS" : "", E.IP, E.Port, tls ? " TLS" : "");
+			SCResendUpdate(DB, aew, it[i].inst, "State = 'HELD'");
+			}
+		else it[k++] = it[i];
+		}
+	if (nheld)
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s HELD (not re-sent to the new address)\n", nheld, ae);
+	n = k;
+	if (n==0) return SC_CHUNK_DONE;
+
+#ifndef HAVE_OPENSSL
+	if (tls)
+		{
+		if (SCWarnOnce(warntls, &nwarntls, ae))
+			OperatorConsole.printf("*** Storage commitment: %s has T in acrnema.map but this dgate was built without TLS; no re-send (objects stay FAILED)\n", ae);
+		return SC_CHUNK_DONE;
+		}
+#endif
+
+	// the objects in the local archive; not there -> FAILED "not local"
+	for (i=k=0; i<n; i++)
+		{
+		it[i].file = SCLocalFile(DB, it[i].inst);
+		if (!it[i].file)
+			{
+			sprintf(upd, "FailReason = %d", SC_REASON_NOTLOCAL);
+			SCResendUpdate(DB, aew, it[i].inst, upd);
+			OperatorConsole.printf("*** Storage commitment ALARM: %s for %s not in the local archive, no re-send (FAILED, not local)\n", it[i].inst, ae);
+			}
+		else it[k++] = it[i];
+		}
+	n = k;
+	if (n==0) return SC_CHUNK_DONE;
+
+	// reservation: ResendRes + 1 before anything is sent (a failed connect or a crash also counts);
+	// NextTry = when to try again if this re-send does not succeed
+	for (i=k=0; i<n; i++)
+		{
+		char where[384];
+		sprintf(upd, "ResendRes = ResendRes + 1, NextTry = %u", now + SCResendBackoff(it[i].res+1));
+		sprintf(where, "%s and SOPInstUID = '%s' and State = 'FAILED' and NoResend = 0 and ResendRes = %d", aew, it[i].inst, it[i].res);
+		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
+			{
+			OperatorConsole.printf("*** Storage commitment: database update failed, %s not re-sent to %s\n", it[i].inst, ae);
+			free(it[i].file);
+			continue;
+			}
+		it[i].res++;
+		it[k++] = it[i];
+		}
+	n = k;
+	if (n==0) return SC_CHUNK_DONE;
+
+	// one association for the batch: same AE, address and port as the first send, compression
+	// from the map as a forward, TLS when the node has T
+	PDU.AttachRTC(&VRType);
+	LoadPDU.AttachRTC(&VRType);
+	strcpy(compress, E.Compress);
+	PDU.SetRequestedCompressionType(compress);
+	uid.Set("1.2.840.10008.3.1.1.1");
+	PDU.SetApplicationContext(uid);
+	PDU.SetLocalAddress(MYACRNEMA);
+	PDU.SetRemoteAddress((unsigned char *)ae);
+	PDU.SetTimeOut(TCPIPTimeOut);
+	for (i=0; i<n; i++)
+		{
+		for (k=0; k<i; k++) if (strcmp(it[k].cls, it[i].cls)==0) break;
+		if (k<i) continue;
+		uid.Set(it[i].cls);
+		PDU.AddAbstractSyntax(uid);
+		}
+	uid.Set("1.2.840.10008.1.1");
+	PDU.AddAbstractSyntax(uid);
+	ACRNemaAddress EE = E;
+	strcpy(EE.Name, ae);
+	SCPrepareTLS(PDU, EE);
+
+	OperatorConsole.printf("Storage commitment: re-sending %d object(s) of study %s to %s\n", n, it[0].study, ae);
+	if (!PDU.Connect((unsigned char *)E.IP, (unsigned char *)E.Port))
+		{
+		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), tried again later\n", ae, E.IP, E.Port);
+		for (i=0; i<n; i++) free(it[i].file);
+		return SC_CHUNK_DOWN;
+		}
+
+	for (i=0; i<n; i++)
+		{
+		DICOMDataObject *DDO = NULL;
+		DICOMCommandObject DCO;
+		cls[0] = inst[0] = 0;
+		now = (unsigned int)time(NULL);
+		if (!PDU.Link.Connected) break;
+		if (!SCResendStillAllowed(DB, ae, aew, it+i, now))
+			{
+			OperatorConsole.printf("Storage commitment: re-send of %s to %s not done (no longer allowed or no longer FAILED)\n", it[i].inst, ae);
+			continue;
+			}
+		DDO = LoadPDU.LoadDICOMDataObject(it[i].file);
+		if (DDO && (!SCVRUID(DDO->GetVR(0x0008, 0x0018), inst) || strcmp(inst, it[i].inst)!=0 ||
+		            !SCVRUID(DDO->GetVR(0x0008, 0x0016), cls)))
+			{ delete DDO; DDO = NULL; }
+		if (!DDO)
+			{
+			sprintf(upd, "FailReason = %d", SC_REASON_NOTLOCAL);
+			SCResendUpdate(DB, aew, it[i].inst, upd);
+			OperatorConsole.printf("*** Storage commitment ALARM: %s for %s could not be read from the local archive, no re-send (FAILED, not local)\n", it[i].inst, ae);
+			continue;
+			}
+		uid.Set(cls);
+		if (!PDU.IsAbstractSyntaxAccepted(uid))
+			{
+			OperatorConsole.printf("*** Storage commitment: %s does not accept the class of %s, not re-sent\n", ae, it[i].inst);
+			delete DDO;
+			continue;
+			}
+		// recompress to the accepted transfer syntax as a forward does (keeps quality digits)
+		p = PDU.GetAcceptedCompressionType(uid);
+		BOOL StripGroup2 = memicmp(p, "as", 2)!=0 && memicmp(p, "is", 2)!=0;
+		compress[0] = p[0];
+		compress[1] = p[1];
+		recompress(&DDO, compress, "", StripGroup2, &PDU);
+		RTCStorage.SetUID(uid);
+		if (!RTCStorage.Write(&PDU, DDO, &DCO))
+			{
+			OperatorConsole.printf("*** Storage commitment: re-send of %s to %s failed (re-send %d), tried again later\n", it[i].inst, ae, it[i].res);
+			delete DDO;
+			continue;
+			}
+		delete DDO;
+		// back into the normal cycle: asked again with a new TxUID after the quiet time
+		// (not through SCNoteSent; FirstSent is kept)
+		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0", now);
+		if (!SCResendUpdate(DB, aew, it[i].inst, upd))
+			OperatorConsole.printf("*** Storage commitment ALARM: %s re-sent to %s but the database update failed\n", it[i].inst, ae);
+		else
+			OperatorConsole.printf("Storage commitment: re-sent %s to %s (re-send %d)\n", it[i].inst, ae, it[i].res);
+		nsent++;
+		}
+	if (!PDU.Close()) PDU.Link.Close();
+	for (i=0; i<n; i++) free(it[i].file);
+	OperatorConsole.printf("Storage commitment: %d of %d object(s) re-sent to %s\n", nsent, n, ae);
+	return SC_CHUNK_DONE;
+	}
+
+// step 4b: objects waiting for a re-send, per destination with R (RI: no deadline);
+// a destination that is no longer allowed is skipped (its objects stay FAILED)
+static void SCProcessResends(Database &DB, unsigned int now)
+	{
+	char where[512], qw[160], cols[160], ae[24], cnt[32], aew[64], upd[96];
+	char inst[72], cls[72], study[72], ip[132], port[68], tls[16], res[32], first[32];
+	SQLLEN len;
+	char (*aes)[20];
+	SCResendItem *it;
+	ACRNemaAddress E;
+	int naes = 0, i, j, n, k, rlimit, c;
+	long long limit = (long long)now - OutgoingSCDeadline;
+
+	if (!OutgoingStorageCommitment || OutgoingSCResendMissing<=0) return;
+	SCQueuedWhere(qw);
+
+	aes = (char (*)[20])malloc(20*SC_WARNMAX);
+	it = (SCResendItem *)malloc(sizeof(SCResendItem)*SC_RESENDROWS);
+	if (!aes || !it) { if (aes) free(aes); if (it) free(it); return; }
+
+	sprintf(cols, "%s, COUNT(*)", SCAEGroup(DB));
+	sprintf(where, "%s GROUP BY %s", qw, SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL))
+		{ OperatorConsole.printf("*** Storage commitment: database query failed (re-send)\n"); free(aes); free(it); return; }
+	ae[0] = cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+	DB.BindField(2, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	while (naes<SC_WARNMAX && DB.NextRecord())
+		{
+		if (SCCleanAE(ae, aes[naes])) naes++;
+		ae[0] = cnt[0] = 0;
+		}
+
+	for (j=0; j<naes; j++)
+		{
+		rlimit = SCResendLimit(aes[j], &E);
+		if (!rlimit) continue;			// no R (any more), or switched off: stays FAILED
+		SCAEWhere(DB, aew, aes[j]);
+
+		if (rlimit!=ACR_RESEND_ALWAYS)
+			{
+			// past the deadline: no re-send, TIMEOUT
+			sprintf(where, "%s and %s and FirstSent < %lld", aew, qw, limit);
+			c = 0;
+			if (DB.Query("SCObject", "COUNT(*)", where, NULL))
+				{
+				cnt[0] = 0;
+				DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+				if (DB.NextRecord()) c = atoi(cnt);
+				}
+			if (c && DB.UpdateRecords((char *)"SCObject", (char *)"State = 'TIMEOUT'", where))
+				OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s TIMEOUT (deadline of %d s passed, no re-send)\n", c, aes[j], OutgoingSCDeadline);
+
+			// limit reached: FAILED with reason "re-send limit"
+			sprintf(where, "%s and %s and ResendRes >= %d", aew, qw, rlimit);
+			c = 0;
+			if (DB.Query("SCObject", "COUNT(*)", where, NULL))
+				{
+				cnt[0] = 0;
+				DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+				if (DB.NextRecord()) c = atoi(cnt);
+				}
+			sprintf(upd, "FailReason = %d", SC_REASON_RESENDLIMIT);
+			if (c && DB.UpdateRecords((char *)"SCObject", upd, where))
+				OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s FAILED (re-send limit of %d reached)\n", c, aes[j], rlimit);
+			}
+
+		// due objects, per study
+		sprintf(where, "%s and %s and NextTry <= %u", aew, qw, now);
+		if (!DB.Query("SCObject", "SOPInstUID, SOPClassUID, StudyUID, DestIP, DestPort, DestTLS, ResendRes, FirstSent", where, "StudyUID"))
+			{ OperatorConsole.printf("*** Storage commitment: database query failed (re-send)\n"); continue; }
+		inst[0] = cls[0] = study[0] = ip[0] = port[0] = tls[0] = res[0] = first[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, inst, 70, &len);
+		DB.BindField(2, SQL_C_CHAR, cls, 70, &len);
+		DB.BindField(3, SQL_C_CHAR, study, 70, &len);
+		DB.BindField(4, SQL_C_CHAR, ip, 130, &len);
+		DB.BindField(5, SQL_C_CHAR, port, 66, &len);
+		DB.BindField(6, SQL_C_CHAR, tls, sizeof(tls), &len);
+		DB.BindField(7, SQL_C_CHAR, res, sizeof(res), &len);
+		DB.BindField(8, SQL_C_CHAR, first, sizeof(first), &len);
+		n = 0;
+		while (n<SC_RESENDROWS && DB.NextRecord())
+			{
+			SCTrim(inst); SCTrim(cls); SCTrim(study); SCTrim(ip); SCTrim(port);
+			if (SCIsUID(inst) && SCIsUID(cls) && (study[0]==0 || SCIsUID(study)))
+				{
+				strcpy(it[n].inst, inst); strcpy(it[n].cls, cls); strcpy(it[n].study, study);
+				strcpy(it[n].ip, ip); strcpy(it[n].port, port);
+				it[n].tls = atoi(tls);
+				it[n].res = atoi(res);
+				it[n].first = (unsigned int)atol(first);
+				it[n].file = NULL;
+				// within the limit (checked above; RI has none)
+				if (rlimit==ACR_RESEND_ALWAYS || it[n].res < rlimit) n++;
+				}
+			inst[0] = cls[0] = study[0] = ip[0] = port[0] = tls[0] = res[0] = first[0] = 0;
+			}
+
+		// one association per (destination, study), at most OutgoingSCMaxBatch objects
+		for (i=0; i<n; i=k)
+			{
+			for (k=i+1; k<n && k-i<OutgoingSCMaxBatch && strcmp(it[k].study, it[i].study)==0; k++);
+			if (SCResendBatch(DB, aes[j], it+i, k-i, (unsigned int)time(NULL))==SC_CHUNK_DOWN) break;
+			}
+		}
+	free(aes);
+	free(it);
+	}
+
+// RI destinations: objects still in the cycle after OutgoingSCDeadline are OVERDUE;
+// one alarm line per destination and day (worker thread only)
+static void SCCheckOverdue(Database &DB, unsigned int now)
+	{
+	static char aeseen[SC_WARNMAX][20];
+	static unsigned int lastalarm[SC_WARNMAX];
+	static int nseen = 0;
+	char where[512], qw[160], cols[96], ae[24], cnt[32], a[20];
+	SQLLEN len;
+	ACRNemaAddress E;
+	int i;
+	long long limit = (long long)now - OutgoingSCDeadline;
+	struct { char ae[20]; int n; } found[SC_WARNMAX];
+	int nfound = 0;
+
+	if (OutgoingSCResendMissing<=0) return;
+	SCQueuedWhere(qw);
+	sprintf(cols, "%s, COUNT(*)", SCAEGroup(DB));
+	sprintf(where, "(State in ('NOTED', 'REQUESTED') or (%s)) and FirstSent < %lld GROUP BY %s", qw, limit, SCAEGroup(DB));
+	if (!DB.Query("SCObject", cols, where, NULL)) return;
+	ae[0] = cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+	DB.BindField(2, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	while (nfound<SC_WARNMAX && DB.NextRecord())
+		{
+		if (SCCleanAE(ae, a)) { strcpy(found[nfound].ae, a); found[nfound++].n = atoi(cnt); }
+		ae[0] = cnt[0] = 0;
+		}
+	for (int j=0; j<nfound; j++)
+		{
+		if (SCResendLimit(found[j].ae, &E)!=ACR_RESEND_ALWAYS) continue;
+		for (i=0; i<nseen; i++) if (strcmp(aeseen[i], found[j].ae)==0) break;
+		if (i==nseen)
+			{
+			if (nseen>=SC_WARNMAX) continue;
+			strcpy(aeseen[nseen], found[j].ae);
+			lastalarm[nseen++] = 0;
+			}
+		if (lastalarm[i] && now < lastalarm[i] + 86400) continue;
+		lastalarm[i] = now;
+		OperatorConsole.printf("*** Storage commitment ALARM: OVERDUE: %d object(s) for %s not committed after OutgoingSCDeadline (%d s); RI: re-sent until committed\n",
+			found[j].n, found[j].ae, OutgoingSCDeadline);
+		}
+	}
+
 // step 5: COMMITTED objects and closed transactions older than OutgoingSCKeepDays
 static void SCPurge(Database &DB, unsigned int now)
 	{
@@ -23920,6 +24390,9 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
 	SCCheckDeadline(DB, now);
+	SCCheckOverdue(DB, now);
+	SCProcessResends(DB, now);
+	now = (unsigned int)time(NULL);
 	SCProcessGroups(DB, now);
 
 	now = (unsigned int)time(NULL);
@@ -23964,14 +24437,16 @@ void StartSCWorkerThread(void)
 	}
 
 // sc_status: per destination the number of objects per state and the age of the oldest
-// object still waiting (NOTED or REQUESTED); plus the number of open transactions
+// object still waiting (NOTED or REQUESTED); plus the number of open transactions; and the
+// re-send counts: resends (successful), reserved (attempts), resend_queued, resend_limit,
+// not_local, overdue (RI nodes: objects past OutgoingSCDeadline still in the cycle)
 static void SCStatusText(char *out, int size)
 	{
 	static const char *states[] = { "NOTED", "REQUESTED", "COMMITTED", "FAILED", "TIMEOUT", "UNSUPPORTED", "HELD", "CANCELLED" };
 	const int ns = 8;
-	struct SCStat { char ae[20]; int c[8]; unsigned int oldest; } *s;
+	struct SCStat { char ae[20]; int c[8]; unsigned int oldest; int r[6]; } *s;
 	Database DB;
-	char cols[128], where[128], ae[24], st[24], cnt[32], first[32], line[512];
+	char cols[128], where[512], ae[24], st[24], cnt[32], first[32], line[640], qw[160];
 	SQLLEN len;
 	int n = 0, i, j, used = 0, open = 0;
 	unsigned int now = (unsigned int)time(NULL);
@@ -24017,6 +24492,41 @@ static void SCStatusText(char *out, int size)
 		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
 		if (DB.NextRecord()) open = atoi(cnt);
 		}
+
+	// re-send: resends (successful C-STOREs), reserved (re-send attempts), resend_queued (nodes
+	// with R now), resend_limit and not_local (FAILED), overdue (RI nodes only: past the deadline)
+	SCQueuedWhere(qw);
+	for (int q=0; q<5; q++)
+		{
+		const char *cnts = "COUNT(*)";
+		if (q==0)      { cnts = "SUM(Resends), SUM(ResendRes)"; sprintf(where, "1 = 1 GROUP BY %s", SCAEGroup(DB)); }
+		else if (q==1) sprintf(where, "%s GROUP BY %s", qw, SCAEGroup(DB));
+		else if (q==2) sprintf(where, "State = 'FAILED' and FailReason = %d GROUP BY %s", SC_REASON_RESENDLIMIT, SCAEGroup(DB));
+		else if (q==3) sprintf(where, "State = 'FAILED' and FailReason = %d GROUP BY %s", SC_REASON_NOTLOCAL, SCAEGroup(DB));
+		else           sprintf(where, "(State in ('NOTED', 'REQUESTED') or (%s)) and FirstSent < %lld GROUP BY %s",
+					qw, (long long)now - OutgoingSCDeadline, SCAEGroup(DB));
+		sprintf(cols, "%s, %s", SCAEGroup(DB), cnts);
+		if (!DB.Query("SCObject", cols, where, NULL)) continue;
+		ae[0] = cnt[0] = first[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, ae, 20, &len);
+		DB.BindField(2, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		if (q==0) DB.BindField(3, SQL_C_CHAR, first, sizeof(first), &len);
+		while (DB.NextRecord())
+			{
+			char a[20];
+			ACRNemaAddress E;
+			if (SCCleanAE(ae, a))
+				for (i=0; i<n; i++)
+					if (strcmp(s[i].ae, a)==0)
+						{
+						if (q==0) { s[i].r[0] = atoi(cnt); s[i].r[1] = atoi(first); }
+						else if (q==1) { if (SCResendLimit(a, &E)) s[i].r[2] = atoi(cnt); }	// nodes with R now
+						else if (q<4) s[i].r[q+1] = atoi(cnt);
+						else if (SCResendLimit(a, &E)==ACR_RESEND_ALWAYS) s[i].r[5] = atoi(cnt);
+						}
+			ae[0] = cnt[0] = first[0] = 0;
+			}
+		}
 	DB.Close();
 
 	used = snprintf(out, size, "open transactions: %d\n", open);
@@ -24025,13 +24535,65 @@ static void SCStatusText(char *out, int size)
 		{
 		int k = snprintf(line, sizeof(line), "%s", s[i].ae);
 		for (j=0; j<ns; j++) k += snprintf(line+k, sizeof(line)-k, " %s=%d", states[j], s[i].c[j]);
-		if (s[i].oldest) snprintf(line+k, sizeof(line)-k, " oldest_waiting=%ds\n", (int)(now - s[i].oldest));
-		else             snprintf(line+k, sizeof(line)-k, " oldest_waiting=-\n");
+		if (s[i].oldest) k += snprintf(line+k, sizeof(line)-k, " oldest_waiting=%ds", (int)(now - s[i].oldest));
+		else             k += snprintf(line+k, sizeof(line)-k, " oldest_waiting=-");
+		snprintf(line+k, sizeof(line)-k, " resends=%d reserved=%d resend_queued=%d resend_limit=%d not_local=%d overdue=%d\n",
+			s[i].r[0], s[i].r[1], s[i].r[2], s[i].r[3], s[i].r[4], s[i].r[5]);
 		if (used + (int)strlen(line) >= size) break;
 		strcpy(out+used, line);
 		used += strlen(line);
 		}
 	free(s);
+	}
+
+// sc_cancel:<AE>[,<StudyUID>]: objects of that destination (and study) in NOTED, REQUESTED,
+// FAILED, TIMEOUT or HELD become CANCELLED (no more requests or re-sends); Response = count,
+// or -1 on error. A result that arrives later can still make an object COMMITTED.
+static void SCCancelCommand(const char *arg, char *Response)
+	{
+	Database DB;
+	char ae[20], study[68], aew[64], where[512], cnt[32], tmp[160];
+	const char *c;
+	SQLLEN len;
+	int n = 0;
+
+	strcpy(Response, "-1");
+	if (!OutgoingStorageCommitment)
+		{ OperatorConsole.printf("*** sc_cancel: OutgoingStorageCommitment is 0\n"); return; }
+	strncpy(tmp, arg, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
+	study[0] = 0;
+	c = strchr(tmp, ',');
+	if (c)
+		{
+		if (strlen(c+1)>64) { OperatorConsole.printf("*** sc_cancel: use sc_cancel:AE[,StudyUID]\n"); return; }
+		strcpy(study, c+1);
+		SCTrim(study);
+		tmp[c-tmp] = 0;
+		}
+	if (!SCCleanAE(tmp, ae) || (c && !SCIsUID(study)))
+		{ OperatorConsole.printf("*** sc_cancel: use sc_cancel:AE[,StudyUID]\n"); return; }
+	if (!DB.Open(DataSource, UserName, Password, DataHost))
+		{ OperatorConsole.printf("*** sc_cancel: no database connection\n"); return; }
+	if (!SCEnsureTables(DB)) { DB.Close(); return; }
+
+	SCAEWhere(DB, aew, ae);
+	sprintf(where, "%s%s%s%s and State in ('NOTED', 'REQUESTED', 'FAILED', 'TIMEOUT', 'HELD')",
+		aew, study[0] ? " and StudyUID = '" : "", study, study[0] ? "'" : "");
+	if (DB.Query("SCObject", "COUNT(*)", where, NULL))
+		{
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		if (DB.NextRecord()) n = atoi(cnt);
+		if (n==0 || DB.UpdateRecords((char *)"SCObject", (char *)"State = 'CANCELLED'", where))
+			{
+			OperatorConsole.printf("Storage commitment: sc_cancel: %d object(s) for %s%s%s CANCELLED by the operator\n",
+				n, ae, study[0] ? " study " : "", study);
+			sprintf(Response, "%d", n);
+			}
+		else OperatorConsole.printf("*** sc_cancel: database update failed\n");
+		}
+	else OperatorConsole.printf("*** sc_cancel: database query failed\n");
+	DB.Close();
 	}
 
 static int cgi_parse(char *in, char *out, const char *name, const char *def);
@@ -25590,6 +26152,14 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		SCStatusText(Response, 5000);
+		return true;
+		}
+
+	// outgoing storage commitment: operator closes the case of a destination (and study)
+	if (memcmp(SilentText, "sc_cancel:", 10)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCCancelCommand(SilentText+10, Response);
 		return true;
 		}
 

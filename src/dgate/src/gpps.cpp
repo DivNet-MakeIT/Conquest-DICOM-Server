@@ -34,6 +34,7 @@
 //			gpps/gppstime statistics are done under it. A value read from the file is not
 //			cached when the cache was emptied while it was read (it may be the old one).
 //			Lookup order and the values returned are unchanged.
+// 20261026	mmd	GppsStatistics: gpps and gppstime read together under the cache lock
 
 int      gpps=0, gppstime=0;
 
@@ -424,6 +425,14 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 		into_IniCache(theSection, theKey, theReturnBuffer, gen);
 	IniAddTime(t);
 	return aReturnLength > 0 ? aReturnLength - 1 : 0;
+}
+
+// the statistics (number of reads, seconds spent) as one consistent pair, under the cache lock
+void GppsStatistics(int *count, int *seconds)
+{ EnterCriticalSection(&IniCritical);
+  if (count)   *count   = gpps;
+  if (seconds) *seconds = gppstime;
+  LeaveCriticalSection(&IniCritical);
 }
 
 void FlushPrivateProfileStringCache(void)

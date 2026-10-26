@@ -1377,6 +1377,13 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: the C-MOVE send sequence is taken per object just before it
 			is read (read-ahead thread, overlap read or direct read), not once per move
 20261026	mmd	Build variant line at startup and Lua buildvariant (version string unchanged)
+20261026	mmd	Outgoing storage commitment: durable "commitment unsafe" sentinel file SCUnsafeFile (default
+			sc_unsafe.flag in the dgate directory; files only with OutgoingStorageCommitment = 1). Set
+			when a local overwrite cannot be invalidated, a send is dropped or cannot be recorded (it
+			replaces the SCMarker overflow epoch), sends are still unrecorded at a stop, or the previous
+			run did not stop cleanly (running marker <SCUnsafeFile>.running); while it exists no study
+			is confirmed. sc_unsafe: shows it, sc_unsafe_clear: (also sc_overflow_clear:) reconciles
+			the rows with the local files and removes it. SIGTERM/SIGINT and quit: stop cleanly
 
 ENDOFUPDATEHISTORY
 */
@@ -1562,6 +1569,7 @@ int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed
 int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
+int	SCTestFailDemote=0;				// TEST ONLY: 1 = the invalidation after a local overwrite counts as failed
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -23268,7 +23276,7 @@ static void SCImageSeriesJoin(char *out)
 
 static BOOL SCNotedPending(const char *ae, const char *study);
 static BOOL SCSqlText(const char *s, int max);
-static int SCOverflowState(Database &DB);
+static BOOL SCUnsafeActive(void);
 
 // Confirmed check with the number of local objects of the study in *objects.
 // Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
@@ -23286,10 +23294,9 @@ static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char 
 	if (nAE<0 || (nAE>0 && !AEs)) return -1;
 	if (!SCEnsureTables(DB)) return -1;
 
-	// sends were dropped (queue full) and the operator has not cleared it yet: no study is
-	// confirmed (a dropped send may belong to any study and destination); -1 when unknown
-	i = SCOverflowState(DB);
-	if (i!=0) return i<0 ? -1 : 0;
+	// commitment unsafe (sentinel file SCUnsafeFile: a local overwrite could not be invalidated,
+	// sends were dropped or lost, unclean stop): no study is confirmed until the operator clears it
+	if (SCUnsafeActive()) return 0;
 
 	// the given AE titles (spaces around them are not significant), checked before any query
 	if (nAE>0)
@@ -23847,7 +23854,8 @@ static SCNoted		SCNotedQueue[SC_NOTEDMAX];	// ring buffer
 static int		SCNotedHead = 0;		// oldest item
 static int		SCNotedCount = 0;		// items in the queue (including those the worker is recording)
 static unsigned int	SCNotedDropped = 0;		// items dropped because the queue was full
-static unsigned int	SCOverflowSince = 0;		// overflow epoch: time of the first drop not cleared (0 = none)
+static unsigned int	SCOverflowSince = 0;		// time of the first drop not cleared (0 = none; shown by sc_overflow:)
+static int		SCStopping = 0;			// the server stops: the queue has had its last drain
 static CRITICAL_SECTION	SCNotedCritical;
 static struct SCNotedCriticalInit
 	{
@@ -23872,6 +23880,204 @@ static unsigned int	SCChangeSeq = 0;		// number of changes so far (= sequence of
 struct SCWriting { char inst[65]; int used; int relevant; };
 static SCWriting	SCWrites[SC_WRITEMAX];
 static int		SCWritesUnknown = 0;		// writes in progress without a slot
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Commitment unsafe: a durable sentinel file (dicom.ini SCUnsafeFile, default sc_unsafe.flag in
+// the dgate directory). It is the one authority for "a COMMITTED row may be wrong": while it
+// exists, every "study confirmed" answers 0 (sc_confirmed:, sc_confirmed_list:, Lua scconfirmed,
+// the OutgoingSCStudyConfirmed hook), whatever the database says. It does not depend on the
+// database, so a database outage cannot lose it. It is set (file created, reason line appended
+// and synced, ALARM line) when:
+//  - a local overwrite could not be invalidated (SCLocalStored / SCWriteEnd demotion failed, or
+//    the tables were not available);
+//  - a send was dropped: queue full, unusable values, destination no longer with SC (it replaces
+//    the overflow epoch of table SCMarker, which is now only read once, from earlier builds);
+//  - sends were still not recorded when the server stopped, or one was noted during the stop;
+//  - the previous run did not stop cleanly: the worker creates a running marker
+//    (<SCUnsafeFile>.running) at its start and a clean stop removes it; found at the next start,
+//    it means queued sends may have been lost;
+//  - the running marker cannot be written (an unclean stop could not be detected).
+// Only sc_unsafe_clear: removes it (refused while sends are queued, a local write is in
+// progress, or the database is not reachable); it first reconciles the rows with the local
+// files (SCReconcile). Files are only made with OutgoingStorageCommitment = 1.
+//////////////////////////////////////////////////////////////////////////////////////////
+#include <errno.h>
+
+static CRITICAL_SECTION	SCUnsafeCritical;
+static struct SCUnsafeCriticalInit
+	{
+	SCUnsafeCriticalInit() { InitializeCriticalSection(&SCUnsafeCritical); }
+	}	SCUnsafeCriticalInitObject;
+static char		SCUnsafePath[512] = "";		// full name; fixed once the worker has started
+static int		SCUnsafePathFixed = 0;
+static int		SCUnsafeMem = 0;		// set in this run (or found at the start); cleared only by sc_unsafe_clear:
+static unsigned int	SCUnsafeCount = 0;		// number of times it was set (the clear checks it did not change)
+static int		SCUnsafeLines = 0;		// reason lines written by this run (at most 100)
+static char		SCUnsafeFirst[320] = "";	// first reason line (shown by sc_unsafe:, sc_status:)
+static int		SCWorkerRunning = 0;		// the worker was started in this process (running marker)
+
+// the file name from dicom.ini (a name without a path is in the dgate directory, as acrnema.map);
+// read with the other worker keys; a change after the worker started needs a restart
+static void SCUnsafeFileConfig(const char *root)
+	{
+	char name[256], path[512];
+	MyGetPrivateProfileString(root, "SCUnsafeFile", "", name, sizeof(name), ConfigFile);
+	SCTrim(name);
+	if (!name[0]) strcpy(name, "sc_unsafe.flag");
+	if (strrchr(name, PATHSEPCHAR) || strchr(name, '/')) snprintf(path, sizeof(path), "%s", name);
+	else                                                 snprintf(path, sizeof(path), "%s%s", BaseDir, name);
+	EnterCriticalSection(&SCUnsafeCritical);
+	if (!SCUnsafePathFixed) strcpy(SCUnsafePath, path);
+	else if (strcmp(SCUnsafePath, path)!=0 && OutgoingStorageCommitment)
+		OperatorConsole.printf("*** Storage commitment: SCUnsafeFile changed; %s stays in use until the server is restarted\n", SCUnsafePath);
+	LeaveCriticalSection(&SCUnsafeCritical);
+	}
+
+// 1: the file exists, 0: it does not, -1: cannot tell (counts as existing)
+static int SCFileState(const char *path)
+	{
+	struct stat st;
+	if (!path[0]) return -1;
+	if (stat(path, &st)==0) return 1;
+	return errno==ENOENT ? 0 : -1;
+	}
+
+// make the directory entry of path durable (POSIX); nothing on Windows
+static void SCSyncDir(const char *path)
+	{
+#ifndef WIN32
+	char dir[512];
+	char *c;
+	snprintf(dir, sizeof(dir), "%s", path);
+	c = strrchr(dir, '/');
+	if (!c) strcpy(dir, ".");
+	else if (c==dir) dir[1] = 0;
+	else *c = 0;
+	int fd = open(dir, O_RDONLY);
+	if (fd>=0) { fsync(fd); close(fd); }
+#else
+	(void)path;
+#endif
+	}
+
+// write text to path (append, or replace when append is FALSE) and sync it to disk
+static BOOL SCDurableWrite(const char *path, const char *text, BOOL append)
+	{
+	FILE *f;
+	BOOL ok;
+	if (!path[0]) return FALSE;
+	f = fopen(path, append ? "ab" : "wb");
+	if (!f) return FALSE;
+	ok = fputs(text, f)>=0 && fflush(f)==0;
+#ifdef WIN32
+	ok = ok && _commit(_fileno(f))==0;
+#else
+	ok = ok && fsync(fileno(f))==0;
+#endif
+	ok = (fclose(f)==0) && ok;
+	if (ok) SCSyncDir(path);
+	return ok;
+	}
+
+// remove path (missing is fine) and make that durable
+static BOOL SCDurableRemove(const char *path)
+	{
+	if (!path[0]) return FALSE;
+	if (unlink(path)!=0 && errno!=ENOENT) return FALSE;
+	SCSyncDir(path);
+	return TRUE;
+	}
+
+static void SCRunningPath(char *out, int size)
+	{
+	EnterCriticalSection(&SCUnsafeCritical);
+	snprintf(out, size, "%s.running", SCUnsafePath);
+	LeaveCriticalSection(&SCUnsafeCritical);
+	}
+
+// Set "commitment unsafe" with a reason: synchronously, before the caller goes on. Never called
+// while SCNotedCritical is held (the clear takes SCUnsafeCritical, then SCNotedCritical).
+static void SCUnsafeSet(const char *reason)
+	{
+	char line[400];
+	BOOL ok = TRUE, first;
+	if (!OutgoingStorageCommitment && !SCWorkerRunning) return;		// never a file when it is off
+	snprintf(line, sizeof(line), "%u %s\n", (unsigned int)time(NULL), reason);
+	EnterCriticalSection(&SCUnsafeCritical);
+	first = !SCUnsafeMem;
+	SCUnsafeMem = 1;
+	SCUnsafeCount++;
+	if (!SCUnsafeFirst[0])
+		{
+		snprintf(SCUnsafeFirst, sizeof(SCUnsafeFirst), "%s", line);
+		SCUnsafeFirst[strcspn(SCUnsafeFirst, "\r\n")] = 0;
+		}
+	if (SCUnsafeLines<100 || SCFileState(SCUnsafePath)!=1)
+		{
+		ok = SCDurableWrite(SCUnsafePath, line, TRUE);
+		if (ok) SCUnsafeLines++;
+		}
+	LeaveCriticalSection(&SCUnsafeCritical);
+	OperatorConsole.printf("*** Storage commitment ALARM: commitment unsafe (%s): no study is confirmed until sc_unsafe_clear: is given%s\n",
+		reason, ok ? "" : " (the sentinel file could not be written: this holds only until the server stops)");
+	(void)first;
+	}
+
+// is commitment unsafe now: set in this run, or the file exists (or cannot be checked)
+static BOOL SCUnsafeActive(void)
+	{
+	BOOL r;
+	EnterCriticalSection(&SCUnsafeCritical);
+	r = SCUnsafeMem || SCFileState(SCUnsafePath)!=0;
+	LeaveCriticalSection(&SCUnsafeCritical);
+	return r;
+	}
+
+// "" when not unsafe, else a one-line description
+static void SCUnsafeText(char *out, int size)
+	{
+	out[0] = 0;
+	if (!OutgoingStorageCommitment || !SCUnsafeActive()) return;
+	EnterCriticalSection(&SCUnsafeCritical);
+	snprintf(out, size, "%s", SCUnsafeFirst[0] ? SCUnsafeFirst : "sentinel file present");
+	LeaveCriticalSection(&SCUnsafeCritical);
+	}
+
+// at the start of the worker: take over a sentinel of an earlier run, detect an unclean stop of
+// the previous run (running marker still there), and create the running marker for this run
+static void SCUnsafeStartup(void)
+	{
+	char path[512], running[540], text[64];
+	int state;
+	EnterCriticalSection(&SCUnsafeCritical);
+	SCUnsafePathFixed = 1;
+	SCWorkerRunning = 1;
+	strcpy(path, SCUnsafePath);
+	state = SCFileState(path);
+	if (state!=0)
+		{
+		FILE *f = fopen(path, "rb");
+		SCUnsafeMem = 1;
+		SCUnsafeFirst[0] = 0;
+		if (f)
+			{
+			if (fgets(SCUnsafeFirst, sizeof(SCUnsafeFirst), f)) SCUnsafeFirst[strcspn(SCUnsafeFirst, "\r\n")] = 0;
+			else SCUnsafeFirst[0] = 0;
+			fclose(f);
+			}
+		if (!SCUnsafeFirst[0]) strcpy(SCUnsafeFirst, "sentinel file of an earlier run");
+		}
+	LeaveCriticalSection(&SCUnsafeCritical);
+	if (state!=0)
+		OperatorConsole.printf("*** Storage commitment ALARM: commitment unsafe since an earlier run (%s: %s): no study is confirmed until sc_unsafe_clear: is given\n",
+			path, SCUnsafeFirst);
+	SCRunningPath(running, sizeof(running));
+	if (SCFileState(running)!=0)
+		SCUnsafeSet("the previous run of the server did not stop cleanly (noted sends may never have been recorded)");
+	snprintf(text, sizeof(text), "%u running\n", (unsigned int)time(NULL));
+	if (!SCDurableWrite(running, text, FALSE))
+		SCUnsafeSet("the running marker could not be written (an unclean stop could not be detected)");
+	}
 
 // caller holds SCNotedCritical
 static BOOL SCWriteInProgressLocked(const char *inst)
@@ -23987,13 +24193,17 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 	if (!SCIsUID(SOPClassUID) || !SCIsUID(SOPInstanceUID)) return;
 	if (!IP[0] || !Port[0] || !SCSqlText(IP, 127) || !SCSqlText(Port, 16))
 		{
+		char why[200];
 		OperatorConsole.printf("*** Outgoing storage commitment: send of %s to %s not noted (unusable address)\n", SOPInstanceUID, ae);
+		snprintf(why, sizeof(why), "a send to %s was not noted (unusable address)", ae);
+		SCUnsafeSet(why);
 		return;
 		}
 
 	int max = (SCTestQueueMax>0 && SCTestQueueMax<SC_NOTEDMAX) ? SCTestQueueMax : SC_NOTEDMAX;
-	BOOL first = FALSE;
+	BOOL first = FALSE, late = FALSE;
 	EnterCriticalSection(&SCNotedCritical);
+	if (SCStopping) late = TRUE;			// after the last drain of a stop: never recorded
 	if (SCNotedCount >= max)
 		{
 		dropped = ++SCNotedDropped;
@@ -24019,12 +24229,17 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		}
 	LeaveCriticalSection(&SCNotedCritical);
 
-	// a dropped item is never confirmed, and from the first drop no study is (overflow epoch,
-	// see SCOverflowState); one line per 1000 drops
+	// a dropped item is never confirmed, and from the first drop no study is (commitment unsafe,
+	// sentinel file, until the queue has drained and the operator clears it); one line per 1000 drops
 	if (first)
-		OperatorConsole.printf("*** Storage commitment ALARM: queue full (%d), send of %s to %s not noted: no study is confirmed until the queue has drained and sc_overflow_clear: is given\n", n, SOPInstanceUID, ae);
+		{
+		OperatorConsole.printf("*** Storage commitment ALARM: queue full (%d), send of %s to %s not noted: no study is confirmed until the queue has drained and sc_unsafe_clear: is given\n", n, SOPInstanceUID, ae);
+		SCUnsafeSet("queue full: sends were dropped without being recorded");
+		}
 	if (dropped && (dropped % 1000)==1)
 		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
+	if (late)
+		SCUnsafeSet("a send was noted while the server was stopping (not recorded)");
 	}
 
 // The same for a C-STORE on PDU: the destination is the one its last Connect really used
@@ -24142,21 +24357,14 @@ static int SCNotedLength(unsigned int *dropped)
 	return n;
 	}
 
-// Overflow epoch. A send dropped because the queue was full is never recorded: its object can be
+// Overflow. A send dropped because the queue was full is never recorded: its object can be
 // missing from SCObject for that destination (sc_confirmed without AEs would not even look at that
 // destination), or an older COMMITTED row can stand for a send that went somewhere else. Which
-// studies are affected is not known, so from the first drop every "study confirmed" answers 0
-// (sc_confirmed:, sc_confirmed_list:, Lua scconfirmed, the OutgoingSCStudyConfirmed hook), until
-// the queue has drained and the operator clears it with sc_overflow_clear: (after checking or
-// re-sending what was lost). The send path only sets SCOverflowSince (no database there); the
-// worker writes the marker to table SCMarker (Name 'OVERFLOW') on its next pass, so it survives
-// a restart. SCOverflowCritical keeps the worker's write and the operator's clear apart.
-static CRITICAL_SECTION	SCOverflowCritical;
-static struct SCOverflowCriticalInit
-	{
-	SCOverflowCriticalInit() { InitializeCriticalSection(&SCOverflowCritical); }
-	}	SCOverflowCriticalInitObject;
-static unsigned int	SCOverflowStored = 0;		// SCNotedDropped as written to SCMarker (or cleared)
+// studies are affected is not known, so the first drop sets "commitment unsafe" (sentinel file,
+// SCUnsafeSet, no database): no study is confirmed until the queue has drained and the operator
+// clears it with sc_unsafe_clear: (or sc_overflow_clear:, the same). Builds of round 2 kept this
+// epoch in table SCMarker (Name 'OVERFLOW'); such a row is taken over once by the worker
+// (SCMarkerTakeOver) and removed by the clear.
 
 // 1: overflow marker in the table, 0: none, -1: query failed
 static int SCOverflowMarked(Database &DB)
@@ -24169,48 +24377,23 @@ static int SCOverflowMarked(Database &DB)
 	return DB.NextRecord() ? 1 : 0;
 	}
 
-// 1: overflow epoch (in memory or in the table), 0: none, -1: unknown (query failed)
-static int SCOverflowState(Database &DB)
+// worker, until it succeeds once: an overflow marker left in SCMarker by an earlier build
+static void SCMarkerTakeOver(Database &DB)
 	{
-	unsigned int since;
-	EnterCriticalSection(&SCNotedCritical);
-	since = SCOverflowSince;
-	LeaveCriticalSection(&SCNotedCritical);
-	if (since) return 1;
-	return SCOverflowMarked(DB);
+	static int done = 0;
+	if (done) return;
+	int m = SCOverflowMarked(DB);
+	if (m<0) return;
+	done = 1;
+	if (m==1) SCUnsafeSet("queue overflow marker in table SCMarker from an earlier build");
 	}
 
-// worker: write the overflow epoch to SCMarker when there are drops not written yet
-static void SCOverflowPersist(Database &DB)
-	{
-	unsigned int since, drops;
-	char vals[96], upd[64];
-	int m;
-	EnterCriticalSection(&SCNotedCritical);
-	since = SCOverflowSince;
-	drops = SCNotedDropped;
-	LeaveCriticalSection(&SCNotedCritical);
-	if (!since) return;
-	EnterCriticalSection(&SCOverflowCritical);
-	if (drops != SCOverflowStored)
-		{
-		BOOL ok;
-		m = SCOverflowMarked(DB);
-		sprintf(upd, "Drops = %u", drops);
-		sprintf(vals, "'OVERFLOW', %u, %u", since, drops);
-		if (m==1)      ok = DB.UpdateRecords((char *)"SCMarker", upd, (char *)"Name = 'OVERFLOW'");
-		else if (m==0) ok = DB.AddRecord("SCMarker", "Name, Since, Drops", vals);
-		else           ok = FALSE;
-		if (ok) SCOverflowStored = drops;
-		else    OperatorConsole.printf("*** Storage commitment ALARM: queue overflow could not be written to SCMarker (tried again; confirmations answer 0 meanwhile)\n");
-		}
-	LeaveCriticalSection(&SCOverflowCritical);
-	}
-
-// sc_overflow: -> "0" (none) or "1 since <time> dropped <n>" (in memory) or "1 marked" (table only)
+// sc_overflow: -> "0" (none), "1 since <time> dropped <n>" (drops in this run) or
+// "1 marked: <reason>" (commitment unsafe for another reason or since an earlier run)
 static void SCOverflowCommand(char *Response)
 	{
 	unsigned int since, drops;
+	char text[400];
 	strcpy(Response, "0");
 	if (!OutgoingStorageCommitment) return;
 	EnterCriticalSection(&SCNotedCritical);
@@ -24218,53 +24401,18 @@ static void SCOverflowCommand(char *Response)
 	drops = SCNotedDropped;
 	LeaveCriticalSection(&SCNotedCritical);
 	if (since) { sprintf(Response, "1 since %u dropped %u", since, drops); return; }
-	Database DB;
-	if (!DB.Open(DataSource, UserName, Password, DataHost) || !SCEnsureTables(DB)) { strcpy(Response, "1 unknown (database)"); return; }
-	int m = SCOverflowMarked(DB);
-	DB.Close();
-	if (m==1) strcpy(Response, "1 marked");
-	else if (m<0) strcpy(Response, "1 unknown (database)");
+	SCUnsafeText(text, 300);
+	if (text[0]) sprintf(Response, "1 marked: %s", text);
 	}
 
-// sc_overflow_clear: the operator ends the overflow epoch. Refused while sends are still in the
-// queue, when the marker cannot be removed from SCMarker, or when another send was dropped meanwhile.
-static void SCOverflowClearCommand(char *Response)
+// sc_unsafe: -> "0" or "1 <first reason line>"
+static void SCUnsafeCommand(char *Response)
 	{
-	unsigned int since, drops;
-	int n;
-	strcpy(Response, "refused: OutgoingStorageCommitment is 0");
+	char text[400];
+	strcpy(Response, "0");
 	if (!OutgoingStorageCommitment) return;
-	EnterCriticalSection(&SCNotedCritical);
-	n = SCNotedCount;
-	since = SCOverflowSince;
-	drops = SCNotedDropped;
-	LeaveCriticalSection(&SCNotedCritical);
-	if (n>0) { sprintf(Response, "refused: %d send(s) still in the queue", n); return; }
-
-	Database DB;
-	if (!DB.Open(DataSource, UserName, Password, DataHost) || !SCEnsureTables(DB))
-		{ strcpy(Response, "refused: no database connection"); return; }
-	EnterCriticalSection(&SCOverflowCritical);
-	if (!DB.DeleteRecord("SCMarker", "Name = 'OVERFLOW'"))
-		strcpy(Response, "refused: marker could not be removed");
-	else
-		{
-		EnterCriticalSection(&SCNotedCritical);
-		if (SCNotedDropped == drops)
-			{
-			SCOverflowSince = 0;
-			SCOverflowStored = drops;
-			strcpy(Response, "cleared");
-			}
-		else	strcpy(Response, "refused: more sends were dropped meanwhile");
-		LeaveCriticalSection(&SCNotedCritical);
-		}
-	LeaveCriticalSection(&SCOverflowCritical);
-	DB.Close();
-	if (strcmp(Response, "cleared")==0)
-		OperatorConsole.printf("Storage commitment: queue overflow cleared by the operator (%s)\n", since ? "epoch of this run" : "marker from an earlier run, if any");
-	else
-		OperatorConsole.printf("*** sc_overflow_clear: %s\n", Response);
+	SCUnsafeText(text, 300);
+	if (text[0]) sprintf(Response, "1 %s", text);
 	}
 
 // SQL that makes the objects of a where clause unconfirmed after a local change: Gen + 1 (a result
@@ -24289,7 +24437,18 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 
 	if (!OutgoingStorageCommitment || !DDO) return;
 	if (!SCVRUID(DDO->GetVR(0x0008, 0x0018), inst)) return;
-	if (!SCEnsureTables(DB)) return;
+	if (!SCEnsureTables(DB))
+		{
+		// the rows of this object cannot be checked or invalidated (not with the dbase driver:
+		// there is no outgoing storage commitment at all, nothing is ever confirmed)
+		if (DB.db_type!=DT_DBASEIII && DB.db_type!=DT_DBASEIIINOINDEX && DB.db_type!=DT_NULL)
+			{
+			char why[200];
+			snprintf(why, sizeof(why), "%s stored locally, but the commitment tables are not available", inst);
+			SCUnsafeSet(why);
+			}
+		return;
+		}
 
 	sprintf(where, "SOPInstUID = '%s'", inst);
 	if (DB.Query("SCObject", "COUNT(*)", where, NULL))
@@ -24303,8 +24462,14 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 	SCRegisterChange(inst);				// first: a send recorded from now on sees the change,
 							// and a write of inst in progress (SaveToDisk) becomes relevant
 	if (n==0) return;
-	if (!DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+	if (SCTestFailDemote || !DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		{
+		char why[200];
 		OperatorConsole.printf("*** Storage commitment ALARM: %s stored again locally, but its commitment state could not be reset\n", inst);
+		snprintf(why, sizeof(why), n<0 ? "%s stored locally, but its rows could not be checked or made CHANGED"
+					      : "%s stored again locally, but its rows could not be made CHANGED", inst);
+		SCUnsafeSet(why);
+		}
 	else
 		OperatorConsole.printf("Storage commitment: %s stored again locally: CHANGED for every destination (not confirmed until it is sent again)\n", inst);
 	}
@@ -24342,9 +24507,14 @@ void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written)
 		{
 		SCRegisterChange(uid);
 		sprintf(where, "SOPInstUID = '%s' and State <> 'CHANGED'", uid);
-		if (!DB || !SCEnsureTables(*DB) || !DB->UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		if (SCTestFailDemote || !DB || !SCEnsureTables(*DB) || !DB->UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+			{
+			char why[200];
 			OperatorConsole.printf("*** Storage commitment ALARM: %s %s locally, but its commitment state could not be reset again\n",
 				uid, written ? "rewritten" : "write failed");
+			snprintf(why, sizeof(why), "%s %s locally, but its rows could not be made CHANGED after the write", uid, written ? "rewritten" : "write failed");
+			SCUnsafeSet(why);
+			}
 		}
 
 	EnterCriticalSection(&SCNotedCritical);
@@ -24581,7 +24751,9 @@ void SCReadWorkerConfig(const char *root)
 	SCTestDelayBeforeWrite  = SCIniInt(root, "SCTestDelayBeforeWrite",  0,     0, 60000);
 	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
 	SCTestQueueMax          = SCIniInt(root, "SCTestQueueMax",          0,     0, SC_NOTEDMAX);
+	SCTestFailDemote        = SCIniInt(root, "SCTestFailDemote",        0,     0, 1);
 	SCReadRetryInterval(root);
+	SCUnsafeFileConfig(root);
 	}
 
 // delay before asking again after attempt number 'attempts' (1 = first request failed)
@@ -24845,6 +25017,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 	if (!SCCleanAE(it->ae, ae) || !SCIsUID(it->inst) || !SCIsUID(it->cls) || (it->study[0] && !SCIsUID(it->study)))
 		{
 		OperatorConsole.printf("*** Storage commitment: noted send with invalid AE or UID not recorded\n");
+		SCUnsafeSet("a noted send with an invalid AE or UID was not recorded");
 		return TRUE;
 		}
 	strcpy(study, it->study);
@@ -24862,7 +25035,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
 		{
 		if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
-			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return TRUE; }
+			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); SCUnsafeSet("a noted send with an unusable address was not recorded"); return TRUE; }
 		// the destination of this send (the map may have changed since an earlier one)
 		sprintf(upd, "LastSent = %u, " SC_GENINC ", DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
 			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
@@ -24875,9 +25048,9 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 	// still SC in acrnema.map; the destination recorded is the one actually used for the send
 	// (never rebuilt from the map): a different map address later holds the object
 	if (!GetACRNemaEntryByAE(ae, &E) || !(E.Flags & ACR_SC))
-		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); return TRUE; }
+		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); SCUnsafeSet("a noted send was not recorded (destination no longer with SC in acrnema.map)"); return TRUE; }
 	if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
-		{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return TRUE; }
+		{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); SCUnsafeSet("a noted send with an unusable address was not recorded"); return TRUE; }
 
 	if (exists)
 		{
@@ -26041,6 +26214,81 @@ static void SCPurge(Database &DB, unsigned int now)
 	if (!ok) OperatorConsole.printf("*** Storage commitment: purge of old records failed (retried in an hour)\n");
 	}
 
+// Reconciliation before "commitment unsafe" is cleared. A local overwrite whose invalidation
+// failed left the rows of its object as they were (COMMITTED, or REQUESTED/NOTED that a result can
+// still make COMMITTED, with the Gen of the old content). Rule: every NOTED, REQUESTED or COMMITTED
+// row whose LastSent (when its last send was noted) is not before the modification time of the
+// object's current local file (whole seconds) becomes CHANGED (Gen + 1, as SCLocalStored would
+// have done). No usable file (not local any more, not found, no time): every such row of the
+// object becomes CHANGED. Why LastSent and not CommittedAt: the send read the file before LastSent,
+// and LastSent <= CommittedAt, so this catches every overwrite after the send, also one between the
+// send and its result. Why it is enough: a demotion that failed was preceded by the change in
+// memory, so a send recorded after it was stale (CHANGED) or is still queued (the clear is refused
+// then); a row recorded before it has LastSent <= that moment < the end of the file write, which
+// is the file time. An object stored in the same second as its last send counts as changed (safe
+// side). Returns the number of objects made CHANGED, -1 on a database error.
+struct SCReconItem { char inst[65]; unsigned int last; };
+
+static int SCReconcile(Database &DB)
+	{
+	SCReconItem *list = NULL, *nl;
+	int n = 0, cap = 0, i, changed = 0;
+	char inst[80], last[32], where[256];
+	SQLLEN len;
+
+	if (!DB.Query("SCObject", "SOPInstUID, MIN(LastSent)", "State in ('NOTED', 'REQUESTED', 'COMMITTED') GROUP BY SOPInstUID", NULL))
+		return -1;
+	inst[0] = last[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, inst, sizeof(inst), &len);
+	DB.BindField(2, SQL_C_CHAR, last, sizeof(last), &len);
+	while (DB.NextRecord())
+		{
+		SCTrim(inst);
+		if (!SCIsUID(inst)) { n = -1; inst[0] = last[0] = 0; continue; }
+		if (n>=0 && n==cap)
+			{
+			cap = cap ? 2*cap : 1024;
+			nl = (SCReconItem *)realloc(list, cap*sizeof(SCReconItem));
+			if (!nl) n = -1;
+			else list = nl;
+			}
+		if (n>=0)
+			{
+			strcpy(list[n].inst, inst);
+			list[n].last = (unsigned int)strtoul(last, NULL, 10);
+			n++;
+			}
+		inst[0] = last[0] = 0;
+		}
+	if (n<0) { if (list) free(list); OperatorConsole.printf("*** sc_unsafe_clear: rows with an invalid UID or out of memory\n"); return -1; }
+
+	for (i=0; i<n; i++)
+		{
+		struct stat st;
+		char *file = SCLocalFile(DB, list[i].inst);
+		BOOL known = file && stat(file, &st)==0;
+		if (file) free(file);
+		if (known && (long long)st.st_mtime < (long long)list[i].last) continue;	// every send after the file was written
+		if (known) sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED') and LastSent <= %lld", list[i].inst, (long long)st.st_mtime);
+		else       sprintf(where, "SOPInstUID = '%s' and State in ('NOTED', 'REQUESTED', 'COMMITTED')", list[i].inst);
+		if (!DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where)) { free(list); return -1; }
+		OperatorConsole.printf("Storage commitment: reconciliation: %s made CHANGED (%s)\n", list[i].inst,
+			known ? "local file written at or after its last send" : "no local file");
+		changed++;
+		}
+	if (list) free(list);
+	return changed;
+	}
+
+// the worker's drain and the last drain of a stop never run at the same time
+static CRITICAL_SECTION	SCDrainCritical;
+static struct SCDrainCriticalInit
+	{
+	SCDrainCriticalInit() { InitializeCriticalSection(&SCDrainCritical); }
+	}	SCDrainCriticalInitObject;
+static int		SCPassActive = 0;		// a worker pass is running (under SCNotedCritical)
+static int		SCStopRequested = 0;		// a stop began: no new worker pass
+
 // one pass of the worker; the database is opened per pass
 static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 	{
@@ -26058,10 +26306,12 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 	// in queue order; the first one that fails on the database and all after it stay in the
 	// queue (still visible to "study confirmed") and are tried again on the next pass
 	static unsigned int lastnote = 0, lastalarm = 0;
+	EnterCriticalSection(&SCDrainCritical);
 	n = SCTakeNoted(buf, SC_DRAINMAX);
 	for (i=0; i<n; i++)
 		if (!SCRecordNoted(DB, buf+i)) break;
 	SCDropNoted(i);
+	LeaveCriticalSection(&SCDrainCritical);
 	if (i<n)
 		{
 		unsigned int t0 = (unsigned int)time(NULL);
@@ -26078,7 +26328,7 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 			lastalarm = t0;
 			}
 		}
-	SCOverflowPersist(DB);
+	SCMarkerTakeOver(DB);
 
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
@@ -26108,10 +26358,216 @@ static BOOL WINAPI SCWorkerThread(void)
 	OperatorConsole.printf("Started outgoing storage commitment thread\n");
 	while (TRUE)
 		{
-		if (OutgoingStorageCommitment) SCWorkerPass(buf, &lastpurge);
+		int run;
+		EnterCriticalSection(&SCNotedCritical);
+		run = OutgoingStorageCommitment && !SCStopRequested;
+		SCPassActive = run;
+		LeaveCriticalSection(&SCNotedCritical);
+		if (run) SCWorkerPass(buf, &lastpurge);
+		EnterCriticalSection(&SCNotedCritical);
+		SCPassActive = 0;
+		LeaveCriticalSection(&SCNotedCritical);
 		Sleep(1000*OutgoingSCScanInterval);
 		}
 	return TRUE;
+	}
+
+// Clean stop (quit:, safequit:, SIGTERM, SIGINT): no new worker pass starts, a running one is
+// given up to 5 s to end (a request sent in it can then get its result); the last drain records what is queued; what
+// cannot be recorded (database) sets "commitment unsafe"; then the running marker is removed (kept
+// when the sentinel could not be written, so the next start sets it). Called once; the drain lock
+// is kept until the process ends, so the worker does not drain any more.
+void SCStop(const char *how)
+	{
+	static SCNoted *buf = NULL;
+	char running[540], why[200];
+	int n = 0, i, left;
+	BOOL keep;
+	if (!SCWorkerRunning) return;
+	EnterCriticalSection(&SCNotedCritical);
+	SCStopRequested = 1;
+	LeaveCriticalSection(&SCNotedCritical);
+	for (i=0; i<50; i++)
+		{
+		int active;
+		EnterCriticalSection(&SCNotedCritical);
+		active = SCPassActive;
+		LeaveCriticalSection(&SCNotedCritical);
+		if (!active) break;
+		Sleep(100);
+		}
+	EnterCriticalSection(&SCDrainCritical);			// never left: the process ends
+	buf = (SCNoted *)malloc(sizeof(SCNoted)*SC_DRAINMAX);
+	Database DB;
+	if (buf && DB.Open(DataSource, UserName, Password, DataHost) && SCEnsureTables(DB))
+		{
+		while ((n = SCTakeNoted(buf, SC_DRAINMAX))>0)
+			{
+			for (i=0; i<n; i++)
+				if (!SCRecordNoted(DB, buf+i)) break;
+			SCDropNoted(i);
+			if (i<n) break;
+			}
+		DB.Close();
+		}
+	EnterCriticalSection(&SCNotedCritical);
+	SCStopping = 1;
+	left = SCNotedCount;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (left>0)
+		{
+		snprintf(why, sizeof(why), "the server stopped (%s) with %d noted send(s) not recorded", how, left);
+		SCUnsafeSet(why);
+		}
+	EnterCriticalSection(&SCUnsafeCritical);
+	keep = SCUnsafeMem && SCFileState(SCUnsafePath)==0;
+	LeaveCriticalSection(&SCUnsafeCritical);
+	SCRunningPath(running, sizeof(running));
+	if (!keep && SCDurableRemove(running))
+		OperatorConsole.printf("Storage commitment: clean stop (%s)%s\n", how, left>0 ? ", commitment unsafe" : "");
+	else
+		OperatorConsole.printf("*** Storage commitment: stop (%s), running marker kept (the next start counts it as unclean)\n", how);
+	}
+
+#ifndef WIN32
+// SIGTERM / SIGINT (only with outgoing storage commitment): the handler only writes the signal
+// number to a pipe; a thread does the clean stop and then ends the process as the signal would
+static int SCStopPipe[2] = { -1, -1 };
+
+static void SCStopSignal(int sig)
+	{
+	unsigned char c = (unsigned char)sig;
+	ssize_t r = write(SCStopPipe[1], &c, 1);
+	(void)r;
+	}
+
+static void *SCStopThread(void *arg)
+	{
+	unsigned char c = 0;
+	ssize_t r;
+	(void)arg;
+	do r = read(SCStopPipe[0], &c, 1); while (r<0 && errno==EINTR);
+	if (r!=1) return NULL;
+	SCStop(c==SIGINT ? "SIGINT" : "SIGTERM");
+	fflush(stdout);
+	fflush(stderr);
+	signal(c, SIG_DFL);
+	raise(c);
+	_exit(128 + c);			// the signal is ignored (process 1 in a container)
+	return NULL;
+	}
+#endif
+
+static void SCInstallStop(void)
+	{
+#ifndef WIN32
+	pthread_t t;
+	struct sigaction sa, old;
+	if (pipe(SCStopPipe)!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment: no clean stop on SIGTERM (pipe failed); a stop by signal counts as unclean\n");
+		return;
+		}
+	fcntl(SCStopPipe[0], F_SETFD, FD_CLOEXEC);
+	fcntl(SCStopPipe[1], F_SETFD, FD_CLOEXEC);
+	if (pthread_create(&t, NULL, SCStopThread, NULL)!=0)
+		{
+		OperatorConsole.printf("*** Storage commitment: no clean stop on SIGTERM (thread failed); a stop by signal counts as unclean\n");
+		return;
+		}
+	pthread_detach(t);
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = SCStopSignal;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	// a signal that was ignored when the server started stays ignored
+	if (sigaction(SIGTERM, NULL, &old)==0 && old.sa_handler!=SIG_IGN) sigaction(SIGTERM, &sa, NULL);
+	if (sigaction(SIGINT,  NULL, &old)==0 && old.sa_handler!=SIG_IGN) sigaction(SIGINT,  &sa, NULL);
+#endif
+	}
+
+// sc_unsafe_clear: (also sc_overflow_clear:) the operator ends "commitment unsafe". Refused while
+// sends are in the queue, while a local write is in progress, when the database is not reachable,
+// when the reconciliation fails, or when it was set again meanwhile. Otherwise: reconciliation
+// (SCReconcile), the SCMarker row of earlier builds is removed, and then the sentinel file.
+static CRITICAL_SECTION	SCClearCritical;
+static struct SCClearCriticalInit
+	{
+	SCClearCriticalInit() { InitializeCriticalSection(&SCClearCritical); }
+	}	SCClearCriticalInitObject;
+
+static void SCUnsafeClearCommand(char *Response)
+	{
+	int n, w, i, changed = -1;
+	unsigned int count0;
+	char running[540];
+	SQLLEN len;
+	char cnt[32];
+
+	strcpy(Response, "refused: OutgoingStorageCommitment is 0");
+	if (!OutgoingStorageCommitment) return;
+	if (!SCUnsafeActive())
+		{
+		strcpy(Response, "cleared");
+		OperatorConsole.printf("Storage commitment: sc_unsafe_clear: commitment is not unsafe (nothing done)\n");
+		return;
+		}
+	EnterCriticalSection(&SCClearCritical);
+
+	EnterCriticalSection(&SCNotedCritical);
+	n = SCNotedCount;
+	w = SCWritesUnknown;
+	for (i=0; i<SC_WRITEMAX; i++) if (SCWrites[i].used) w++;
+	LeaveCriticalSection(&SCNotedCritical);
+	EnterCriticalSection(&SCUnsafeCritical);
+	count0 = SCUnsafeCount;
+	LeaveCriticalSection(&SCUnsafeCritical);
+
+	Database DB;
+	if (n>0) sprintf(Response, "refused: %d send(s) still in the queue", n);
+	else if (w>0) sprintf(Response, "refused: %d local write(s) in progress", w);
+	else if (!DB.Open(DataSource, UserName, Password, DataHost) || !SCEnsureTables(DB) ||
+		 !DB.Query("SCObject", "COUNT(*)", "1 = 1", NULL))
+		strcpy(Response, "refused: database not reachable");
+	else
+		{
+		cnt[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+		while (DB.NextRecord()) ;
+		SCRunningPath(running, sizeof(running));
+		if (SCWorkerRunning && SCFileState(running)!=1 &&
+		    !SCDurableWrite(running, "running (made again by sc_unsafe_clear:)\n", FALSE))
+			strcpy(Response, "refused: the running marker cannot be written");
+		else if ((changed = SCReconcile(DB))<0)
+			strcpy(Response, "refused: reconciliation failed (database)");
+		else if (SCOverflowMarked(DB)!=0 && !DB.DeleteRecord("SCMarker", "Name = 'OVERFLOW'"))
+			strcpy(Response, "refused: SCMarker row could not be removed");
+		else
+			{
+			EnterCriticalSection(&SCUnsafeCritical);
+			if (SCUnsafeCount != count0)
+				strcpy(Response, "refused: commitment became unsafe again meanwhile");
+			else if (!SCDurableRemove(SCUnsafePath))
+				strcpy(Response, "refused: the sentinel file could not be removed");
+			else
+				{
+				SCUnsafeMem = 0;
+				SCUnsafeLines = 0;
+				SCUnsafeFirst[0] = 0;
+				EnterCriticalSection(&SCNotedCritical);
+				SCOverflowSince = 0;
+				LeaveCriticalSection(&SCNotedCritical);
+				strcpy(Response, "cleared");
+				}
+			LeaveCriticalSection(&SCUnsafeCritical);
+			}
+		DB.Close();
+		}
+	LeaveCriticalSection(&SCClearCritical);
+	if (strcmp(Response, "cleared")==0)
+		OperatorConsole.printf("Storage commitment: commitment unsafe cleared by the operator; reconciliation made %d object(s) CHANGED\n", changed);
+	else
+		OperatorConsole.printf("*** sc_unsafe_clear: %s\n", Response);
 	}
 
 // start the worker once; called at server start only when OutgoingStorageCommitment = 1
@@ -26120,6 +26576,8 @@ void StartSCWorkerThread(void)
 	static BOOL started = FALSE;
 	if (started) return;
 	started = TRUE;
+	SCUnsafeStartup();
+	SCInstallStop();
 #ifdef WIN32
 	unsigned long ThreadID;
 	CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) SCWorkerThread, NULL, 0, &ThreadID);
@@ -26134,7 +26592,18 @@ void StartSCWorkerThread(void)
 // object still waiting (NOTED or REQUESTED); plus the number of open transactions; and the
 // re-send counts: resends (successful), reserved (attempts), resend_queued, resend_limit,
 // not_local, overdue (RI nodes: objects past OutgoingSCDeadline still in the cycle)
+static void SCStatusTextDB(char *out, int size);
 static void SCStatusText(char *out, int size)
+	{
+	char text[400];
+	int k;
+	SCUnsafeText(text, 300);
+	if (!text[0]) { SCStatusTextDB(out, size); return; }
+	k = snprintf(out, size, "commitment UNSAFE (no study is confirmed until sc_unsafe_clear:): %s\n", text);
+	if (k>=0 && k<size) SCStatusTextDB(out+k, size-k);
+	}
+
+static void SCStatusTextDB(char *out, int size)
 	{
 	static const char *states[] = { "NOTED", "REQUESTED", "COMMITTED", "FAILED", "TIMEOUT", "UNSUPPORTED", "HELD", "CANCELLED", "CHANGED" };
 	const int ns = 9;
@@ -27857,11 +28326,18 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		return true;
 		}
 
-	// outgoing storage commitment: queue overflow epoch (no study confirmed while it lasts)
-	if (memcmp(SilentText, "sc_overflow_clear:", 18)==0)
+	// outgoing storage commitment: commitment unsafe (sentinel file; no study confirmed while it
+	// exists); sc_overflow_clear: is the same as sc_unsafe_clear:
+	if (memcmp(SilentText, "sc_overflow_clear:", 18)==0 || memcmp(SilentText, "sc_unsafe_clear:", 16)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
-		SCOverflowClearCommand(Response);
+		SCUnsafeClearCommand(Response);
+		return true;
+		}
+	if (memcmp(SilentText, "sc_unsafe:", 10)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCUnsafeCommand(Response);
 		return true;
 		}
 	if (memcmp(SilentText, "sc_overflow:", 12)==0)
@@ -29098,6 +29574,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 	if (memcmp(SilentText, "quit:", 5)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCStop("quit:");		// outgoing storage commitment: last drain (nothing when off)
 		exit(0);
 		return true;
 		}
@@ -29105,6 +29582,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		while (OpenThreadCount>1) Sleep(1000);
+		SCStop("safequit:");
 		exit(0);
 		return true;
 		}

@@ -23,6 +23,11 @@
 // 20110407	mvh	Extended FlushPrivateProfileStringCache to reset timestamp
 //			Fixed that was reading beyond current section
 // 20191019	mvh     Attemp to fix buffer overrun when reading long entries
+// 20261026	mmd	Cache: a hit is copied with the caller's buffer length (cut and the same
+//			'trucated' line as a file read, instead of an unbounded strcpy) and inside
+//			the cache lock; a section, key or value that does not fit the cache arrays
+//			(64/64/1024) or a value cut to the caller's buffer is not cached (it is read
+//			from the file each time). Values that fit: results unchanged.
 
 int      gpps=0, gppstime=0;
 
@@ -56,6 +61,11 @@ int into_IniCache(const char *section, const char *in, char *value)
 	{ 
 	int i, sum, r;
 
+	// only what fits the fixed arrays is cached (else read from the file every time)
+	if (!section || !in || !value) return -1;
+	if (strlen(section) >= sizeof(IniSections[0]) || strlen(in) >= sizeof(IniCache[0]) ||
+	    strlen(value) >= sizeof(IniValues[0])) return -1;
+
 	const char *p = in;
 	sum = 0;
 	while(*p) sum+=*p++;
@@ -88,13 +98,16 @@ int into_IniCache(const char *section, const char *in, char *value)
 	return r;
   	}
 
-int isin_IniCache(const char *section, const char *in, char *file)
+// On a hit the value is copied to out (at most outlen-1 characters, NUL ended) while
+// the cache is locked; *len = its length as returned to the caller.
+int isin_IniCache(const char *section, const char *in, char *file, char *out, size_t outlen, size_t *len)
 	{
 	int i, sum;
 	const char *p = in;
 	struct stat statbuf;
 
 	if (IniTop==0 && IniBottom==0) return -1;
+	if (!section || !in || !out || !outlen) return -1;
 
 	sum = 0;
 	while(*p) sum+=*p++;
@@ -124,6 +137,15 @@ int isin_IniCache(const char *section, const char *in, char *file)
 		if (IniCheckSums[i] == sum)
 			if (strcmp(IniCache[i], in)==0 && strcmp(IniSections[i], section)==0)
 				{
+				size_t n = strlen(IniValues[i]);
+				if (n >= outlen)
+					{
+					n = outlen-1;
+					OperatorConsole.printf("***Ini file item '%s:%s' trucated\n", section, in);
+					}
+				memcpy(out, IniValues[i], n);
+				out[n] = 0;
+				*len = n;
 				LeaveCriticalSection(&IniCritical);
 				return i;
 				}
@@ -142,13 +164,15 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 	char *theIniFileName)			// pathname of ini file to search
 {
 	int i, t = time(NULL);
+	size_t cachedlen = 0;
+	BOOL truncated = FALSE;
 	gpps++;
 
-	// try to find it in the cache
-	if ((i = isin_IniCache(theSection, theKey, theIniFileName))>=0)
-	{ strcpy(theReturnBuffer, IniValues[i]);
+	// try to find it in the cache (copied with the caller's length)
+	if ((i = isin_IniCache(theSection, theKey, theIniFileName, theReturnBuffer, theReturnBufferLength, &cachedlen))>=0)
+	{
   	  gppstime += time(NULL)-t;
-	  return strlen(theReturnBuffer);
+	  return cachedlen;
 	}
 
 	FILE *aFile = theIniFileName ? fopen(theIniFileName, "r") : NULL;
@@ -322,6 +346,7 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 							aReturnLength += aLineLength;
 							if (aReturnLength >= theReturnBufferLength)
 							{
+								truncated = TRUE;	// not cached: a larger buffer must get it all
 								aReturnLength = theReturnBufferLength-1;
 								OperatorConsole.printf("***Ini file item '%s:%s' trucated\n", theSection, theKey);
 							}								
@@ -351,14 +376,16 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 			theReturnBufferLength : aLength;
 		strncpy(theReturnBuffer, theDefault, aLength);
 		theReturnBuffer[aLength - 1] = '\0';
-		// store into cache
-		into_IniCache(theSection, theKey, theReturnBuffer);
+		// store into cache (not a default that was cut to this buffer)
+		if (theDefault && strlen(theDefault) < theReturnBufferLength)
+			into_IniCache(theSection, theKey, theReturnBuffer);
                 gppstime += time(NULL)-t;
 		return aLength - 1;
 	}
 
-	// store into cache
-	into_IniCache(theSection, theKey, theReturnBuffer);
+	// store into cache (not a value that was cut to this buffer)
+	if (!truncated)
+		into_IniCache(theSection, theKey, theReturnBuffer);
 	gppstime += time(NULL)-t;
 	return aReturnLength > 0 ? aReturnLength - 1 : 0;
 }

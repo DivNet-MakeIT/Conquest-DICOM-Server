@@ -1291,11 +1291,13 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			accepted when enabled; event on new association was sent without data (writing empties 
 			the object: now a copy is written first) and now proposes the SCP role
 20261019	mmd	StorageCommitment: refuse N-ACTION (0x0124) from a calling AE that is not in acrnema.map
+20261026	mmd	Build variant line at startup and Lua buildvariant (version string unchanged)
 
 ENDOFUPDATEHISTORY
 */
 
 #define DGATE_VERSION "1.5.0g4"
+#define DGATE_BUILD_VARIANT "SC-in"	// storage commitment for incoming data
 
 //#define DO_LEAK_DETECTION	1
 //#define DO_VIOLATION_DETECTION	1
@@ -11752,6 +11754,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
 
 	      lua_setvar(PDU, "command_line",    b);      
               lua_setvar(PDU, "version",         DGATE_VERSION);
+              lua_setvar(PDU, "buildvariant",    DGATE_BUILD_VARIANT);
 	    }
             
 	    // note: threadnum not implemented
@@ -12869,6 +12872,7 @@ BOOL prefetchprocess(char *data, ExtendedPDU_Service *PDU, char *dum)
 
       lua_setvar(PDU, "command_line",    p+1);      
       lua_setvar(PDU, "version",         DGATE_VERSION);
+      lua_setvar(PDU, "buildvariant",    DGATE_BUILD_VARIANT);
       do_lua(&(PDU->L), script, &sd1);
     }
     else
@@ -15082,6 +15086,7 @@ ParseArgs (int	argc, char	*argv[], ExtendedPDU_Service *PDU)
 						globalPDU.SetLocalAddress ( (BYTE *)"global" );
 						globalPDU.SetRemoteAddress ( (BYTE *)"dolua" );
 						lua_setvar(&globalPDU, "version", DGATE_VERSION); // creates globalPDU.L if needed
+						lua_setvar(&globalPDU, "buildvariant", DGATE_BUILD_VARIANT);
 	  					lua_createtable   (globalPDU.L, 0, 0);
 						for (int i=0; i<argc; i++)
 							{
@@ -20806,6 +20811,7 @@ void lua_printserver(ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDat
 	if (lua[0])
 		{
 		lua_setvar(PDU, "version",      DGATE_VERSION);
+		lua_setvar(PDU, "buildvariant", DGATE_BUILD_VARIANT);
 		lua_setvar(PDU, "command_line", cmd);
 		struct scriptdata sd = {PDU, DCO, DDO, -1, NULL, NULL, NULL, NULL, NULL, 0, 0};
 		do_lua(&(PDU->L), lua, &sd);
@@ -22795,6 +22801,7 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 
 		lua_setvar(&PDU, "command_line",  SilentText+10);      
 		lua_setvar(&PDU, "version",       DGATE_VERSION);
+		lua_setvar(&PDU, "buildvariant",  DGATE_BUILD_VARIANT);
 
 		FILE *f;
 		if (f = fopen("lua/anonymize_script.lua", "rt"))
@@ -25911,6 +25918,7 @@ main ( int	argc, char	*argv[] )
   		globalPDU.ThreadNum = 0;
   	        struct scriptdata sd = {&globalPDU, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0};		
 		lua_setvar(&globalPDU, "version", DGATE_VERSION);
+		lua_setvar(&globalPDU, "buildvariant", DGATE_BUILD_VARIANT);
 		lua_createtable   (globalPDU.L, 0, 0);
 		for (int i=0; i<argc; i++)
 			{
@@ -25988,6 +25996,7 @@ main ( int	argc, char	*argv[] )
 				OperatorConsole.printf("DGATE (%s, build %s, bits %d) runs in non-threaded debug mode\n", DGATE_VERSION, TimeString, 8*sizeof(void *));
 			else
 				OperatorConsole.printf("DGATE (%s, build %s, bits %d) is running as threaded server\n", DGATE_VERSION, TimeString, 8*sizeof(void *));
+			OperatorConsole.printf("Build variant: %s (storage commitment for incoming data)\n", DGATE_BUILD_VARIANT);
 				
 			{
 			Database testDB;
@@ -28568,6 +28577,7 @@ windowname = AiViewer V1.00
       lua_setvar(&globalPDU, "port",            (char *)Port);
       lua_setvar(&globalPDU, "address",         ServerCommandAddress);
       lua_setvar(&globalPDU, "version",         DGATE_VERSION);
+      lua_setvar(&globalPDU, "buildvariant",    DGATE_BUILD_VARIANT);
 
       // still used in newweb
       lua_setvar(&globalPDU, "slice",           slice);
@@ -28658,6 +28668,7 @@ windowname = AiViewer V1.00
             lua_setvar(&globalPDU, "webscriptadress", WebScriptAddress);
             lua_setvar(&globalPDU, "extra",           extra);
             lua_setvar(&globalPDU, "version",         DGATE_VERSION);
+            lua_setvar(&globalPDU, "buildvariant",    DGATE_BUILD_VARIANT);
             lua_setvar(&globalPDU, "mode",            mode);
   	    lua_setvar(&globalPDU, "uploadedfile",    uploadedfile);
             

@@ -1402,6 +1402,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: the reconciliation of sc_unsafe_clear: makes every row of a
 			reconciled object CHANGED (Gen + 1), whatever its state (also FAILED, TIMEOUT, HELD,
 			CANCELLED: a late result could still make them COMMITTED); only CHANGED rows stay as they are
+20261026	mmd	Outgoing storage commitment: a fetch error (Database FetchError) is no longer taken for the
+			end of the rows where the reconciliation, sc_unsafe_clear:, sc_verify_now: and the confirmed
+			check read rows: the clear is refused, the verification answers 0 database error
 
 ENDOFUPDATEHISTORY
 */
@@ -1589,6 +1592,7 @@ int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a re
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
 int	SCTestFailDemote=0;				// TEST ONLY: 1 = the invalidation after a local overwrite counts as failed
+int	SCTestFailFetch=0;				// TEST ONLY: 1 = reconciliation, sc_unsafe_clear: and sc_verify_now: see a fetch error
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -23184,6 +23188,18 @@ static BOOL SCVRString(VR *vr, char *buf, int size)
 	return buf[0]!=0;
 	}
 
+// After a loop over DB.NextRecord(): did it stop on a fetch error rather than at the end of the rows?
+// (odbci FetchError; SCTestFailFetch, test only, simulates one in the reconciliation, the clear and
+// sc_verify_now:, which pass test = TRUE.) A console line names it.
+extern int SCTestFailFetch;
+static BOOL SCFetchFailed(Database &DB, const char *where, BOOL test)
+	{
+	if (!DB.FetchError && !(test && SCTestFailFetch)) return FALSE;
+	OperatorConsole.printf("*** Storage commitment: fetch error while reading rows (%s)%s\n", where,
+		DB.FetchError ? "" : " [SCTestFailFetch]");
+	return TRUE;
+	}
+
 // add column Gen (int, 0 for existing rows) to a table made by an earlier development build
 static BOOL SCAddGenColumn(Database &DB, const char *table, const char *probe)
 	{
@@ -23325,6 +23341,7 @@ static int SCLoadList(Database &DB, const char *tables, const char *column, cons
 			}
 		buf[0] = 0;
 		}
+	if (SCFetchFailed(DB, tables, FALSE)) return -1;
 	if (n>1)
 		{
 		qsort(*list, n, sizeof(SCListItem), SCListCompare);
@@ -24981,6 +24998,7 @@ void SCReadWorkerConfig(const char *root)
 	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
 	SCTestQueueMax          = SCIniInt(root, "SCTestQueueMax",          0,     0, SC_NOTEDMAX);
 	SCTestFailDemote        = SCIniInt(root, "SCTestFailDemote",        0,     0, 1);
+	SCTestFailFetch         = SCIniInt(root, "SCTestFailFetch",         0,     0, 1);
 	SCReadRetryInterval(root);
 	SCUnsafeFileConfig(root);
 	}
@@ -25985,6 +26003,7 @@ static int SCVerifyLocal(Database &DB, const char *StudyUID, SCVerifyObj **out)
 		if (!o[n-1].file) { r = SCV_DBERROR; goto fail; }
 		inst[0] = cls[0] = file[0] = dev[0] = 0;
 		}
+	if (SCFetchFailed(DB, "sc_verify_now: local objects", TRUE)) { r = SCV_DBERROR; goto fail; }
 	if (n>1) qsort(o, n, sizeof(SCVerifyObj), SCVerifyObjCompare);
 	for (i=1; i<n; i++)
 		if (strcmp(o[i-1].inst, o[i].inst)==0) { r = SCV_BAD; goto fail; }
@@ -27052,6 +27071,7 @@ static int SCReconcile(Database &DB)
 			}
 		inst[0] = last[0] = 0;
 		}
+	if (n>=0 && SCFetchFailed(DB, "reconciliation", TRUE)) { if (list) free(list); return -1; }
 	if (n<0) { if (list) free(list); OperatorConsole.printf("*** sc_unsafe_clear: rows with an invalid UID or out of memory\n"); return -1; }
 
 	for (i=0; i<n; i++)
@@ -27328,7 +27348,9 @@ static void SCUnsafeClearCommand(char *Response)
 		DB.BindField(1, SQL_C_CHAR, cnt, sizeof(cnt), &len);
 		while (DB.NextRecord()) ;
 		SCRunningPath(running, sizeof(running));
-		if (SCWorkerRunning && SCFileState(running)!=1 &&
+		if (SCFetchFailed(DB, "sc_unsafe_clear:", FALSE))
+			strcpy(Response, "refused: database not reachable (fetch error)");
+		else if (SCWorkerRunning && SCFileState(running)!=1 &&
 		    !SCDurableWrite(running, "running (made again by sc_unsafe_clear:)\n", FALSE))
 			strcpy(Response, "refused: the running marker cannot be written");
 		else if ((changed = SCReconcile(DB))<0)

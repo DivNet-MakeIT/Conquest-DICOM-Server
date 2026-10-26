@@ -44,6 +44,7 @@
 20230904   mvh   Updated for new postgres interface
 20260614   mvh   Started on SqLite backup
 20260620   mvh   Added blocks and delay parameters
+20261026   mmd   FetchError, FetchEnded: tell a fetch error from the end of the rows
 */
 
 
@@ -311,6 +312,13 @@ class	Database
 #endif
 
 	BOOL	Connected;
+
+	// NextRecord returned FALSE: FetchEnded when the rows of the last statement were all read,
+	// FetchError when something failed instead (no result, a row that could not be fetched).
+	// Both are reset by every SQL statement. Only read by callers that must not take an error
+	// for "no (more) rows" (outgoing storage commitment); nothing else changes.
+	BOOL	FetchError;
+	BOOL	FetchEnded;
 
 	// for built-in dbase support
         struct 	dbase_header *dbase_handles[20];

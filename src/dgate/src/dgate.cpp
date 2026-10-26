@@ -1313,6 +1313,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Study confirmed (outgoing storage commitment): computed live from the image table and
 			SCObject; server commands sc_confirmed: and sc_confirmed_list:, Lua scconfirmed(),
 			optional [lua] OutgoingSCStudyConfirmed hook when a result makes a study confirmed
+20261026	mmd	Outgoing TLS (build with HAVE_OPENSSL) to nodes with T in acrnema.map: forwards, C-MOVE
+			sub-associations, Lua dicomstore/dicomecho/dicomquery/dicommove/dicomget/dicomprint,
+			virtual server, grab, echo, storage commitment event; keys TLSCertificate, TLSPrivateKey,
+			TLSCAFile, TLSVerifyPeer, TLSMinVersion, TLSCipherList, TLSVerifyHostname, TLSPin_<AE>;
+			no plain fallback; a build without HAVE_OPENSSL refuses T nodes; others unchanged
 
 ENDOFUPDATEHISTORY
 */
@@ -6069,6 +6074,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
           PDU[part].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
     
+          PrepareTLSForAE(PDU[part], line+offset);
           if (!PDU[part].Connect((unsigned char *)&host, (unsigned char *)&port))
           { OperatorConsole.printf("*** ExportConverter%d.%d: Forward failed to connect to host %s\n", N, part, line+offset);
             delete DDO;
@@ -10511,6 +10517,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
         uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
         PDU[channel].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
   
+        PrepareTLSForAE(PDU[channel], line+offset);
         if (!PDU[channel].Connect((unsigned char *)&host, (unsigned char *)&port))
         { if (N >= -2) OperatorConsole.printf("*** %sConverter%d.%d: Forward failed to connect to host %s\n", ininame, N, channel, line+offset);
         }
@@ -12510,6 +12517,7 @@ static int DcmMove(const char *patid, char* pszSourceAE, char* pszDestinationAE,
 			OperatorConsole.printf("***preretrieve: AE not found: %s\n", pszSourceAE);
 			return 1; 	// wrong address no retry
 			}
+		PrepareTLSForAE(PDU, pszSourceAE);
 		if(!PDU.Connect(host, port)) 
 			{
 			OperatorConsole.printf("***preretrieve: could not connect to AE: %s\n", pszSourceAE);
@@ -12741,6 +12749,7 @@ char *DcmMove2(char* pszSourceAE, const char* pszDestinationAE, BOOL patroot, in
 			strcpy(retvalue, StatusString);
 			return retvalue;
 			}
+		PrepareTLSForAE(PDU, pszSourceAE);
 		if(!PDU.Connect(host, port)) 
 			{
 			OperatorConsole.printf("***dicommove: could not connect to AE: %s\n", pszSourceAE);
@@ -16161,6 +16170,7 @@ int VirtualQuery(DICOMDataObject *DDO, const char *Level, int N, Array < DICOMDa
 	PDU.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
+	PrepareTLSForAE(PDU, AE);
 	if(!PDU.Connect(ip, port))
 		{
 		OperatorConsole.printf("*** Virtual query - failed to connect for C-FIND to %s\n", AE);
@@ -19142,6 +19152,7 @@ BOOL VirtualServer2(struct ReadAheadThreadData *ratd, int N)
         PDU2.SetTimeOut(TCPIPTimeOut);
 
 	// Make association for MOVE on port/ip
+	PrepareTLSForAE(PDU2, AE);
 	if(!PDU2.Connect(ip, port))
 		{
 		PDU2.Close();
@@ -20081,6 +20092,404 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 	return(::RetrieveOn(DDOMask, DDOOutPtr,SStorage,RTCStorage, pDCO, pADDO, ExtraBytes)); // 20100227: pass DCO: used in %s for RetrieveResultConverter
 	}
 
+////////////////////////////////////////////////////////////////////////////////
+// Outgoing DICOM TLS (20261026 mmd). Nodes with T in the 5th column of
+// acrnema.map are connected with TLS; every other connection stays exactly as
+// before. A failed handshake or certificate check is a failed connection: there
+// is never a plain fallback. A dgate built without HAVE_OPENSSL refuses T nodes.
+// Incoming TLS is not part of this step.
+//
+// dicom.ini [sscscp] keys (all optional). The first five are read when the first
+// TLS connection is made (a change needs a restart); TLSVerifyHostname and
+// TLSPin_<AE> are read for every TLS connection.
+//   TLSCertificate     our certificate (PEM, chain allowed), also sent as client certificate
+//   TLSPrivateKey      its key (PEM); default: the TLSCertificate file
+//   TLSCAFile          trusted CA or peer certificates (PEM); needed unless TLSVerifyPeer = ignore
+//   TLSVerifyPeer      require (default) | verify | ignore; for outgoing connections
+//                      require and verify are the same (a server always sends a certificate)
+//   TLSMinVersion      1.2 (default) | 1.3; TLS 1.1 and lower are never used
+//   TLSCipherList      TLS 1.2 cipher suites; can only narrow the default list (RFC 9325:
+//                      ECDHE with AES-GCM or CHACHA20-POLY1305). TLS 1.3: OpenSSL defaults
+//   TLSVerifyHostname  0 (default) | 1: the certificate (SAN) must match the host name or IP
+//                      address of the node in acrnema.map
+//   TLSPin_<AE>        one or two SHA-256 certificate fingerprints for node AE (hex, colons
+//                      optional, comma separated); when set, the certificate must match one
+////////////////////////////////////////////////////////////////////////////////
+
+// Set the transport of PDU for a connection to the map entry E: TLS when E has
+// T in acrnema.map, else plain (as before). E.Name must be the called AE title
+// (it selects TLSPin_<AE>). Returns FALSE when the node needs TLS and this dgate
+// has no TLS support; Connect then refuses the connection (never plain).
+// For the storage commitment worker: call it with the map entry before Connect.
+BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
+	{
+	if (!(E.Flags & ACR_TLS))
+		return PDU.SetTLS(0, NULL);
+	return PDU.SetTLS(1, E.Name);
+	}
+
+// The same for a destination given by its AE title, as the connect sites use it
+// after GetACRNema. An AE that is not in the map (e.g. host:port) stays plain.
+BOOL	PrepareTLSForAE(PDU_Service &PDU, const char *AE)
+	{
+	ACRNemaAddress	E;
+	char		ae[20];
+
+	if (!AE)
+		return PDU.SetTLS(0, NULL);
+	memset(ae, 0, sizeof(ae));
+	strncpy(ae, AE, sizeof(ae)-1);
+	while (ae[0] && ae[strlen(ae)-1]==' ')
+		ae[strlen(ae)-1] = 0;
+	if (!GetACRNemaEntryByAE(ae, &E))
+		return PDU.SetTLS(0, NULL);
+	strcpy(E.Name, ae);		// a wildcard entry: the pin key uses the called AE
+	return SCPrepareTLS(PDU, E);
+	}
+
+// TLS lines from the socket layer go to the operator console or the debug log
+static	void	TLSLogLine(int level, const char *text)
+	{
+	if (level==0)
+		OperatorConsole.printf("%s\n", text);
+	else
+		SystemDebug.printf("%s\n", text);
+	}
+
+#ifdef	HAVE_OPENSSL
+#	include	<openssl/ssl.h>
+#	include	<openssl/err.h>
+#	include	<openssl/evp.h>
+#	include	<openssl/x509v3.h>
+
+// RFC 9325 for TLS 1.2: only ECDHE with AES-GCM or CHACHA20-POLY1305
+#define	TLS_DEFAULT_CIPHERS	"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" \
+				"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" \
+				"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+
+static	CRITICAL_SECTION	TLSCtxCritical;
+static	struct	TLSCtxCriticalInit
+	{
+	TLSCtxCriticalInit() { InitializeCriticalSection(&TLSCtxCritical); }
+	}	TLSCtxCriticalInitObject;
+static	SSL_CTX	*TLSClientCtx = NULL;		// made once, on the first TLS connection
+static	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore
+
+// the dicom.ini section with the server settings
+static	void	TLSIniSection(char *sc)
+	{
+	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, 64, ConfigFile);
+	}
+
+// the last OpenSSL error as text
+static	const char *TLSErrorText(char *buf, int len)
+	{
+	unsigned long	e = ERR_peek_last_error();
+	if (e) ERR_error_string_n(e, buf, len);
+	else   snprintf(buf, len, "unknown error");
+	ERR_clear_error();
+	return buf;
+	}
+
+// Set the TLS 1.2 cipher suites: the default list, or the TLSCipherList entries
+// that are also in the default list (others are dropped with a warning).
+static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
+	{
+	char	keep[1024], dropped[1024], allowed[1024], item[128], err[256];
+	const char	*name;
+	STACK_OF(SSL_CIPHER)	*sk;
+	int	i;
+
+	if (!wanted[0])
+		{
+		if (SSL_CTX_set_cipher_list(ctx, TLS_DEFAULT_CIPHERS)==1) return TRUE;
+		OperatorConsole.printf("*** TLS: default cipher list not accepted: %s\n", TLSErrorText(err, sizeof(err)));
+		return FALSE;
+		}
+	if (SSL_CTX_set_cipher_list(ctx, wanted)!=1)
+		{
+		OperatorConsole.printf("*** TLS: TLSCipherList not usable: %s\n", TLSErrorText(err, sizeof(err)));
+		return FALSE;
+		}
+
+	snprintf(allowed, sizeof(allowed), ":%s:", TLS_DEFAULT_CIPHERS);
+	keep[0] = dropped[0] = 0;
+	sk = SSL_CTX_get_ciphers(ctx);
+	for (i=0; sk && i<sk_SSL_CIPHER_num(sk); i++)
+		{
+		name = SSL_CIPHER_get_name(sk_SSL_CIPHER_value(sk, i));
+		if (!name || strncmp(name, "TLS_", 4)==0) continue;	// TLS 1.3 suites: set apart
+		snprintf(item, sizeof(item), ":%s:", name);
+		if (strstr(allowed, item))
+			{ if (keep[0]) strncat(keep, ":", sizeof(keep)-strlen(keep)-1); strncat(keep, name, sizeof(keep)-strlen(keep)-1); }
+		else
+			{ if (dropped[0]) strncat(dropped, ":", sizeof(dropped)-strlen(dropped)-1); strncat(dropped, name, sizeof(dropped)-strlen(dropped)-1); }
+		}
+	if (dropped[0])
+		OperatorConsole.printf("*** TLS: TLSCipherList entries below the minimum are ignored: %s\n", dropped);
+	if (!keep[0])
+		{
+		if (minversion >= TLS1_3_VERSION) return TRUE;	// TLS 1.2 is not used anyway
+		OperatorConsole.printf("*** TLS: TLSCipherList leaves no allowed TLS 1.2 cipher\n");
+		return FALSE;
+		}
+	if (SSL_CTX_set_cipher_list(ctx, keep)!=1)
+		{
+		OperatorConsole.printf("*** TLS: cipher list not accepted: %s\n", TLSErrorText(err, sizeof(err)));
+		return FALSE;
+		}
+	return TRUE;
+	}
+
+// Make the client SSL_CTX from dicom.ini. Returns NULL (with a console line) on
+// any configuration problem, so that T nodes are refused rather than half secured.
+static	SSL_CTX	*TLSMakeClientContext(void)
+	{
+	char	sc[64], cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
+	SSL_CTX	*ctx;
+	int	minversion = TLS1_2_VERSION;
+
+	TLSIniSection(sc);
+	MyGetPrivateProfileString(sc, "TLSCertificate", "", cert, sizeof(cert), ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSPrivateKey", "", key, sizeof(key), ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSCAFile", "", ca, sizeof(ca), ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSVerifyPeer", "require", verify, sizeof(verify), ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSMinVersion", "1.2", minv, sizeof(minv), ConfigFile);
+	MyGetPrivateProfileString(sc, "TLSCipherList", "", ciphers, sizeof(ciphers), ConfigFile);
+
+	if      (stricmp(verify, "require")==0) TLSVerifyMode = 2;
+	else if (stricmp(verify, "verify")==0)  TLSVerifyMode = 1;
+	else if (stricmp(verify, "ignore")==0)  TLSVerifyMode = 0;
+	else
+		{
+		OperatorConsole.printf("*** TLS: TLSVerifyPeer = %s not known, using require\n", verify);
+		TLSVerifyMode = 2;
+		}
+
+	if (strcmp(minv, "1.3")==0)
+		minversion = TLS1_3_VERSION;
+	else if (strcmp(minv, "1.2")!=0)
+		OperatorConsole.printf("*** TLS: TLSMinVersion = %s not supported, using 1.2\n", minv);
+
+	ctx = SSL_CTX_new(TLS_client_method());
+	if (!ctx)
+		{
+		OperatorConsole.printf("*** TLS: cannot create client context: %s\n", TLSErrorText(err, sizeof(err)));
+		return NULL;
+		}
+	if (SSL_CTX_set_min_proto_version(ctx, minversion)!=1)
+		{
+		OperatorConsole.printf("*** TLS: cannot set minimum version: %s\n", TLSErrorText(err, sizeof(err)));
+		SSL_CTX_free(ctx);
+		return NULL;
+		}
+	SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+	if (!TLSSetCiphers(ctx, ciphers, minversion))
+		{
+		SSL_CTX_free(ctx);
+		return NULL;
+		}
+
+	if (cert[0])
+		{
+		if (SSL_CTX_use_certificate_chain_file(ctx, cert)!=1 ||
+		    SSL_CTX_use_PrivateKey_file(ctx, key[0] ? key : cert, SSL_FILETYPE_PEM)!=1 ||
+		    SSL_CTX_check_private_key(ctx)!=1)
+			{
+			OperatorConsole.printf("*** TLS: TLSCertificate/TLSPrivateKey not usable: %s\n", TLSErrorText(err, sizeof(err)));
+			SSL_CTX_free(ctx);
+			return NULL;
+			}
+		}
+	else
+		SystemDebug.printf("TLS: no TLSCertificate, no client certificate is sent\n");
+
+	if (ca[0])
+		{
+		if (SSL_CTX_load_verify_locations(ctx, ca, NULL)!=1)
+			{
+			OperatorConsole.printf("*** TLS: TLSCAFile %s not usable: %s\n", ca, TLSErrorText(err, sizeof(err)));
+			SSL_CTX_free(ctx);
+			return NULL;
+			}
+		}
+	else if (TLSVerifyMode)
+		{
+		OperatorConsole.printf("*** TLS: TLSCAFile is needed unless TLSVerifyPeer = ignore\n");
+		SSL_CTX_free(ctx);
+		return NULL;
+		}
+
+	SSL_CTX_set_verify(ctx, TLSVerifyMode ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+	if (!TLSVerifyMode)
+		OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: server certificates are not verified\n");
+	OperatorConsole.printf("TLS: client context ready (minimum TLS %s, verify %s)\n", minversion==TLS1_3_VERSION ? "1.3" : "1.2",
+		TLSVerifyMode==2 ? "require" : TLSVerifyMode==1 ? "verify" : "ignore");
+	return ctx;
+	}
+
+// Socket hook: the client SSL_CTX, made once under a lock (retried while it fails)
+static	void	*TLSClientContext(void)
+	{
+	SSL_CTX	*ctx;
+	EnterCriticalSection(&TLSCtxCritical);
+	if (!TLSClientCtx)
+		TLSClientCtx = TLSMakeClientContext();
+	ctx = TLSClientCtx;
+	LeaveCriticalSection(&TLSCtxCritical);
+	return ctx;
+	}
+
+// Once per node and process: a TLS node with neither TLSPin_<AE> nor TLSVerifyHostname
+// is accepted on any certificate from TLSCAFile, so that file should hold a dedicated
+// DICOM CA (or the node certificates) only
+static	void	TLSWarnUnbound(const char *AE)
+	{
+	static char	warned[64][20];
+	static int	nwarned = 0;
+	for (int i=0; i<nwarned; i++) if (strcmp(warned[i], AE)==0) return;
+	if (nwarned<64) { strncpy(warned[nwarned], AE, 19); warned[nwarned][19] = 0; nwarned++; }
+	OperatorConsole.printf("*** TLS: %s is accepted on any certificate signed by a CA in TLSCAFile (no TLSPin_%s, TLSVerifyHostname = 0); use a dedicated DICOM CA or set a pin\n", AE, AE);
+	}
+
+// TLSVerifyHostname from dicom.ini
+static	BOOL	TLSHostnameCheckOn(void)
+	{
+	char	sc[64], tmp[32];
+	TLSIniSection(sc);
+	MyGetPrivateProfileString(sc, "TLSVerifyHostname", "0", tmp, sizeof(tmp), ConfigFile);
+	return atoi(tmp)!=0;
+	}
+
+// Socket hook before the handshake: with TLSVerifyHostname = 1 the certificate
+// verification also requires the host name or IP address of the node (SAN)
+static	BOOL	TLSBeforeHandshake(void *s, const char *AE, const char *host)
+	{
+	SSL			*ssl = (SSL *) s;
+	X509_VERIFY_PARAM	*p;
+
+	if (!TLSHostnameCheckOn())
+		return TRUE;
+	p = SSL_get0_param(ssl);
+	X509_VERIFY_PARAM_set_hostflags(p, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+	if (X509_VERIFY_PARAM_set1_ip_asc(p, host)==1)		// numeric IPv4 or IPv6 address
+		return TRUE;
+	if (X509_VERIFY_PARAM_set1_host(p, host, 0)==1)
+		return TRUE;
+	OperatorConsole.printf("*** TLS: cannot check host name %s for %s; connection refused\n", host, AE);
+	return FALSE;
+	}
+
+// TRUE when the certificate matches host (IP address or DNS name in the SAN)
+static	BOOL	TLSCertMatchesHost(X509 *cert, const char *host)
+	{
+	int	r = X509_check_ip_asc(cert, host, 0);
+	if (r == -2)						// not an IP address
+		r = X509_check_host(cert, host, 0, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, NULL);
+	return r == 1;
+	}
+
+// Socket hook after the handshake: the host name check when certificates are not
+// verified (TLSVerifyPeer = ignore), and the certificate pin TLSPin_<AE>
+static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
+	{
+	SSL		*ssl = (SSL *) s;
+	X509		*cert;
+	char		sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1], pin[2*EVP_MAX_MD_SIZE+1];
+	unsigned char	md[EVP_MAX_MD_SIZE];
+	unsigned int	n = 0, i;
+	int		k, good = 0;
+	const char	*q;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	cert = SSL_get1_peer_certificate(ssl);
+#else
+	cert = SSL_get_peer_certificate(ssl);
+#endif
+
+	if (!TLSVerifyMode && TLSHostnameCheckOn() && (!cert || !TLSCertMatchesHost(cert, host)))
+		{
+		OperatorConsole.printf("*** TLS: certificate of %s does not match host %s; connection refused\n", AE, host);
+		if (cert) X509_free(cert);
+		return FALSE;
+		}
+
+	TLSIniSection(sc);
+	snprintf(key, sizeof(key), "TLSPin_%s", AE);
+	MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+	if (!pins[0])
+		{
+		// identity then rests on TLSCAFile alone: say so once per node
+		if (!TLSHostnameCheckOn()) TLSWarnUnbound(AE);
+		if (cert) X509_free(cert);
+		return TRUE;
+		}
+
+	if (!cert || X509_digest(cert, EVP_sha256(), md, &n)!=1)
+		{
+		OperatorConsole.printf("*** TLS: no certificate of %s to compare with %s; connection refused\n", AE, key);
+		if (cert) X509_free(cert);
+		return FALSE;
+		}
+	X509_free(cert);
+	for (i=0; i<n; i++)
+		sprintf(hex+2*i, "%02x", md[i]);
+	hex[2*n] = 0;
+
+	// compare with each comma separated fingerprint (colons and blanks ignored)
+	q = pins;
+	while (*q)
+		{
+		k = 0;
+		while (*q && *q!=',')
+			{
+			if (isxdigit((unsigned char)*q) && k < (int)sizeof(pin)-1)
+				pin[k++] = tolower((unsigned char)*q);
+			else if (*q!=':' && *q!=' ' && *q!='\t')
+				k = sizeof(pin);		// not a fingerprint
+			q++;
+			}
+		if (*q==',') q++;
+		if (k == (int)(2*n))
+			{
+			pin[k] = 0;
+			if (strcmp(pin, hex)==0) good = 1;
+			}
+		else if (k)
+			OperatorConsole.printf("*** TLS: %s contains an entry that is not a SHA-256 fingerprint\n", key);
+		}
+
+	if (!good)
+		{
+		OperatorConsole.printf("*** TLS: certificate of %s (%s) does not match %s (its SHA-256 is %s); connection refused\n", AE, host, key, hex);
+		return FALSE;
+		}
+	SystemDebug.printf("TLS: certificate of %s matches %s\n", AE, key);
+	return TRUE;
+	}
+
+// install the socket hooks before main() runs
+static	struct	TLSHooksInit
+	{
+	TLSHooksInit()
+		{
+		SocketTLS.ClientContext   = TLSClientContext;
+		SocketTLS.BeforeHandshake = TLSBeforeHandshake;
+		SocketTLS.AfterHandshake  = TLSAfterHandshake;
+		SocketTLS.Log             = TLSLogLine;
+		}
+	}	TLSHooksInitObject;
+
+#else
+
+// without OpenSSL only the log hook: the refusal of T nodes reaches the console
+static	struct	TLSHooksInit
+	{
+	TLSHooksInit() { SocketTLS.Log = TLSLogLine; }
+	}	TLSHooksInitObject;
+
+#endif
+
 BOOL
 QualifyOn(
 	BYTE	*ACRNema,
@@ -20593,6 +21002,7 @@ void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Ser
   PDU2.AddAbstractSyntax ( iUID );
   PDU2.SetTimeOut(TCPIPTimeOut);
 
+  PrepareTLSForAE(PDU2, server);
   if (!PDU2.Connect((unsigned char *)&host, (unsigned char *)&port))
   { OperatorConsole.printf("*** Test forward: Forward failed to connect to host %s\n", server);
     delete pDDO;
@@ -21570,6 +21980,7 @@ BOOL StorageApp ::	StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMComma
 		PDU2.SetTimeOut(TCPIPTimeOut);
 
 		// Make new association for EVENT on port/ip
+		PrepareTLSForAE(PDU2, Calling);
 		if(!PDU2.Connect(ip, port))
 			{
 			OperatorConsole.printf("*** Storage commitment - failed to reconnect to %s (%s %s) for N-EVENT\n", Calling, ip, port);
@@ -23220,6 +23631,11 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	PDU.AddAbstractSyntax(uid);		// refuses only the commitment class still accepts the
 	PDU.SetTimeOut(TCPIPTimeOut);		// association, so that case is told from a failed connect
 
+	// TLS when the node has T (Connect refuses, never plain, when TLS cannot be used)
+	ACRNemaAddress EE = *E;
+	strcpy(EE.Name, called);
+	SCPrepareTLS(PDU, EE);
+
 	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
 		{
 		OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
@@ -23323,13 +23739,15 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 	n = k;
 	if (n==0) return SC_CHUNK_DONE;
 
-	// never plain text to a node with T; TLS is not available in this version
+	// never plain text to a node with T: without TLS support in this build, ask nothing
+#ifndef HAVE_OPENSSL
 	if (tls)
 		{
 		if (SCWarnOnce(warntls, &nwarntls, ae))
-			OperatorConsole.printf("*** Storage commitment: %s has T in acrnema.map; TLS is not available, no request sent (objects stay NOTED)\n", ae);
+			OperatorConsole.printf("*** Storage commitment: %s has T in acrnema.map but this dgate was built without TLS; no request sent (objects stay NOTED)\n", ae);
 		return SC_CHUNK_STOP;
 		}
+#endif
 
 	if (!SCNewTxUID(TxUID))
 		{
@@ -28074,6 +28492,7 @@ BOOL GrabImagesFromServer(BYTE *calledae, const char *studydate, char *destinati
         PDU2.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
+	PrepareTLSForAE(PDU, (char *)calledae);
 	if(!PDU.Connect(ip, port))
 		{
 		OperatorConsole.printf("*** Grab - failed to connect for C-FIND\n");
@@ -28081,6 +28500,7 @@ BOOL GrabImagesFromServer(BYTE *calledae, const char *studydate, char *destinati
 		}
 
 	// Make the association for the MOVE on port/ip
+	PrepareTLSForAE(PDU2, (char *)calledae);
 	if(!PDU2.Connect(ip, port))
 		{
 		PDU.Close();
@@ -28465,6 +28885,7 @@ static BOOL DcmEcho(const char *AE)
 	if(!GetACRNema((char *)AE, (char *)host, (char *)port, (char *)compr)) 
 		return FALSE;
 	
+	PrepareTLSForAE(PDU, AE);
 	if(!PDU.Connect(host, port))
 		return ( FALSE );
 	
@@ -31143,6 +31564,7 @@ char *heapinfo( void )
 	PDU.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
+	PrepareTLSForAE(PDU, ae);
 	if(!PDU.Connect(ip, port))
 		return ( 0 );
 
@@ -31384,6 +31806,7 @@ static int PrintGrayScaleImages (
 	if (atoi(callback)) 
 	   Progress.printf("Process=%d, Type='dicomprint', Active=1\n", atoi(callback));
 
+	PrepareTLSForAE(PDU, (char *)RemoteAE);
 	if(!PDU.Connect((BYTE *)RemoteHost, (BYTE *)RemotePort))
 		{
 		if (atoi(callback)) 
@@ -31917,6 +32340,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	PDU.SetTimeOut(TCPIPTimeOut);
 
 	// Make the association for the FIND on port/ip
+	PrepareTLSForAE(PDU, ae);
 	if(!PDU.Connect(ip, port))
 	  return ( 0 );
 
@@ -31972,6 +32396,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	PDU.SetRequestedCompressionType("");
 
 	// Make the association for the GET on port/ip
+	PrepareTLSForAE(PDU, ae);
 	if(!PDU.Connect(ip, port))
         { delete P;
           delete P2;
@@ -32062,6 +32487,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
 	uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
         PDU.AddAbstractSyntax(uid);		// assures connect will not 
 
+	PrepareTLSForAE(PDU, ae);
 	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
         { OperatorConsole.printf("*** dicomstore: failed to connect to host %s\n", ae);
           lua_pushstring(L, "Failed to connect to host");
@@ -32157,6 +32583,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
       strcpy((char *)compr, "UN");
     }
     
+    PrepareTLSForAE(PDU, ae);
     if(!PDU.Connect(host, port))
     	return ( FALSE );
     

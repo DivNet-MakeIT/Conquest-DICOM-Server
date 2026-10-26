@@ -25,6 +25,10 @@
 20250701	mvh	Added error messages and connection retries
 20250702	mvh	Fixed connection retry for Linux; fix small mistake
 20260912	mvh	Corrected dates in update
+20261026	mmd	Outgoing TLS behind HAVE_OPENSSL (SetTLS before Open): handshake after
+			connect with a time limit, full write loop, read uses data buffered in
+			OpenSSL before select(), bounded close_notify. Never falls back to plain;
+			without HAVE_OPENSSL a TLS connection is refused. Plain sockets unchanged.
 
 */
 
@@ -70,6 +74,33 @@
 #       include <unistd.h> //DUCKHEAD92
 #endif
 
+#	include	<stdarg.h>
+#ifdef	HAVE_OPENSSL
+#	include	<openssl/ssl.h>
+#	include	<openssl/err.h>
+#	include	<time.h>
+#ifndef	WINDOWS
+#	include	<fcntl.h>
+#endif
+#endif
+
+// outgoing TLS hooks, set by the application (all NULL: TLS is refused)
+SocketTLSHooks	SocketTLS = { NULL, NULL, NULL, NULL };
+
+// TLS message to the application log (level 0 operator, 1 debug)
+static	void	SocketTLSPrint(int level, const char *fmt, ...)
+	{
+	char	text[512];
+	va_list	args;
+	va_start(args, fmt);
+	vsnprintf(text, sizeof(text), fmt, args);
+	va_end(args);
+	if (SocketTLS.Log)
+		SocketTLS.Log(level, text);
+	else if (level==0)
+		fprintf(stderr, "%s\n", text);
+	}
+
 
 #ifdef	WINDOWS
 #define SD_BOTH         0x02		/* From winsock2.h */
@@ -106,10 +137,15 @@ Socket	::	Socket ()
 	ListenSocketfd = 0;
 	Connected = 0;
 	Listened = 0;
+	TLSHandle = NULL;
+	TLSMode = 0;
+	TLSPeerAE[0] = 0;
 	}
 
 Socket	::	~Socket ()
 	{
+	if ( TLSHandle )
+		TLSFree(TRUE);
 
 	if( ! WinSockUsed )
 		return;	// must have failed installation
@@ -170,10 +206,17 @@ Socket	::	Socket()
     sa(),
     hes(),
     servs(),
-    TimeOut(300) {}	// 5 minutes
+    TimeOut(300) 	// 5 minutes
+	{
+	TLSHandle = NULL;
+	TLSMode = 0;
+	TLSPeerAE[0] = 0;
+	}
 
 Socket	::	~Socket()
 	{
+	if ( TLSHandle )
+		TLSFree(TRUE);
 	if ( Socketfd )
 		{
 		closesocket(Socketfd);
@@ -377,10 +420,30 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 	struct	servent		secopy;
 	struct	linger		Linger;
 
+	if ( TLSHandle )
+		TLSFree(TRUE);
 	if ( Socketfd )
 		closesocket(Socketfd);
 
 	Connected = 0;
+
+#ifndef	HAVE_OPENSSL
+	if ( TLSMode )
+		{
+		// the node needs TLS: never connect plain instead
+		Socketfd = 0;
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: this dgate was built without TLS support", TLSPeerAE, ip);
+		return ( FALSE );
+		}
+#else
+	if ( TLSMode && !(SocketTLS.ClientContext && SocketTLS.ClientContext()) )
+		{
+		// TLS configuration not usable: do not even connect
+		Socketfd = 0;
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: no usable TLS client configuration", TLSPeerAE, ip);
+		return ( FALSE );
+		}
+#endif
 
 	he = Gethostbyname(ip);
 	
@@ -433,6 +496,14 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 		if( ! Error )
 			{
 			Connected = TRUE;
+			if ( TLSMode && !TLSOpen(ip) )
+				{
+				// failed handshake or certificate check: no plain fallback
+				closesocket(Socketfd);
+				Socketfd = 0;
+				Connected = FALSE;
+				return ( FALSE );
+				}
 			return ( TRUE );
 			}
 #ifdef	WINDOWS
@@ -459,6 +530,8 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 BOOL	Socket	::	Close()
 	{
 
+	if(TLSHandle)
+		TLSFree(TRUE);
 
 	if(ListenSocketfd)
 		{
@@ -487,6 +560,10 @@ BOOL	Socket	::	Poll(void)
 
 	if ( ! Connected )
 		return ( FALSE );
+#ifdef	HAVE_OPENSSL
+	if ( TLSHandle && SSL_pending((SSL *)TLSHandle) > 0 )
+		return ( TRUE );	// decrypted data waiting inside OpenSSL
+#endif
 #ifdef	MAC
 	memset((void*)&fds, 0, sizeof(struct fd_set));
 #else
@@ -501,6 +578,10 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	{
 	if ( !Connected)
 		return ( 0 );
+#ifdef	HAVE_OPENSSL
+	if ( TLSHandle )
+		return ( TLSSend(s, count) );
+#endif
 	
 	if(send ( Socketfd, (char *) s, count, 0)<0)
 		{
@@ -514,6 +595,10 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
         struct timespec t;
 	if ( !Connected)
 		return ( 0 );
+#ifdef	HAVE_OPENSSL
+	if ( TLSHandle )
+		return ( TLSSend(s, count) );
+#endif
 		
         t.tv_sec =0;
         t.tv_nsec=1000000;
@@ -552,6 +637,10 @@ INT	Socket	::	ReadBinary(BYTE *s, UINT	count)
 
 	if ( ! Connected )
 		return ( -1 );
+#ifdef	HAVE_OPENSSL
+	if ( TLSHandle )
+		return ( TLSRead(s, count) );
+#endif
 #ifdef	MAC
 	memset((void*)&fds, 0, sizeof(struct fd_set));
 #else
@@ -703,6 +792,282 @@ Socket	::	 BindUDPClient (
 	Socketfd = 0;
 	return ( FALSE );
 	}
+
+// Ask for TLS (on=1) or plain (on=0) on the next Open; AE is the node being
+// connected (used for its certificate checks). Returns FALSE when TLS is asked
+// for and this build has no TLS: Open will then refuse the connection.
+BOOL	Socket	::	SetTLS(int on, const char *AE)
+	{
+	TLSMode = on ? 1 : 0;
+	memset(TLSPeerAE, 0, sizeof(TLSPeerAE));
+	if (AE)
+		strncpy(TLSPeerAE, AE, sizeof(TLSPeerAE)-1);
+#ifdef	HAVE_OPENSSL
+	return ( TRUE );
+#else
+	return ( !TLSMode );
+#endif
+	}
+
+#ifdef	HAVE_OPENSSL
+
+#define	TLS_HANDSHAKE_SECONDS	30	// limit for the TLS handshake
+#define	TLS_CLOSE_SECONDS	2	// limit for sending close_notify
+
+// Wait until the socket can be read (ForWrite=0) or written (ForWrite=1).
+// Returns 1 when ready, 0 on timeout, -1 on error.
+int	Socket	::	TLSWait(int ForWrite, int Seconds)
+	{
+	fd_set		fds;
+	struct	timeval	tv;
+	time_t		end = time(NULL) + Seconds;
+	int		left, r;
+
+	for (;;)
+		{
+		left = (int)(end - time(NULL));
+		if (left < 0) left = 0;
+		tv.tv_sec = left;
+		tv.tv_usec = 0;
+		FD_ZERO(&fds);
+		FD_SET(Socketfd, &fds);
+		r = select(Socketfd + 1, ForWrite ? NULL : &fds, ForWrite ? &fds : NULL, NULL, &tv);
+		if (r > 0) return 1;
+		if (r == 0) return 0;
+#ifndef	WINDOWS
+		if (errno == EINTR && left > 0) continue;
+#endif
+		return -1;
+		}
+	}
+
+// Text of the last TLS error, with the certificate verification result if that failed
+static	void	SocketTLSErrorText(SSL *ssl, int e, char *buf, int len)
+	{
+	long	v = SSL_get_verify_result(ssl);
+	unsigned long	err = ERR_peek_last_error();
+
+	if (v != X509_V_OK)
+		snprintf(buf, len, "certificate verification failed: %s", X509_verify_cert_error_string(v));
+	else if (err)
+		ERR_error_string_n(err, buf, len);
+	else if (e == SSL_ERROR_ZERO_RETURN)
+		snprintf(buf, len, "closed by peer");
+	else
+		snprintf(buf, len, "TLS error %d (connection closed or reset)", e);
+	}
+
+// TLS handshake on the connected socket (client side), with a time limit and
+// the application's certificate checks. On failure the SSL object is freed and
+// FALSE returned; the caller closes the socket.
+BOOL	Socket	::	TLSOpen(char *host)
+	{
+	SSL_CTX	*ctx;
+	SSL	*ssl;
+	char	why[256];
+	int	limit, r, e, w, left;
+	time_t	end;
+	BOOL	isname = FALSE;
+
+	ctx = SocketTLS.ClientContext ? (SSL_CTX *) SocketTLS.ClientContext() : NULL;
+	if (!ctx)
+		{
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: no usable TLS client configuration", TLSPeerAE, host);
+		return ( FALSE );
+		}
+	ssl = SSL_new(ctx);
+	if (!ssl)
+		{
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: SSL_new failed", TLSPeerAE, host);
+		return ( FALSE );
+		}
+
+	// non-blocking from here: every wait below has a time limit
+#ifdef	WINDOWS
+	u_long	nb = 1;
+	ioctlsocket(Socketfd, FIONBIO, &nb);
+#else
+	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+	SSL_set_fd(ssl, Socketfd);
+	SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+	TLSHandle = ssl;
+
+	// server name indication only for host names, not for IP addresses
+	for (int i=0; host[i]; i++)
+		if ((host[i]<'0' || host[i]>'9') && host[i]!='.' && host[i]!=':')
+			isname = TRUE;
+	if (isname)
+		SSL_set_tlsext_host_name(ssl, host);
+
+	if (SocketTLS.BeforeHandshake && !SocketTLS.BeforeHandshake(ssl, TLSPeerAE, host))
+		{
+		SSL_set_quiet_shutdown(ssl, 1);
+		TLSFree(FALSE);
+		return ( FALSE );
+		}
+
+	limit = TLS_HANDSHAKE_SECONDS;
+	if (TimeOut > 0 && TimeOut < limit)
+		limit = TimeOut;
+	end = time(NULL) + limit;
+	for (;;)
+		{
+		ERR_clear_error();
+		r = SSL_connect(ssl);
+		if (r == 1)
+			break;
+		e = SSL_get_error(ssl, r);
+		if (e == SSL_ERROR_WANT_READ) w = 0;
+		else if (e == SSL_ERROR_WANT_WRITE) w = 1;
+		else
+			{
+			SocketTLSErrorText(ssl, e, why, sizeof(why));
+			SocketTLSPrint(0, "*** TLS: handshake with %s (%s) failed: %s", TLSPeerAE, host, why);
+			SSL_set_quiet_shutdown(ssl, 1);
+			TLSFree(FALSE);
+			return ( FALSE );
+			}
+		left = (int)(end - time(NULL));
+		if (left <= 0 || TLSWait(w, left) <= 0)
+			{
+			SocketTLSPrint(0, "*** TLS: handshake with %s (%s) timed out after %d s", TLSPeerAE, host, limit);
+			SSL_set_quiet_shutdown(ssl, 1);
+			TLSFree(FALSE);
+			return ( FALSE );
+			}
+		}
+
+	if (SocketTLS.AfterHandshake && !SocketTLS.AfterHandshake(ssl, TLSPeerAE, host))
+		{
+		TLSFree(TRUE);
+		return ( FALSE );
+		}
+
+	SocketTLSPrint(1, "TLS: connected to %s (%s) with %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+	return ( TRUE );
+	}
+
+// Free the TLS state; optionally send one close_notify first, waiting at most
+// TLS_CLOSE_SECONDS and never for the peer's answer. The socket stays open.
+void	Socket	::	TLSFree(BOOL SendCloseNotify)
+	{
+	SSL	*ssl = (SSL *) TLSHandle;
+	int	r;
+
+	if (!ssl)
+		return;
+	if (SendCloseNotify && Socketfd)
+		{
+		ERR_clear_error();
+		r = SSL_shutdown(ssl);
+		if (r < 0 && SSL_get_error(ssl, r) == SSL_ERROR_WANT_WRITE && TLSWait(1, TLS_CLOSE_SECONDS) > 0)
+			{
+			ERR_clear_error();
+			SSL_shutdown(ssl);
+			}
+		}
+	SSL_free(ssl);
+	TLSHandle = NULL;
+	ERR_clear_error();
+	}
+
+// Send all count bytes over TLS. Returns FALSE when the connection fails or
+// makes no progress for TimeOut seconds (300 when not set).
+BOOL	Socket	::	TLSSend(BYTE *s, UINT count)
+	{
+	SSL	*ssl = (SSL *) TLSHandle;
+	UINT	done = 0, part;
+	int	limit, n, e, w, left;
+	time_t	end;
+	char	why[256];
+
+	limit = TimeOut > 0 ? TimeOut : 300;
+	end = time(NULL) + limit;
+	while (done < count)
+		{
+		part = count - done;
+		if (part > 0x40000000) part = 0x40000000;
+		ERR_clear_error();
+		n = SSL_write(ssl, s + done, (int) part);
+		if (n > 0)
+			{
+			done += n;
+			end = time(NULL) + limit;
+			continue;
+			}
+		e = SSL_get_error(ssl, n);
+		if (e == SSL_ERROR_WANT_WRITE) w = 1;
+		else if (e == SSL_ERROR_WANT_READ) w = 0;
+		else
+			{
+			SocketTLSErrorText(ssl, e, why, sizeof(why));
+			SocketTLSPrint(0, "*** TLS: send to %s failed: %s", TLSPeerAE, why);
+			SSL_set_quiet_shutdown(ssl, 1);
+			return ( FALSE );
+			}
+		left = (int)(end - time(NULL));
+		if (left <= 0 || TLSWait(w, left) <= 0)
+			{
+			SocketTLSPrint(0, "*** TLS: send to %s timed out", TLSPeerAE);
+			SSL_set_quiet_shutdown(ssl, 1);
+			return ( FALSE );
+			}
+		}
+	return ( TRUE );
+	}
+
+// Read up to count bytes over TLS, with the same results as the plain
+// ReadBinary: >0 bytes read, -1 closed/error/timeout, 0 nothing (TimeOut 0).
+// SSL_read is tried first, so data that OpenSSL already holds (SSL_pending)
+// is returned without waiting in select().
+INT	Socket	::	TLSRead(BYTE *s, UINT count)
+	{
+	SSL	*ssl = (SSL *) TLSHandle;
+	int	n, e, w, left;
+	time_t	end = time(NULL) + TimeOut;
+	char	why[256];
+
+	if (count > 0x40000000) count = 0x40000000;
+	for (;;)
+		{
+		ERR_clear_error();
+		n = SSL_read(ssl, s, (int) count);
+		if (n > 0)
+			return ( n );
+		e = SSL_get_error(ssl, n);
+		if (e == SSL_ERROR_WANT_READ) w = 0;
+		else if (e == SSL_ERROR_WANT_WRITE) w = 1;
+		else
+			{
+			// closed by the peer or TLS error: as the plain code, close
+			if (e != SSL_ERROR_ZERO_RETURN)
+				{
+				SocketTLSErrorText(ssl, e, why, sizeof(why));
+				SocketTLSPrint(1, "TLS: read from %s ended: %s", TLSPeerAE, why);
+				SSL_set_quiet_shutdown(ssl, 1);
+				}
+			Close ();
+			return ( -1 );
+			}
+		if ( !TimeOut )
+			return ( 0 );
+		left = (int)(end - time(NULL));
+		if (left <= 0 || TLSWait(w, left) <= 0)
+			return ( -1 );
+		}
+	}
+
+#else
+
+// builds without HAVE_OPENSSL: TLS is never active (Open refuses TLSMode)
+BOOL	Socket	::	TLSOpen(char *host)		{ return ( FALSE ); }
+void	Socket	::	TLSFree(BOOL SendCloseNotify)	{ TLSHandle = NULL; }
+int	Socket	::	TLSWait(int ForWrite, int Seconds)	{ return ( -1 ); }
+BOOL	Socket	::	TLSSend(BYTE *s, UINT count)	{ return ( FALSE ); }
+INT	Socket	::	TLSRead(BYTE *s, UINT count)	{ return ( -1 ); }
+
+#endif
 	
 /*#endif*/
 

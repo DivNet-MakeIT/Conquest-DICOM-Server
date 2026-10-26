@@ -1310,6 +1310,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			OutgoingSCReportTimeout per OutgoingSCRetries/OutgoingSCRetryInterval until OutgoingSCDeadline
 			(TIMEOUT), purges after OutgoingSCKeepDays; no plain text request to a node with T;
 			server command sc_status:
+20261026	mmd	Study confirmed (outgoing storage commitment): computed live from the image table and
+			SCObject; server commands sc_confirmed: and sc_confirmed_list:, Lua scconfirmed(),
+			optional [lua] OutgoingSCStudyConfirmed hook when a result makes a study confirmed
 
 ENDOFUPDATEHISTORY
 */
@@ -7237,6 +7240,32 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
     export_queueN(sqN, "", -1, NULL, NULL, NULL, NULL, NULL, NULL, cmd);
     return 0;
   }
+  int SCStudyConfirmed(Database &DB, const char *StudyUID, const char **AEs, int nAE);
+
+  // scconfirmed(studyuid [, ae, ...]): true when the study is confirmed (outgoing storage
+  // commitment) for all given AEs (none given: every SC destination it was sent to),
+  // false when not or when OutgoingStorageCommitment is 0, nil on error
+  static int luascconfirmed(lua_State *L)
+  { int n = lua_gettop(L), nae = 0, r;
+    const char *aes[16];
+    if (n<1 || !lua_isstring(L, 1)) { lua_pushnil(L); return 1; }
+    if (!OutgoingStorageCommitment)
+    { OperatorConsole.printf("*** scconfirmed: OutgoingStorageCommitment is 0 (answer false)\n");
+      lua_pushboolean(L, 0);
+      return 1;
+    }
+    for (int i=2; i<=n; i++)
+    { if (!lua_isstring(L, i) || nae>=16) { lua_pushnil(L); return 1; }
+      aes[nae++] = lua_tostring(L, i);
+    }
+    Database DB;
+    if (!DB.Open(DataSource, UserName, Password, DataHost)) { lua_pushnil(L); return 1; }
+    r = SCStudyConfirmed(DB, lua_tostring(L, 1), aes, nae);
+    DB.Close();
+    if (r<0) { lua_pushnil(L); return 1; }
+    lua_pushboolean(L, r==1);
+    return 1;
+  }
   static int luaget_amap(lua_State *L)
   { int r = lua_tointeger(L, 1);
     ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
@@ -9585,6 +9614,7 @@ const char *do_lua(lua_State **L, char *cmd, struct scriptdata *sd)
     lua_register      (*L, "reject",        luareject);
     lua_register      (*L, "retry",         luaretry);
     lua_register      (*L, "get_amap",      luaget_amap);
+    lua_register      (*L, "scconfirmed",   luascconfirmed);
     lua_register      (*L, "get_sqldef",    luaget_sqldef);
     lua_register      (*L, "dbquery",       luadbquery);
     lua_register      (*L, "sql",           luasql);
@@ -15739,7 +15769,7 @@ class	StorageApp	:
 		void FailSafeStorage(CheckedPDU_Service *PDU);
 		BOOL PrinterSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject *PrintData[], int Thread, char *lua);
 		BOOL StorageCommitmentSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, DICOMDataObject **CommitData);
-		BOOL SCEventReportSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP);
+		BOOL SCEventReportSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP);
 		BOOL SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO);
 	};
 
@@ -21792,6 +21822,286 @@ BOOL SCEnsureTables(Database &DB)
 	return SCTablesReady;
 	}
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// Study confirmed: a study is confirmed for AE X only when EVERY object of it in the local
+// database (image table) has an SCObject row in state COMMITTED for X. It is computed live,
+// each time it is asked, from the image table and SCObject (no stored marker), so an object
+// added to the study gives 0 at once. Other states (NOTED, REQUESTED, FAILED, TIMEOUT,
+// UNSUPPORTED, HELD) never count. Used before deleting studies in routing scripts.
+//////////////////////////////////////////////////////////////////////////////////////////
+
+#define SC_MAXCONFIRMAES 16
+
+typedef char SCListItem[65];
+
+struct SCConfirmedStudy { char uid[65]; int objects; };
+
+static CRITICAL_SECTION	SCHookCritical;
+static struct SCHookCriticalInit
+	{
+	SCHookCriticalInit() { InitializeCriticalSection(&SCHookCritical); }
+	}	SCHookCriticalInitObject;
+
+static int SCListCompare(const void *a, const void *b)
+	{ return strcmp((const char *)a, (const char *)b); }
+
+// Run a one-column query and add the values to *list (malloc'ed, n items already in it).
+// Empty values are skipped. Returns the new count, sorted and without exact duplicates,
+// or -1 on error (query failed, value longer than 64 characters, out of memory).
+static int SCLoadList(Database &DB, const char *tables, const char *column, const char *where, SCListItem **list, int n)
+	{
+	char buf[256];
+	SQLLEN len;
+	int size = n, i, j;
+	SCListItem *t;
+	if (!DB.Query(tables, column, where, NULL)) return -1;
+	buf[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, buf, sizeof(buf), &len);
+	while (DB.NextRecord())
+		{
+		SCTrim(buf);
+		if (strlen(buf)>64) return -1;
+		if (buf[0])
+			{
+			if (n>=size)
+				{
+				size = size ? size*2 : 256;
+				t = (SCListItem *)realloc(*list, size*sizeof(SCListItem));
+				if (!t) return -1;
+				*list = t;
+				}
+			strcpy((*list)[n++], buf);
+			}
+		buf[0] = 0;
+		}
+	if (n>1)
+		{
+		qsort(*list, n, sizeof(SCListItem), SCListCompare);
+		for (i=j=1; i<n; i++)
+			if (strcmp((*list)[i], (*list)[j-1])!=0)
+				{
+				if (i!=j) strcpy((*list)[j], (*list)[i]);
+				j++;
+				}
+		n = j;
+		}
+	return n;
+	}
+
+// "Images.SeriesInst = Series.SeriesInst": the Conquest link from the image to the series table
+static void SCImageSeriesJoin(char *out)
+	{
+	sprintf(out, "%s.%s = %s.%s", ImageTableName, UniqueLink(ImageDB), SeriesTableName, UniqueKey(SeriesDB));
+	}
+
+// Confirmed check with the number of local objects of the study in *objects.
+// Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
+// have SCObject rows for this study and SC in acrnema.map (none: 0, never sent = not confirmed).
+static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char **AEs, int nAE, int *objects)
+	{
+	char tables[256], sctables[256], join[512], where[1024], col[128], aew[64];
+	SCListItem *local = NULL, *aes = NULL, *done = NULL;
+	int nlocal, naes = 0, ndone, i, j, r = -1;
+	ACRNemaAddress E;
+
+	*objects = 0;
+	if (!OutgoingStorageCommitment) return 0;
+	if (!StudyUID || !SCIsUID(StudyUID)) return -1;
+	if (nAE<0 || (nAE>0 && !AEs)) return -1;
+	if (!SCEnsureTables(DB)) return -1;
+
+	// the given AE titles (spaces around them are not significant), checked before any query
+	if (nAE>0)
+		{
+		aes = (SCListItem *)malloc(nAE*sizeof(SCListItem));
+		if (!aes) return -1;
+		for (i=0; i<nAE; i++)
+			{
+			const char *s = AEs[i];
+			if (!s) goto done;
+			while (*s==' ') s++;
+			if (strlen(s)>64) goto done;
+			strcpy(aes[i], s);
+			SCTrim(aes[i]);
+			if (!SCIsAE(aes[i])) goto done;
+			}
+		naes = nAE;
+		}
+
+	// the local objects of the study: image table joined to the series table
+	sprintf(tables, "%s, %s", ImageTableName, SeriesTableName);
+	sprintf(sctables, "SCObject, %s, %s", ImageTableName, SeriesTableName);
+	SCImageSeriesJoin(join);
+	sprintf(join+strlen(join), " and %s.%s = '%s'", SeriesTableName, UniqueLink(SeriesDB), StudyUID);
+	sprintf(col, "%s.%s", ImageTableName, UniqueKey(ImageDB));
+	nlocal = SCLoadList(DB, tables, col, join, &local, 0);
+	if (nlocal<0) goto done;
+	*objects = nlocal;
+	if (nlocal==0) { r = 0; goto done; }		// empty study: not confirmed
+
+	// no AE given: every destination with rows for this study (by StudyUID or by object)
+	// that has SC in the current map
+	if (nAE==0)
+		{
+		sprintf(where, "StudyUID = '%s'", StudyUID);
+		naes = SCLoadList(DB, "SCObject", "CalledAE", where, &aes, 0);
+		if (naes<0) goto done;
+		sprintf(where, "SCObject.SOPInstUID = %s.%s and %s", ImageTableName, UniqueKey(ImageDB), join);
+		naes = SCLoadList(DB, sctables, "SCObject.CalledAE", where, &aes, naes);
+		if (naes<0) goto done;
+		for (i=j=0; i<naes; i++)
+			{
+			if (!SCIsAE(aes[i])) goto done;
+			if (GetACRNemaEntryByAE(aes[i], &E) && (E.Flags & ACR_SC))
+				{
+				if (i!=j) strcpy(aes[j], aes[i]);
+				j++;
+				}
+			}
+		naes = j;
+		if (naes==0) { r = 0; goto done; }	// never sent to an SC destination
+		}
+
+	// per AE: the local objects with a COMMITTED row for exactly that AE must be all of them
+	r = 1;
+	for (i=0; i<naes && r==1; i++)
+		{
+		SCAEWhere(DB, aew, aes[i]);
+		sprintf(where, "SCObject.%s and SCObject.State = 'COMMITTED' and SCObject.SOPInstUID = %s.%s and %s",
+			aew, ImageTableName, UniqueKey(ImageDB), join);
+		ndone = SCLoadList(DB, sctables, "SCObject.SOPInstUID", where, &done, 0);
+		if (ndone<0) { r = -1; break; }
+		if (ndone!=nlocal) r = 0;
+		else
+			for (j=0; j<nlocal; j++)
+				if (strcmp(done[j], local[j])!=0) { r = 0; break; }
+		free(done); done = NULL;
+		}
+
+done:
+	if (local) free(local);
+	if (aes) free(aes);
+	if (done) free(done);
+	return r;
+	}
+
+// Is the study confirmed: 1 for ALL given AEs, 0 not, -1 error (see SCStudyConfirmedCount).
+// Always 0 without a database query when OutgoingStorageCommitment is 0.
+int SCStudyConfirmed(Database &DB, const char *StudyUID, const char **AEs, int nAE)
+	{
+	int objects;
+	return SCStudyConfirmedCount(DB, StudyUID, AEs, nAE, &objects);
+	}
+
+// Split "a,b,c" in place at the commas, spaces around items removed. Returns the count,
+// or -1 when there are more than max items.
+static int SCSplitArgs(char *s, char **items, int max)
+	{
+	int n = 0;
+	char *c;
+	while (s)
+		{
+		if (n>=max) return -1;
+		c = strchr(s, ',');
+		if (c) *c++ = 0;
+		while (*s==' ') s++;
+		SCTrim(s);
+		items[n++] = s;
+		s = c;
+		}
+	return n;
+	}
+
+// sc_confirmed:<StudyUID>[,<AE>...] -> 1 or 0 (also 0 on error, with a console line)
+static void SCConfirmedCommand(char *args, char *Response)
+	{
+	char *items[SC_MAXCONFIRMAES+1];
+	int n, r;
+	strcpy(Response, "0");
+	if (!OutgoingStorageCommitment)
+		{
+		OperatorConsole.printf("*** sc_confirmed: OutgoingStorageCommitment is 0 (answer 0)\n");
+		return;
+		}
+	n = SCSplitArgs(args, items, SC_MAXCONFIRMAES+1);
+	if (n<1 || !items[0][0])
+		{
+		OperatorConsole.printf("*** sc_confirmed: use sc_confirmed:StudyUID[,AE[,AE...]] (at most %d AEs)\n", SC_MAXCONFIRMAES);
+		return;
+		}
+	Database DB;
+	if (!DB.Open(DataSource, UserName, Password, DataHost))
+		{
+		OperatorConsole.printf("*** sc_confirmed: no database connection (answer 0)\n");
+		return;
+		}
+	r = SCStudyConfirmed(DB, items[0], (const char **)items+1, n-1);
+	DB.Close();
+	if (r<0) OperatorConsole.printf("*** sc_confirmed: check failed for study %.64s (invalid UID or AE, or database error; answer 0)\n", items[0]);
+	if (r==1) strcpy(Response, "1");
+	}
+
+// sc_confirmed_list:<since>[,<AE>...] -> one StudyUID per line in g: studies with at least
+// one object COMMITTED at or after since (for one of the AEs, when given) that are fully
+// confirmed now (for all given AEs; none given: for all their SC destinations)
+static void SCConfirmedListCommand(char *args, FILE *g)
+	{
+	char *items[SC_MAXCONFIRMAES+1], tables[256], where[2048], col[128], aew[64], *s;
+	SCListItem *studies = NULL;
+	int n, ns, i, r;
+	if (!OutgoingStorageCommitment)
+		{
+		OperatorConsole.printf("*** sc_confirmed_list: OutgoingStorageCommitment is 0 (empty list)\n");
+		return;
+		}
+	n = SCSplitArgs(args, items, SC_MAXCONFIRMAES+1);
+	if (n<1 || !items[0][0]) goto usage;
+	for (s=items[0]; *s; s++) if (*s<'0' || *s>'9') goto usage;
+	if (strlen(items[0])>10) goto usage;
+	for (i=1; i<n; i++)
+		if (!SCIsAE(items[i]))
+			{
+			OperatorConsole.printf("*** sc_confirmed_list: unusable AE title (empty list)\n");
+			return;
+			}
+
+	{
+	Database DB;
+	if (!DB.Open(DataSource, UserName, Password, DataHost))
+		{
+		OperatorConsole.printf("*** sc_confirmed_list: no database connection (empty list)\n");
+		return;
+		}
+	if (!SCEnsureTables(DB)) { DB.Close(); return; }
+	sprintf(tables, "SCObject, %s, %s", ImageTableName, SeriesTableName);
+	sprintf(col, "%s.%s", SeriesTableName, UniqueLink(SeriesDB));
+	sprintf(where, "SCObject.State = 'COMMITTED' and SCObject.CommittedAt >= %u and SCObject.SOPInstUID = %s.%s and ",
+		(unsigned int)strtoul(items[0], NULL, 10), ImageTableName, UniqueKey(ImageDB));
+	SCImageSeriesJoin(where+strlen(where));
+	for (i=1; i<n; i++)
+		{
+		SCAEWhere(DB, aew, items[i]);
+		sprintf(where+strlen(where), "%sSCObject.%s", i==1 ? " and (" : " or ", aew);
+		}
+	if (n>1) strcat(where, ")");
+	ns = SCLoadList(DB, tables, col, where, &studies, 0);
+	if (ns<0) OperatorConsole.printf("*** sc_confirmed_list: database query failed (empty list)\n");
+	for (i=0; i<ns; i++)
+		{
+		if (!SCIsUID(studies[i])) continue;
+		r = SCStudyConfirmed(DB, studies[i], (const char **)items+1, n-1);
+		if (r==1) fprintf(g, "%s\n", studies[i]);
+		if (r<0) OperatorConsole.printf("*** sc_confirmed_list: check failed for study %s (left out)\n", studies[i]);
+		}
+	if (studies) free(studies);
+	DB.Close();
+	return;
+	}
+
+usage:
+	OperatorConsole.printf("*** sc_confirmed_list: use sc_confirmed_list:since_epoch[,AE...] (at most %d AEs)\n", SC_MAXCONFIRMAES);
+	}
+
 struct SCMember { char inst[65]; char cls[65]; int seen; int reason; int outcome; int oreason; };
 
 static int SCMemberCompare(const void *a, const void *b)
@@ -21833,7 +22143,10 @@ static BOOL SCCheckSequence(DICOMDataObject *DDO, UINT16 element, SCMember *m, i
 
 // Validate a storage commitment result for a transaction this server started and record it.
 // Nothing is changed unless the whole report is consistent. Returns the DIMSE status to answer.
-UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObject *DDO)
+// Confirmed != NULL (only when the OutgoingSCStudyConfirmed hook is set): receives the
+// studies (malloc'ed, *nConfirmed items) that this result made confirmed for CallingAE.
+static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DICOMDataObject *DDO,
+	SCConfirmedStudy **Confirmed, int *nConfirmed)
 	{
 	Database DB;
 	char TxUID[68], txae[20], txstate[16], fi[68], fc[68], fo[16], fr[16], where[512], upd[256], aew[64];
@@ -21842,8 +22155,12 @@ UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObj
 	int nm = 0, nok = 0, nfail = 0, i;
 	const char *why = NULL;
 	UINT16 status = 0x0110;		// processing failure, unless all checks pass
+	SCListItem *cand = NULL;
+	int ncand = 0, objects, k;
+	BOOL hooklocked = FALSE;
 
 	TxUID[0] = 0;
+	if (Confirmed) { *Confirmed = NULL; *nConfirmed = 0; }
 	if (!DB.Open(DataSource, UserName, Password, DataHost))
 		{ OperatorConsole.printf("*** Storage commitment result: no database connection\n"); return 0x0110; }
 	if (!SCEnsureTables(DB)) { DB.Close(); return 0x0110; }
@@ -21911,6 +22228,25 @@ UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObj
 		goto done;
 		}
 
+	// for the hook: the studies of the members that are not confirmed before this result is
+	// recorded (serialized, so that a study becoming confirmed is reported once)
+	if (Confirmed && nok)
+		{
+		char tables[256], w[1024], col[128];
+		EnterCriticalSection(&SCHookCritical);
+		hooklocked = TRUE;
+		sprintf(tables, "SCTxMember, %s, %s", ImageTableName, SeriesTableName);
+		sprintf(w, "SCTxMember.TxUID = '%s' and SCTxMember.SOPInstUID = %s.%s and ", TxUID, ImageTableName, UniqueKey(ImageDB));
+		SCImageSeriesJoin(w+strlen(w));
+		sprintf(col, "%s.%s", SeriesTableName, UniqueLink(SeriesDB));
+		ncand = SCLoadList(DB, tables, col, w, &cand, 0);
+		if (ncand<0) { OperatorConsole.printf("*** OutgoingSCStudyConfirmed: studies of transaction %s not found (no hook)\n", TxUID); ncand = 0; }
+		for (i=k=0; i<ncand; i++)
+			if (SCStudyConfirmedCount(DB, cand[i], &CallingAE, 1, &objects)==0)
+				{ if (i!=k) strcpy(cand[k], cand[i]); k++; }
+		ncand = k;
+		}
+
 	// record: committed always wins; a failure never overwrites a committed object, and a
 	// failure from a replaced (abandoned) transaction is ignored: a newer request is pending
 	for (i=0; i<nm; i++)
@@ -21949,12 +22285,32 @@ UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObj
 	OperatorConsole.printf("Storage commitment result from %s for %s: %d committed, %d failed\n", CallingAE, TxUID, nok, nfail);
 	status = 0;
 
+	// for the hook: those studies that are confirmed now
+	if (Confirmed && ncand)
+		{
+		*Confirmed = (SCConfirmedStudy *)malloc(ncand*sizeof(SCConfirmedStudy));
+		if (*Confirmed)
+			for (i=0; i<ncand; i++)
+				if (SCStudyConfirmedCount(DB, cand[i], &CallingAE, 1, &objects)==1)
+					{
+					strcpy((*Confirmed)[*nConfirmed].uid, cand[i]);
+					(*Confirmed)[(*nConfirmed)++].objects = objects;
+					}
+		}
+
 done:
 	if (why)
 		OperatorConsole.printf("*** Storage commitment result from %s refused (%s), transaction %s\n", CallingAE, why, TxUID[0] ? TxUID : "-");
 	if (m) free(m);
+	if (cand) free(cand);
+	if (hooklocked) LeaveCriticalSection(&SCHookCritical);
 	DB.Close();
 	return status;
+	}
+
+UINT16 SCProcessEventReport(const char *CallingAE, int EventTypeID, DICOMDataObject *DDO)
+	{
+	return SCProcessEventReportEx(CallingAE, EventTypeID, DDO, NULL, NULL);
 	}
 
 // The AE title of a result can be set by anyone: also require that the connection comes
@@ -21989,11 +22345,12 @@ static BOOL SCSenderMatchesMap(char *Calling, unsigned int ConnectedIP, const ch
 	}
 
 // N-EVENT-REPORT of the storage commitment class on any association: read, check, answer
-BOOL StorageApp ::	SCEventReportSupport( CheckedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP)
+BOOL StorageApp ::	SCEventReportSupport( ExtendedPDU_Service *PDU, DICOMCommandObject *DCO, unsigned int ConnectedIP)
 	{
-	char Sop[68], Calling[20];
+	char Sop[68], Calling[20], hook[1024];
 	UINT16 status;
-	int eventid;
+	int eventid, i, nconfirmed = 0;
+	SCConfirmedStudy *confirmed = NULL;
 	const char *why = "";
 	ESCPRQ	EventRequest;
 	ESCPRSP	EventResponse;
@@ -22033,9 +22390,30 @@ BOOL StorageApp ::	SCEventReportSupport( CheckedPDU_Service *PDU, DICOMCommandOb
 		status = 0x0110;
 		}
 	else
-		status = SCProcessEventReport(Calling, eventid, &DDO);
+		{
+		// optional hook: [lua] OutgoingSCStudyConfirmed (default empty = not used)
+		MyGetPrivateProfileString("lua", "OutgoingSCStudyConfirmed", "", hook, 1024, ConfigFile);
+		status = SCProcessEventReportEx(Calling, eventid, &DDO, hook[0] ? &confirmed : NULL, &nconfirmed);
+		}
 
 	EventResponse.Write(PDU, DCO, &instance, status, eventid, NULL);
+
+	// after the answer: run the hook once per study that this result made confirmed for the
+	// calling AE, in the Lua context of this association, with globals SCStudy, SCAE, SCObjects
+	for (i=0; i<nconfirmed; i++)
+		{
+		char objects[16];
+		sprintf(objects, "%d", confirmed[i].objects);
+		OperatorConsole.printf("Study %s confirmed for %s (%d objects): running OutgoingSCStudyConfirmed\n",
+			confirmed[i].uid, Calling, confirmed[i].objects);
+		lua_setvar(PDU, (char *)"SCStudy", confirmed[i].uid);
+		lua_setvar(PDU, (char *)"SCAE", Calling);
+		lua_setvar(PDU, (char *)"SCObjects", objects);
+		struct scriptdata sd = {PDU, NULL, NULL, -1, NULL, NULL, NULL, NULL, NULL, 0, ConnectedIP};
+		do_lua(&(PDU->L), hook, &sd);
+		if (sd.DDO) delete sd.DDO;
+		}
+	if (confirmed) free(confirmed);
 	return TRUE;
 	}
 
@@ -22756,6 +23134,9 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 	time_t	until = time(NULL) + OutgoingSCSameAssocWait;
 	UINT16	status;
 	int	eventid;
+	char	hook[1024];
+	SCConfirmedStudy *confirmed = NULL;
+	int	nconfirmed = 0;
 
 	// poll: data in the buffer or on the socket; nothing within the wait: release
 	while (!PDU.Pending() && !PDU.Link.Poll())
@@ -22779,8 +23160,33 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 		status = 0x0112;
 		}
 	else
-		status = SCProcessEventReport(ae, eventid, &EDO);	// our own association to the map address
+		{
+		// our own association to the map address; optional [lua] OutgoingSCStudyConfirmed hook
+		MyGetPrivateProfileString("lua", "OutgoingSCStudyConfirmed", "", hook, 1024, ConfigFile);
+		status = SCProcessEventReportEx(ae, eventid, &EDO, hook[0] ? &confirmed : NULL, &nconfirmed);
+		}
 	EventResponse.Write(&PDU, &ECO, &instance, status, eventid, NULL);
+
+	// after the answer: run the hook once per study this result made confirmed; this thread has
+	// no association Lua context, so the global script context is used (as for nightly/background)
+	for (int k=0; k<nconfirmed; k++)
+		{
+		char objects[16];
+		sprintf(objects, "%d", confirmed[k].objects);
+		OperatorConsole.printf("Study %s confirmed for %s (%d objects): running OutgoingSCStudyConfirmed\n",
+			confirmed[k].uid, ae, confirmed[k].objects);
+		EnterCriticalSection(&dolua_critical);
+		globalPDU.SetLocalAddress ( (BYTE *)"global" );
+		globalPDU.SetRemoteAddress ( (BYTE *)"sccommit" );
+		lua_setvar(&globalPDU, (char *)"SCStudy", confirmed[k].uid);
+		lua_setvar(&globalPDU, (char *)"SCAE", (char *)ae);
+		lua_setvar(&globalPDU, (char *)"SCObjects", objects);
+		struct scriptdata sd = {&globalPDU, NULL, NULL, -1, NULL, NULL, NULL, NULL, NULL, 0, 0};
+		do_lua(&(globalPDU.L), hook, &sd);
+		if (sd.DDO) delete sd.DDO;
+		LeaveCriticalSection(&dolua_critical);
+		}
+	if (confirmed) free(confirmed);
 	return TRUE;
 	}
 
@@ -24805,6 +25211,26 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 				      AAPtr->Name, AAPtr->IP, AAPtr->Port, AAPtr->Compress,
 				      AAPtr->Options);	// 13th argument, unused by existing formats
 			}
+		fclose(g);
+		return true;
+		}
+
+	// outgoing storage commitment: is a study confirmed (1/0 in Response)
+	if (memcmp(SilentText, "sc_confirmed:", 13)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCConfirmedCommand(SilentText+13, Response);
+		return true;
+		}
+
+	// outgoing storage commitment: studies confirmed since a time (one per line, temp file)
+	if (memcmp(SilentText, "sc_confirmed_list:", 18)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		NewTempFile(tempfile, ".txt");
+		FILE *g = fopen(tempfile, "wt");
+		if (!g) return true;
+		SCConfirmedListCommand(SilentText+18, g);
 		fclose(g);
 		return true;
 		}

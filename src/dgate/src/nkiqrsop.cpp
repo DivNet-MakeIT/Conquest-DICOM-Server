@@ -478,6 +478,7 @@ void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 unsigned int	SCSendSeq(void);
 extern int	SCTestDelayAfterRead;
 void	SCTestSleep(int ms);
+unsigned int	SCRetrieveSeq(void *ExtraBytes, unsigned int fallback);
 void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 int	SCModeMayDiffer(const char *mode);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
@@ -508,6 +509,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 	BOOL		StripGroup2, Cancelled;
 	int             splitinto=1, splitselect=0;
 	unsigned int	scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: before any object is read
+									// (fallback; per object: SCRetrieveSeq)
 
 	GetUID(MyUID);
 
@@ -923,7 +925,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
-				if (scOn) SCNoteSentPDU(UsedPDU, scCls, scInst, scStudy, scDiffer, scSeq);	// move destination, address from QualifyOn
+				// send sequence of this object: taken just before it was read (read-ahead or direct)
+				if (scOn) SCNoteSentPDU(UsedPDU, scCls, scInst, scStudy, scDiffer, SCRetrieveSeq(ExtraBytes, scSeq));	// move destination, address from QualifyOn
 				delete iDDO;
 				}
 			}

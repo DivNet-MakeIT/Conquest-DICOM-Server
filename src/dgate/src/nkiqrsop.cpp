@@ -473,6 +473,7 @@ IARQ (AAssociateRQ	&ARQ, BOOL showall);
 // outgoing storage commitment (dgate.cpp): note objects sent by C-MOVE
 extern	int	OutgoingStorageCommitment;
 void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID);
+void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer);
 void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
 
 BOOL	StandardRetrieveNKI	::	Read (
@@ -802,6 +803,19 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 			StripGroup2 = memicmp(AcceptedCompress, "as", 2)!=0 && memicmp(AcceptedCompress, "is", 2)!=0;
 
+			// outgoing storage commitment: a script applied to the sent copy only means the
+			// sent object may differ from the archive copy: never re-sent automatically
+			int scDiffer = 0;
+			if (OutgoingStorageCommitment && !cget)
+				{
+				char rc[64], root[64];
+				rc[0] = 0;	// RetrieveConverter0 in [lua] or in the main section
+				MyGetPrivateProfileString("lua", "RetrieveConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (!rc[0] && MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, root, 64, ConfigFile))
+					MyGetPrivateProfileString(root, "RetrieveConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (rc[0]) scDiffer = 1;
+				}
+
 			if ( !RetrieveOn (ADDO.Get(Index), &iDDO, &SStorage, DCO, &ADDO, ExtraBytes))
 				++Failed;
 			else
@@ -848,7 +862,10 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 					recompress(&iDDO, mode, "", StripGroup2, PDU);
 					if (script[0])
+						{
 						CallImportConverterN(DCO, iDDO, -1, NULL, NULL, NULL, NULL, PDU, NULL, script);
+						scDiffer = 1;
+						}
 					}
 
 // test code to simulate crash in c-move when canceled 20171009
@@ -879,7 +896,7 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
-				if (scOn) SCNoteSent((char *)ACRNema, scCls, scInst, scStudy);
+				if (scOn) SCNoteSentEx((char *)ACRNema, scCls, scInst, scStudy, scDiffer);
 				delete iDDO;
 				}
 			}

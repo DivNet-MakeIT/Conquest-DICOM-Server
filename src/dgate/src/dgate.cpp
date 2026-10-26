@@ -1324,6 +1324,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			stopped by OutgoingSCDeadline (daily OVERDUE alarm); server command sc_cancel:; nodes
 			without R unchanged
 
+20261026	mmd	Outgoing storage commitment: objects whose sent copy may differ from the archive copy
+			(forward script clause, RetrieveConverter0 or C-MOVE script, Lua dicomstore) are marked
+			NoResend: never re-sent automatically
+
 ENDOFUPDATEHISTORY
 */
 
@@ -6127,7 +6131,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
-        if (scOn) SCNoteSent(line+offset, scCls, scInst, scStudy);
+        if (scOn) SCNoteSentEx(line+offset, scCls, scInst, scStudy, script[0]!=0);	// script clause: sent copy may differ
       
         ImagesForwarded++;
         if (level==4) 
@@ -10563,7 +10567,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
   	  PDU[channel].Close();
 	}
 	else
-	{ if (scOn) SCNoteSent(line+offset, scCls, scInst, scStudy);
+	{ if (scOn) SCNoteSentEx(line+offset, scCls, scInst, scStudy, script[0]!=0);	// script clause: sent copy may differ
 	  ImagesForwarded++;
 
 	  if (level==4) 
@@ -22864,7 +22868,7 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 //////////////////////////////////////////////////////////////////////////////////////////
 
 // one successful C-STORE to a node, to be picked up by the storage commitment worker
-struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; };
+struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; int differ; };
 
 #define SC_NOTEDMAX 50000
 
@@ -22881,7 +22885,11 @@ static struct SCNotedCriticalInit
 // called after a successful C-STORE; cheap: copies into a bounded in-memory queue
 // (no database access in the send path). Does nothing unless OutgoingStorageCommitment
 // and the AE has SC in acrnema.map. study may be "" (the worker looks it up).
-void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID)
+// MayDiffer: the object sent may differ from the copy in the local archive (a script was
+// applied to the sent copy only: forward "script" clause, RetrieveConverter0, a Lua object).
+// Such an object is never re-sent automatically (NoResend): a re-send would send the archive
+// copy, e.g. not anonymised where the sent copy was.
+void SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer)
 	{
 	ACRNemaAddress	E;
 	char		ae[20];
@@ -22914,6 +22922,7 @@ void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 		if (StudyUID && SCIsUID(StudyUID)) strcpy(q->study, StudyUID);
 		else                               q->study[0] = 0;
 		q->t = (unsigned int)time(NULL);
+		q->differ = MayDiffer ? 1 : 0;
 		SCNotedCount++;
 		}
 	LeaveCriticalSection(&SCNotedCritical);
@@ -22921,6 +22930,11 @@ void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 	// a dropped item is never confirmed (safe side); one line per 1000 drops
 	if (dropped && (dropped % 1000)==1)
 		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
+	}
+
+void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID)
+	{
+	SCNoteSentEx(AE, SOPClassUID, SOPInstanceUID, StudyUID, 0);
 	}
 
 // read the three UIDs from an object before it is written (Write empties the object)
@@ -23422,7 +23436,7 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 
 	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
 		{
-		sprintf(upd, "LastSent = %u", t);
+		sprintf(upd, it->differ ? "LastSent = %u, NoResend = 1" : "LastSent = %u", t);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
 		return;
@@ -23437,8 +23451,8 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	if (exists)
 		{
 		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
-			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d",
-			t, t, study, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0);
+			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d",
+			t, t, study, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 			OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae);
 		return;
@@ -23446,8 +23460,8 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 
 	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
 		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend");
-	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, 0",
-		ae, it->inst, it->cls, study, t, t, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0);
+	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d",
+		ae, it->inst, it->cls, study, t, t, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
 	if (!DB.AddRecord("SCObject", cols, vals))
 		OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae);
 	}
@@ -33096,7 +33110,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
           { OperatorConsole.printf("*** dicomstore: failed to send DICOM image to %s\n", ae);
             nfail++;
 	  }
-	  else if (scOn) SCNoteSent(ae, scCls, scInst, scStudy);
+	  else if (scOn) SCNoteSentEx(ae, scCls, scInst, scStudy, 1);	// a Lua object: may differ from the archive
 	  delete DDO;
 	}
 	

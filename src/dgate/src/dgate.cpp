@@ -1374,6 +1374,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: a regen pass (dgate -r, regen:) no longer makes SC rows
 			CHANGED (regenfile: still does); Gen stops at 2000000000 (never wraps) and a row at
 			that value is never asked about nor confirmed
+20261026	mmd	Outgoing storage commitment: the C-MOVE send sequence is taken per object just before it
+			is read (read-ahead thread, overlap read or direct read), not once per move
 
 ENDOFUPDATEHISTORY
 */
@@ -19058,7 +19060,20 @@ struct ReadAheadThreadData
 	int 				numreadahead;
 	int 				overlap;
 	volatile BOOL 		        reverse;
+	unsigned int			*SCSeqs;	// outgoing SC: send sequence taken just before object i was read (NULL: SC off)
+	unsigned int			SCLastSeq;	// outgoing SC: that of the object RetrieveOn returned last
+	int				SCLastSeqValid;
 	};
+
+// outgoing storage commitment (nkiqrsop.cpp, C-MOVE): the send sequence taken just before the
+// object that RetrieveOn returned last was read; fallback (taken at the start of the move, i.e.
+// earlier = more conservative) when it is not known
+unsigned int SCRetrieveSeq(void *ExtraBytes, unsigned int fallback)
+	{
+	struct ReadAheadThreadData *r = (struct ReadAheadThreadData *)ExtraBytes;
+	if (!r || !r->SCLastSeqValid) return fallback;
+	return r->SCLastSeq;
+	}
 
 #ifdef WIN32
 #define NULLHANDLE NULL
@@ -19114,6 +19129,7 @@ static int ProcessRATData(struct ReadAheadThreadData *ratd, int maxfiles)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
+		if (ratd->SCSeqs) ratd->SCSeqs[i] = SCSendSeq();	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
@@ -19176,6 +19192,7 @@ static int ProcessRATData(struct ReadAheadThreadData *ratd, int maxfiles)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
+		if (ratd->SCSeqs) ratd->SCSeqs[i] = SCSendSeq();	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
@@ -19582,6 +19599,7 @@ static BOOL WINAPI ReadAheadThread(struct ReadAheadThreadData *ratd)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
+		if (ratd->SCSeqs) ratd->SCSeqs[ir] = SCSendSeq();	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
@@ -19698,6 +19716,7 @@ RetrieveOn (
 
 	// assume read will fail unless proven otherwise
 	*DDOOutPtr = NULL;
+	ratd->SCLastSeqValid = 0;
 
 	// This line will disable the read ahead thread
 	if (!EnableReadAheadThread || NoThread) pADDO = NULL;
@@ -19740,7 +19759,7 @@ RetrieveOn (
 			free(ratd->Filenames);  ratd->Filenames   = NULL;
 			free(ratd->ObjectFiles);ratd->ObjectFiles = NULL;
 			free(ratd->Devices);    ratd->Devices     = NULL;
-			free(ratd->Status);     ratd->Status      = NULL;
+			free(ratd->Status);     ratd->Status      = NULL; free(ratd->SCSeqs); ratd->SCSeqs = NULL;
 			free(ratd->SOPs);       ratd->SOPs        = NULL;
 			free(ratd->Series);     ratd->Series      = NULL;
 			free(ratd->Studies);    ratd->Studies     = NULL;
@@ -19764,6 +19783,7 @@ RetrieveOn (
 		ratd->ObjectFiles = (char *) malloc(ratd->NumToRead * 256);
 		ratd->Devices     = (char *) malloc(ratd->NumToRead * 32);
 		ratd->Status      = (int  *) malloc(ratd->NumToRead * sizeof(int));
+		ratd->SCSeqs      = OutgoingStorageCommitment ? (unsigned int *) calloc(ratd->NumToRead, sizeof(unsigned int)) : NULL;
 		memset(ratd->SOPs,    0, ratd->NumToRead * 66);
 		memset(ratd->Series,  0, ratd->NumToRead * 66);
 		memset(ratd->Studies, 0, ratd->NumToRead * 66);
@@ -19835,6 +19855,7 @@ RetrieveOn (
 				if (!ratd->reverse && (ratd->Status[i]==STATUS_READ || ratd->Status[i]==STATUS_FAILED) && pADDO->Get(i)==DDOMask) 
 					{
 					*DDOOutPtr = ratd->DDOOutPtr[i];
+					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[i]; ratd->SCLastSeqValid = 1; }
 					strcpy(Filename, ratd->Filenames + i*1024);
 					ratd->Status[i] = STATUS_RETRIEVED;
 					SystemDebug.printf("RetrieveOn: givenout < %04d\n", i);
@@ -19862,7 +19883,7 @@ RetrieveOn (
 						free(ratd->pats);       ratd->pats         = NULL;
 						free(ratd->ObjectFiles); ratd->ObjectFiles = NULL;
 						free(ratd->Devices);     ratd->Devices     = NULL;
-						free(ratd->Status);      ratd->Status      = NULL;
+						free(ratd->Status);      ratd->Status      = NULL; free(ratd->SCSeqs); ratd->SCSeqs = NULL;
                                                 CloseHandle(ratd->Handle); ratd->Handle = NULLHANDLE;
 						}
 
@@ -19872,6 +19893,7 @@ RetrieveOn (
 					{
 					ratd->reverse = TRUE;
 					*DDOOutPtr = ratd->DDOOutPtr[ratd->NumToRead-1-i];
+					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[ratd->NumToRead-1-i]; ratd->SCLastSeqValid = 1; }
 					strcpy(Filename, ratd->Filenames + (ratd->NumToRead-1-i)*1024);
 					ratd->Status[ratd->NumToRead-1-i] = STATUS_RETRIEVED;
 					SystemDebug.printf("RetrieveOn: givenout < %04d\n", ratd->NumToRead-1-i);
@@ -19899,7 +19921,7 @@ RetrieveOn (
 						free(ratd->pats);       ratd->pats         = NULL;
 						free(ratd->ObjectFiles); ratd->ObjectFiles = NULL;
 						free(ratd->Devices);     ratd->Devices     = NULL;
-						free(ratd->Status);      ratd->Status      = NULL;
+						free(ratd->Status);      ratd->Status      = NULL; free(ratd->SCSeqs); ratd->SCSeqs = NULL;
                                                 CloseHandle(ratd->Handle); ratd->Handle = NULLHANDLE;
 						}
 
@@ -19922,7 +19944,7 @@ RetrieveOn (
 					free(ratd->Filenames);  ratd->Filenames   = NULL;
 					free(ratd->ObjectFiles);ratd->ObjectFiles = NULL;
 					free(ratd->Devices);    ratd->Devices     = NULL;
-					free(ratd->Status);     ratd->Status      = NULL;
+					free(ratd->Status);     ratd->Status      = NULL; free(ratd->SCSeqs); ratd->SCSeqs = NULL;
 					free(ratd->SOPs);       ratd->SOPs        = NULL;
 					free(ratd->Series);     ratd->Series      = NULL;
 					free(ratd->Studies);    ratd->Studies     = NULL;
@@ -20007,6 +20029,9 @@ further:
 		UseChapter10 = (stricmp(FullFilename+len-4, ".v2")!=0) || NoDicomCheck;
 
 	if (*TestMode) strcat(FullFilename, TestMode);
+
+	// outgoing SC: send sequence just before this object is read
+	if (OutgoingStorageCommitment) { ratd->SCLastSeq = SCSendSeq(); ratd->SCLastSeqValid = 1; }
 
 	int t = (int)time(NULL);
 	if (!UseChapter10)
@@ -29539,7 +29564,7 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP, int Transp
 		free(ratd.pats);       ratd.pats         = NULL;
 		free(ratd.ObjectFiles); ratd.ObjectFiles = NULL;
 		free(ratd.Devices);     ratd.Devices     = NULL;
-		free(ratd.Status);      ratd.Status      = NULL;
+		free(ratd.Status);      ratd.Status      = NULL; free(ratd.SCSeqs); ratd.SCSeqs = NULL;
                 CloseHandle(ratd.Handle); ratd.Handle = NULLHANDLE;
 //////////
 
@@ -30123,7 +30148,7 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP, int Transp
 		free(ratd.pats);       ratd.pats         = NULL;
 		free(ratd.ObjectFiles); ratd.ObjectFiles = NULL;
 		free(ratd.Devices);     ratd.Devices     = NULL;
-		free(ratd.Status);      ratd.Status      = NULL;
+		free(ratd.Status);      ratd.Status      = NULL; free(ratd.SCSeqs); ratd.SCSeqs = NULL;
                 CloseHandle(ratd.Handle); ratd.Handle = NULLHANDLE;
 ///////////
 
@@ -30155,7 +30180,7 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP, int Transp
 			free(ratd.Filenames);  ratd.Filenames   = NULL;
 			free(ratd.ObjectFiles);ratd.ObjectFiles = NULL;
 			free(ratd.Devices);    ratd.Devices     = NULL;
-			free(ratd.Status);     ratd.Status      = NULL;
+			free(ratd.Status);     ratd.Status      = NULL; free(ratd.SCSeqs); ratd.SCSeqs = NULL;
 
 			// 20060405	mvh	Fix for multiple moves on same assoc (thanks Andrej Savelov)
 			free(ratd.SOPs);       ratd.SOPs       = NULL;

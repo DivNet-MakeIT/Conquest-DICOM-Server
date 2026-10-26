@@ -39,6 +39,8 @@
 20261026	mmd	TLSMode 2: the legacy client context (ClientContextLegacy hook); one console
 			line per legacy connection with the protocol and cipher
 20261026	mmd	TLSAccept(fd, peer, Legacy): the legacy server context (ServerContextLegacy)
+20261026	mmd	The legacy connection line moved to the application (one operator line per TLS
+			connection with protocol, cipher, profile and node certificate result)
 
 */
 
@@ -1058,10 +1060,8 @@ BOOL	Socket	::	TLSOpen(char *host)
 		return ( FALSE );
 		}
 
-	if (TLSMode == 2)
-		SocketTLSPrint(0, "TLS legacy profile with %s (%s): %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
-	else
-		SocketTLSPrint(1, "TLS: connected to %s (%s) with %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+	// the operator line (protocol, cipher, profile, node certificate) comes from AfterHandshake
+	SocketTLSPrint(1, "TLS: connected to %s (%s) with %s %s", TLSPeerAE, host, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
 	return ( TRUE );
 	}
 

@@ -1417,6 +1417,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			only for the protocol), and after every legacy handshake: ephemeral DH >= 2048 / EC >= 224
 			bits, every certificate key in the chain RSA/DSA >= 2048 / EC >= 224 bits, no MD5 signature,
 			SHA-1 signatures only for a node in TLSNodeCertsFile or with TLSAcceptSelfSigned = 1
+20261026	mmd	TLS log: one operator console line per TLS connection, incoming and outgoing, strict and
+			legacy: AE, peer IP, protocol, cipher, profile and node certificate result
 
 ENDOFUPDATEHISTORY
 */
@@ -21328,6 +21330,15 @@ static	int	TLSNodeCertMatches(X509 *cert, unsigned char fp[2][TLS_FP_BYTES], int
 	return 0;
 	}
 
+// The operator console line of every TLS connection (owner: TLS data in the normal log):
+// dir "connected to" (outgoing) or "incoming from" (incoming), AE, peer IP, protocol,
+// cipher, profile and the node certificate result. Refusals have their own "*** TLS:" lines.
+static	void	TLSLogConnection(SSL *ssl, const char *dir, const char *AE, const char *peer, const char *cert)
+	{
+	OperatorConsole.printf("TLS: %s %s (%s): %s %s, %s profile, node certificate %s\n", dir, AE, peer,
+		SSL_get_version(ssl), SSL_get_cipher_name(ssl), TLSIsLegacy(ssl) ? "legacy" : "strict", cert);
+	}
+
 // Socket hook after the handshake: the host name check when certificates are not
 // verified (TLSVerifyPeer = ignore), and the certificate of AE in TLSNodeCertsFile
 static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
@@ -21375,6 +21386,7 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		if (SSL_get_app_data(ssl)) TLSNoteSelfSigned(ssl, AE, host, FALSE);
 		else if (!TLSHostnameCheckOn()) TLSWarnUnbound(AE);
 		if (cert) X509_free(cert);
+		TLSLogConnection(ssl, "connected to", AE, host, "not in TLSNodeCertsFile");
 		return TRUE;
 		}
 
@@ -21393,6 +21405,7 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		}
 	SystemDebug.printf("TLS: certificate of %s matches the certificate of %s in %s\n", AE, AE, file);
 	TLSNoteSelfSigned(ssl, AE, host, TRUE);
+	TLSLogConnection(ssl, "connected to", AE, host, "matches TLSNodeCertsFile");
 	return TRUE;
 	}
 
@@ -21435,6 +21448,7 @@ static	BOOL	TLSCheckIncomingNodeCert(PDU_Service *PDU, const char *AE, const cha
 	if (r == 0)
 		{
 		TLSNoteSelfSigned(ssl, AE, peer, FALSE);
+		TLSLogConnection(ssl, "incoming from", AE, peer, "not in TLSNodeCertsFile");
 		return TRUE;
 		}
 
@@ -21457,6 +21471,7 @@ static	BOOL	TLSCheckIncomingNodeCert(PDU_Service *PDU, const char *AE, const cha
 		}
 	SystemDebug.printf("TLS: client certificate of %s matches the certificate of %s in %s\n", AE, AE, file);
 	TLSNoteSelfSigned(ssl, AE, peer, TRUE);
+	TLSLogConnection(ssl, "incoming from", AE, peer, "matches TLSNodeCertsFile");
 	return TRUE;
 	}
 
@@ -21695,15 +21710,15 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 		if (TLSNodeCertLookup(ae, fp, &n, file, sizeof(file))==0 && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
 			strcpy(certae, E.Name);
 
-		// legacy port: one line per association; a node with T but not L is not taken
-		// here (it must use TLSPort); then the legacy policy (TLSLegacyPolicy)
+		// legacy port: a node with T but not L is not taken here (it must use TLSPort);
+		// then the legacy policy (TLSLegacyPolicy). The connection line follows from
+		// TLSCheckIncomingNodeCert, refusals have their own line.
 		SSL	*lssl = (SSL *) PDU->Link.TLSHandle;
 		if (TLSIsLegacy(lssl))
 			{
-			OperatorConsole.printf("TLS legacy profile with %s (%s): %s %s\n", ae, peer, SSL_get_version(lssl), SSL_get_cipher_name(lssl));
 			if (ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS) && !(E.Flags & ACR_TLSLEGACY))
 				{
-				OperatorConsole.printf("*** TLS: association from %s (%s) on TLSLegacyPort rejected: %s has T without L in acrnema.map, use TLSPort\n", ae, peer, E.Name);
+				OperatorConsole.printf("*** TLS: association from %s (%s) on TLSLegacyPort rejected (%s %s): %s has T without L in acrnema.map, use TLSPort\n", ae, peer, SSL_get_version(lssl), SSL_get_cipher_name(lssl), E.Name);
 				return FALSE;
 				}
 			if (!TLSLegacyPolicy(lssl, ae, peer, TLSNodeCertLookup(certae, fp, &n, file, sizeof(file)) > 0))

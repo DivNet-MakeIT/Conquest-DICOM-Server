@@ -1409,6 +1409,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			client context (TLS 1.0-1.2, AES-CBC with SHA-1 only, never NULL/RC4/EXPORT/DES/3DES,
 			peer key of at least 112 bits); one console line per connection; T without L unchanged;
 			write_amap writes the options in the canonical order T L SC R... (e.g. TLSCR5)
+20261026	mmd	Incoming TLS legacy profile: third listener on TLSLegacyPort (default empty = none; equal
+			to TCPPort or TLSPort = startup error, no legacy listener) with the legacy server context;
+			a calling AE with T but without L in acrnema.map is rejected there; T nodes satisfy
+			TLSEnforceForMappedNodes on either TLS port
 
 ENDOFUPDATEHISTORY
 */
@@ -15535,12 +15539,13 @@ ParseArgs (int	argc, char	*argv[], ExtendedPDU_Service *PDU)
 class	DriverApp
 	{
 	public:
-		// Transport: 0 = plain (as before), DRIVER_TRANSPORT_TLS = incoming TLS port
+		// Transport: 0 = plain (as before), DRIVER_TRANSPORT_TLS = incoming TLS port,
+		// DRIVER_TRANSPORT_TLS_LEGACY = incoming legacy-profile TLS port
 		virtual	BOOL	ServerChild ( int, unsigned int, int Transport = 0 ) = 0;
 	public:
 		BOOL		ServerChildThread ( int, unsigned int);
 		BOOL		Server ( BYTE * );
-		BOOL		ServerTLS ( BYTE * );	// incoming TLS listener (per-connection handoff)
+		BOOL		ServerTLS ( BYTE *, int Transport = 1 );	// incoming TLS listener (per-connection handoff)
 		int		ChildSocketfd;
 		volatile int	Lock;
 		unsigned int    ConnectedIP;
@@ -15556,6 +15561,7 @@ class	DriverApp
 // One context per connection, made by the listener and freed by the child, so the
 // shared ChildSocketfd/ConnectedIP/Lock of the plain listener are not used.
 #define	DRIVER_TRANSPORT_TLS	1
+#define	DRIVER_TRANSPORT_TLS_LEGACY	2	// TLSLegacyPort: legacy server context
 struct	DriverConnection
 	{
 	DriverApp	*App;
@@ -20375,6 +20381,12 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	RetrieveOn (
 //                      equal to TCPPort = startup error, no TLS listener
 //   TLSEnforceForMappedNodes  1 (default) | 0: with TLSPort set, a calling AE with T in
 //                      acrnema.map is rejected (A-ASSOCIATE-RJ) on the plain port
+//   TLSLegacyPort      port of a third listener with the legacy profile (see below), read like
+//                      TCPPort; empty (default) = none; equal to TCPPort or TLSPort = startup
+//                      error, no legacy listener. Same certificates, TLSVerifyPeer, TLSCAFile,
+//                      TLSAcceptSelfSigned and TLSNodeCertsFile as TLSPort. A calling AE whose
+//                      acrnema.map entry has T but not L is rejected there (no downgrade of
+//                      modern nodes); TLSEnforceForMappedNodes is satisfied by either TLS port
 //   TLSCertificate/TLSPrivateKey are the server certificate (required for TLSPort),
 //   TLSCAFile checks client certificates, TLSVerifyPeer: require (default) = client
 //   certificate required, verify = checked when sent, ignore = not asked for (a
@@ -21290,6 +21302,16 @@ static	void	*TLSServerContext(void)
 	return ctx;
 	}
 
+// Socket hook (incoming TLSLegacyPort): the legacy server SSL_CTX, made when that listener starts
+static	void	*TLSLegacyServerContext(void)
+	{
+	SSL_CTX	*ctx;
+	EnterCriticalSection(&TLSCtxCritical);
+	ctx = TLSLegacyServerCtx;
+	LeaveCriticalSection(&TLSCtxCritical);
+	return ctx;
+	}
+
 // Incoming TLS: the certificate of the calling AE in TLSNodeCertsFile against the client certificate of this
 // connection. TRUE when AE is not listed (identity rests on TLSCAFile and TLSVerifyPeer).
 static	BOOL	TLSCheckIncomingNodeCert(PDU_Service *PDU, const char *AE, const char *peer)
@@ -21356,14 +21378,75 @@ static	BOOL WINAPI TLSListenerThread(void)
 	return FALSE;
 	}
 
-static	BOOL	TLSPortSameAsTCPPort(void)
+// the legacy listener (TLSLegacyPort), its own DriverApp as the TLS listener
+static	BOOL WINAPI TLSLegacyListenerThread(void)
 	{
-	if (atoi((char *)TLSPort) && atoi((char *)Port))
-		return atoi((char *)TLSPort) == atoi((char *)Port);
-	return strcmp((char *)TLSPort, (char *)Port) == 0;
+	static StorageApp	TLSLegacyServerApp;
+	TLSLegacyServerApp.ServerTLS(TLSLegacyPort, DRIVER_TRANSPORT_TLS_LEGACY);
+	return FALSE;
 	}
 
+// two port values name the same port (numbers compared as numbers)
+static	BOOL	TLSPortsSame(BYTE *a, BYTE *b)
+	{
+	if (atoi((char *)a) && atoi((char *)b))
+		return atoi((char *)a) == atoi((char *)b);
+	return strcmp((char *)a, (char *)b) == 0;
+	}
+
+static	BOOL	TLSPortSameAsTCPPort(void)
+	{
+	return TLSPortsSame(TLSPort, Port);
+	}
+
+// Incoming legacy profile (L2): the third listener, only when TLSLegacyPort is set
+static	void	StartTLSLegacyListener(void)
+	{
+	SSL_CTX	*ctx;
+
+	if (!TLSLegacyPort[0])
+		return;					// default: no legacy listener, nothing changes
+	if (TLSPortsSame(TLSLegacyPort, Port) || (TLSPort[0] && TLSPortsSame(TLSLegacyPort, TLSPort)))
+		{
+		OperatorConsole.printf("*** TLS: TLSLegacyPort %s is the same as %s: no TLS legacy listener\n", (char *)TLSLegacyPort,
+			TLSPortsSame(TLSLegacyPort, Port) ? "TCPPort" : "TLSPort");
+		return;
+		}
+	if (NoThread)
+		{
+		OperatorConsole.printf("*** TLS: no TLS legacy listener on TLSLegacyPort %s in non-threaded debug mode\n", (char *)TLSLegacyPort);
+		return;
+		}
+	EnterCriticalSection(&TLSCtxCritical);
+	ctx = TLSMakeContext(TRUE, TRUE);
+	TLSLegacyServerCtx = ctx;
+	LeaveCriticalSection(&TLSCtxCritical);
+	if (!ctx)
+		{
+		OperatorConsole.printf("*** TLS: no usable TLS legacy server configuration: no TLS legacy listener on TLSLegacyPort %s\n", (char *)TLSLegacyPort);
+		return;
+		}
+#ifdef WIN32
+	unsigned long ThreadID;
+	CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) TLSLegacyListenerThread, NULL, 0, &ThreadID);
+#else
+	pthread_t ThreadID;
+	if (pthread_create(&ThreadID, NULL, (void*(*)(void*))TLSLegacyListenerThread, (void *)NULL)==0)
+		pthread_detach(ThreadID);
+	else
+		OperatorConsole.printf("*** TLS: cannot start the TLS legacy listener thread\n");
+#endif
+	}
+
+static	void	StartTLSStrictListener(void);
+
 void	StartTLSListener(void)
+	{
+	StartTLSStrictListener();	// TLSPort (as before)
+	StartTLSLegacyListener();	// TLSLegacyPort (empty by default: nothing)
+	}
+
+static	void	StartTLSStrictListener(void)
 	{
 	SSL_CTX	*ctx;
 
@@ -21411,6 +21494,7 @@ static	struct	TLSHooksInit
 		SocketTLS.Log             = TLSLogLine;
 		SocketTLS.ServerContext   = TLSServerContext;
 		SocketTLS.ClientContextLegacy = TLSLegacyClientContext;
+		SocketTLS.ServerContextLegacy = TLSLegacyServerContext;
 		}
 	}	TLSHooksInitObject;
 
@@ -21429,6 +21513,8 @@ void	StartTLSListener(void)
 	{
 	if (TLSPort[0])
 		OperatorConsole.printf("*** TLS: TLSPort %s is set but this dgate was built without TLS support: no TLS listener\n", (char *)TLSPort);
+	if (TLSLegacyPort[0])
+		OperatorConsole.printf("*** TLS: TLSLegacyPort %s is set but this dgate was built without TLS support: no TLS legacy listener\n", (char *)TLSLegacyPort);
 	}
 
 // without OpenSSL only the log hook: the refusal of T nodes reaches the console
@@ -21451,10 +21537,13 @@ static	struct	TLSHooksInit
 //    entry's name applies. Wildcard entries cannot have a node certificate (a line with
 //    * is refused at load); a node behind a wildcard entry is bound by a line for its
 //    own AE.
-//  - plain port: with TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
-//    calling AE with T in acrnema.map is rejected; a title with a space inside is
-//    checked as a whole and cut at the first space. With TLSPort empty (default)
-//    nothing is checked, as before.
+//  - TLSLegacyPort (legacy server context): as the TLS port; in addition a calling AE
+//    whose acrnema.map entry has T but not L is rejected (a modern node must not be
+//    downgraded), and one console line gives the AE, protocol and cipher.
+//  - plain port: with TLSPort or TLSLegacyPort set and TLSEnforceForMappedNodes = 1
+//    (default), a calling AE with T in acrnema.map is rejected (either TLS port
+//    satisfies it); a title with a space inside is checked as a whole and cut at the
+//    first space. With both empty (default) nothing is checked, as before.
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	{
 	char		ae[20], cut[20], peer[24], tmp[32];
@@ -21467,7 +21556,7 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 #endif
 	int		form;
 
-	if (!PDU->Link.TLSHandle && !TLSPort[0])
+	if (!PDU->Link.TLSHandle && !TLSPort[0] && !TLSLegacyPort[0])
 		return TRUE;				// no incoming TLS configured: as before
 
 	strcpy(peer, "?");
@@ -21491,6 +21580,21 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 			{
 			OperatorConsole.printf("*** TLS: association from %s rejected: calling AE title '%s' has a space inside\n", peer, ae);
 			return FALSE;
+			}
+
+		// legacy port: one line per association; a node with T but not L is not taken
+		// here (it must use TLSPort); the peer key strength is checked
+		SSL	*lssl = (SSL *) PDU->Link.TLSHandle;
+		if (TLSIsLegacy(lssl))
+			{
+			OperatorConsole.printf("TLS legacy profile with %s (%s): %s %s\n", ae, peer, SSL_get_version(lssl), SSL_get_cipher_name(lssl));
+			if (ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS) && !(E.Flags & ACR_TLSLEGACY))
+				{
+				OperatorConsole.printf("*** TLS: association from %s (%s) on TLSLegacyPort rejected: %s has T without L in acrnema.map, use TLSPort\n", ae, peer, E.Name);
+				return FALSE;
+				}
+			if (!TLSLegacyKeyStrong(lssl, ae))
+				return FALSE;
 			}
 
 		// the line of this AE, else the line of the non-wildcard acrnema.map entry the
@@ -21522,7 +21626,8 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	if ((ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS)) ||
 	    (form==2 && cut[0] && GetACRNemaEntryByAE(cut, &E) && (E.Flags & ACR_TLS)))
 		{
-		OperatorConsole.printf("*** TLS: association from %s (%s) on the plain port rejected: %s has T in acrnema.map, use TLSPort %s\n", ae, peer, E.Name, (char *)TLSPort);
+		OperatorConsole.printf("*** TLS: association from %s (%s) on the plain port rejected: %s has T in acrnema.map, use %s %s\n", ae, peer, E.Name,
+			TLSPort[0] ? "TLSPort" : "TLSLegacyPort", TLSPort[0] ? (char *)TLSPort : (char *)TLSLegacyPort);
 		return FALSE;
 		}
 	return TRUE;
@@ -21883,11 +21988,13 @@ static ThreadRoutineType DriverConnectionHelper (void *arg)
 // Incoming TLS (20261026 mmd): the listener on TLSPort, run in its own thread on
 // its own DriverApp object. Each accepted connection is passed to a new child
 // thread in its own DriverConnection; the plain Server() above is not involved.
-BOOL	DriverApp	::	ServerTLS ( BYTE	*port )
+BOOL	DriverApp	::	ServerTLS ( BYTE	*port, int Transport )
 	{
 	Socket			MSocket;
 	DriverConnection	*c;
 	BOOL			started;
+	const char		*key = Transport == DRIVER_TRANSPORT_TLS_LEGACY ? "TLSLegacyPort" : "TLSPort";
+	const char		*kind = Transport == DRIVER_TRANSPORT_TLS_LEGACY ? "TLS legacy" : "TLS";
 #ifndef UNIX
 	DWORD		ThreadID;
 	HANDLE		ThreadHandle;
@@ -21898,10 +22005,10 @@ BOOL	DriverApp	::	ServerTLS ( BYTE	*port )
 	MSocket.SetTimeOut(TCPIPTimeOut);
 	if (!MSocket.Listen ((char*) port ))
 		{
-		OperatorConsole.printf("*** TLS: cannot listen on TLSPort %s (port in use or not allowed): no TLS listener; DICOM port %s is not affected\n", (char *)port, (char *)Port);
+		OperatorConsole.printf("*** TLS: cannot listen on %s %s (port in use or not allowed): no %s listener; DICOM port %s is not affected\n", key, (char *)port, kind, (char *)Port);
 		return ( FALSE );
 		}
-	OperatorConsole.printf("DICOM TLS listener on TLSPort %s (DICOM port %s unchanged)\n", (char *)port, (char *)Port);
+	OperatorConsole.printf("DICOM %s listener on %s %s (DICOM port %s unchanged)\n", kind, key, (char *)port, (char *)Port);
 
 	while (MSocket.Accept() )
 		{
@@ -21909,7 +22016,7 @@ BOOL	DriverApp	::	ServerTLS ( BYTE	*port )
 		c->App         = this;
 		c->Socketfd    = MSocket.Socketfd;
 		c->ConnectedIP = MSocket.sa.sin_addr.s_addr;
-		c->Transport   = DRIVER_TRANSPORT_TLS;
+		c->Transport   = Transport;
 		MSocket.Socketfd = 0;
 		MSocket.Connected = FALSE;
 
@@ -21928,7 +22035,7 @@ BOOL	DriverApp	::	ServerTLS ( BYTE	*port )
 			delete c;
 			}
 		}
-	OperatorConsole.printf("*** TLS: listener on TLSPort %s stopped (accept failed)\n", (char *)port);
+	OperatorConsole.printf("*** TLS: listener on %s %s stopped (accept failed)\n", key, (char *)port);
 	return ( FALSE );
 	}
 
@@ -30889,11 +30996,11 @@ BOOL StorageApp	::	ServerChild (int theArg, unsigned int ConnectedIP, int Transp
 	WipeStack();
 
 	// incoming TLS port: the TLS handshake first, nothing is parsed before it (20261026 mmd)
-	if (Transport == DRIVER_TRANSPORT_TLS)
+	if (Transport == DRIVER_TRANSPORT_TLS || Transport == DRIVER_TRANSPORT_TLS_LEGACY)
 		{
 		char peer[20];
 		sprintf(peer, "%d.%d.%d.%d", ConnectedIP&255, (ConnectedIP>>8)&255, (ConnectedIP>>16)&255, (ConnectedIP>>24)&255);
-		if (!PDU.Link.TLSAccept(socketfd, peer))
+		if (!PDU.Link.TLSAccept(socketfd, peer, Transport == DRIVER_TRANSPORT_TLS_LEGACY))
 			return ( FALSE );
 		}
 
@@ -33275,6 +33382,7 @@ static void DgateCgi(char *ext, char *argv0, int argc, char **argv)
     Tabulate("dicom.ini", "get_param:MyACRNema", "DICOM name of server", !ReadOnly);
     Tabulate("dicom.ini", "get_param:TCPPort",   "TCP/IP port where server listens", !ReadOnly);
     Tabulate("dicom.ini", "get_param:TLSPort",   "TCP/IP port for DICOM TLS (empty = none)", !ReadOnly);
+    Tabulate("dicom.ini", "get_param:TLSLegacyPort", "TCP/IP port for legacy DICOM TLS, OsiriX-class (empty = none)", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FileNameSyntax", "Determines name for new files", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FixPhilips", "Strip leading zeros from 10 digit patient ID", !ReadOnly);
     Tabulate("dicom.ini", "get_param:FixKodak", "Strip leading zeros from 8 digit patient ID", !ReadOnly);

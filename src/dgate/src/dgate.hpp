@@ -139,6 +139,7 @@ extern	char	PatientTableName[],
 extern	BYTE	Directory [];
 extern	BYTE	Port [];
 extern	BYTE	TLSPort [];
+extern	BYTE	TLSLegacyPort [];
 extern	BYTE	KFACTORFILE [];
 extern	BYTE	MYACRNEMA [];
 extern	char	SOPClassFile [];

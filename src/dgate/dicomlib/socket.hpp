@@ -8,6 +8,7 @@
 // 20261026 mmd     Outgoing TLS members and hooks (used only with HAVE_OPENSSL)
 // 20261026 mmd     Incoming TLS: TLSAccept and the ServerContext hook
 // 20261026 mmd     TLSMode 2 (legacy profile) and the ClientContextLegacy hook
+// 20261026 mmd     TLSAccept with the legacy server context (ServerContextLegacy hook)
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -102,7 +103,8 @@ class	Socket
 		// becomes this object's TLS connection (Connected is left as it was, so
 		// PDU_Service::Multiplex(fd) can take it over); on failure fd is closed.
 		// peer = text for messages (the caller's IP). Without HAVE_OPENSSL: FALSE.
-		BOOL	TLSAccept(int fd, const char *peer);
+		// Legacy = 1: the legacy server context (TLSLegacyPort).
+		BOOL	TLSAccept(int fd, const char *peer, int Legacy = 0);
 	private:
 		BOOL	TLSOpen(char *host);
 		int	TLSConnect(long end);
@@ -123,6 +125,7 @@ class	Socket
 //   Log:             level 0 = operator message, 1 = debug
 //   ServerContext:   returns the SSL_CTX* for incoming TLS connections, or NULL
 //   ClientContextLegacy: the SSL_CTX* for TLSMode 2 (legacy profile), or NULL
+//   ServerContextLegacy: the SSL_CTX* for the incoming legacy port, or NULL
 typedef struct	_SocketTLSHooks
 	{
 	void	*(*ClientContext)(void);
@@ -131,6 +134,7 @@ typedef struct	_SocketTLSHooks
 	void	(*Log)(int level, const char *text);
 	void	*(*ServerContext)(void);
 	void	*(*ClientContextLegacy)(void);
+	void	*(*ServerContextLegacy)(void);
 	}	SocketTLSHooks;
 extern	SocketTLSHooks	SocketTLS;
 

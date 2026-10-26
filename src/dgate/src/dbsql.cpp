@@ -1272,6 +1272,17 @@ void clear_UpdateCache(void)
 extern	int	OutgoingStorageCommitment;
 void	SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd);
 
+// Rebuild: the record is rebuilt from a file that is already in the archive (regen pass);
+// the content did not change, so outgoing storage commitment rows are left as they are.
+BOOL
+SaveToDataBaseEx(
+	Database		&DB,
+	DICOMDataObject	*DDOPtr,
+	char		*filename,
+	const char	*device,
+	BOOL		JustAdd,
+	BOOL		Rebuild);
+
 BOOL
 SaveToDataBase(
 	Database		&DB,
@@ -1279,6 +1290,18 @@ SaveToDataBase(
 	char		*filename,
 	const char	*device,
 	BOOL		JustAdd)
+	{
+	return SaveToDataBaseEx(DB, DDOPtr, filename, device, JustAdd, FALSE);
+	}
+
+BOOL
+SaveToDataBaseEx(
+	Database		&DB,
+	DICOMDataObject	*DDOPtr,
+	char		*filename,
+	const char	*device,
+	BOOL		JustAdd,
+	BOOL		Rebuild)
 	{
 	char LastPatid[65], Modality[17];
 	char s1[128];
@@ -1385,8 +1408,9 @@ SaveToDataBase(
 	  }
 	}
 
-	// outgoing storage commitment: an object stored again is no longer confirmed (one int test when off)
-	if (OutgoingStorageCommitment) SCLocalStored(DB, DDOPtr, JustAdd);
+	// outgoing storage commitment: an object stored again is no longer confirmed (one int test when off);
+	// not for a regen pass, which rebuilds the record of a file already in the archive
+	if (OutgoingStorageCommitment && !Rebuild) SCLocalStored(DB, DDOPtr, JustAdd);
 
 	if (!UpdateOrAddToTable(DB, ImageDB,   ImageTableName,   DDOPtr, filename, device, LastPatid, NULL, &AddedImage, JustAdd, FALSE))
 		return FALSE;

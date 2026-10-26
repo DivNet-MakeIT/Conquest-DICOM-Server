@@ -56,6 +56,8 @@ mvh 20120630: Regen now allows files without 3 letter extension
 mvh 20201224: Added regen and regenFail converter
 mvh 20220206: Allow regen of selected folders/files (pass own * wildcards to RegenDir)
 mvh 20250718: Added TestDICOM to avoid loading loads of invalid files
+mmd 20261026: Regen passes rebuild the database record only (SaveToDataBaseEx Rebuild): outgoing storage
+	      commitment rows are not invalidated; RegenFile (one file named by the operator) still invalidates
 */
 
 // #define MULTITHREAD
@@ -120,8 +122,10 @@ TestDICOM(char *Path)
 
 extern "C" void lua_setvar(ExtendedPDU_Service *pdu, char *name, char *value);
 
+// Rebuild: TRUE for a regen pass over the archive (metadata only, the file did not change);
+// FALSE for RegenFile, where the operator may have put a new file in place
 BOOL
-RegenToDatabase(Database *DB, char *basename, char *filename, const char *device)
+RegenToDatabase(Database *DB, char *basename, char *filename, const char *device, BOOL Rebuild=FALSE)
 	{
 	DICOMDataObject*	pDDO;
 	int			len;
@@ -168,7 +172,7 @@ RegenToDatabase(Database *DB, char *basename, char *filename, const char *device
 	int rc = CallImportConverterN(NULL, pDDO, 2500, NULL, NULL, NULL, NULL, &PDU, NULL, NULL);
         if (rc==2) return ( FALSE );
 
-	if(!SaveToDataBase(*DB, pDDO, basename, device, FALSE))
+	if(!SaveToDataBaseEx(*DB, pDDO, basename, device, FALSE, Rebuild))
 		{
 		delete pDDO;
 		OperatorConsole.printf("***[Regen] %s -FAILED: Error SQL Add\n", filename);
@@ -280,7 +284,7 @@ BOOL RegenDir(Database *DB, char *PathString, const char *Device)
 
 			strcat(TempPath, FileData.cFileName);
 
-			RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device);
+			RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device, TRUE);
 			}
 			
 		if(!FindNextFile(fdHandle, &FileData))
@@ -343,7 +347,7 @@ BOOL RegenDir(Database *DB, char *PathString, const char *Device)
 				}
 			else
 				{
-				RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device);
+				RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device, TRUE);
 				}
 			}
 		else
@@ -767,7 +771,7 @@ static Database *DBs[NTHREADS];
 static void regenprocess(char *data)
 { Database *DB;
   memcpy(&DB, data, sizeof(Database *));
-  RegenToDatabase(DB, data+128, data+256, data+32);
+  RegenToDatabase(DB, data+128, data+256, data+32, TRUE);
 }
 
 static void regen_queue(char *basename, char *filename, char *device)

@@ -1353,6 +1353,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			with a length limit, snprintf, length <= 64 checked); no GenUID into a fixed buffer
 20261026	mmd	Outgoing TLS: every connect site resolves the destination once (GetACRNemaForConnect,
 			QualifyOn entry for C-MOVE): address and TLS come from the same acrnema.map entry
+20261026	mmd	TLS fixes: bounded TLS connect, locks for warnings and contexts, verify mode per
+			connection; incoming checks use one canonical calling AE form on both ports, pins found
+			without regard to case; TLS ini values read through cache-size buffers
 
 ENDOFUPDATEHISTORY
 */
@@ -20264,6 +20267,47 @@ BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE
 	return SCPrepareTLS(PDU, EE);
 	}
 
+// A TLS key from the dicom.ini server section. MyGetPrivateProfileString answers a
+// key it has seen before from its cache, copying up to 1023 characters WITHOUT the
+// caller's length (gpps.cpp). Another reader of the same key with a larger buffer
+// (Lua gpps, get_param:) can fill that cache, so every TLS key is read here into a
+// buffer as large as the cache value and then cut to the caller's size. Key names are
+// compared without regard to case (gpps.cpp stricmp, as GetPrivateProfileString).
+#define	TLS_INI_VALUE	1024		// = IniValues[][1024] in gpps.cpp
+static	void	TLSIni(const char *key, const char *def, char *out, int outlen)
+	{
+	char	sc[TLS_INI_VALUE+8], buf[TLS_INI_VALUE+8];
+	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, TLS_INI_VALUE, ConfigFile);
+	MyGetPrivateProfileString(sc, key, def, buf, TLS_INI_VALUE, ConfigFile);
+	snprintf(out, outlen, "%s", buf);
+	}
+
+// Canonical calling AE title for the incoming TLS checks, the same on both ports:
+// the 16 received bytes hold printable ASCII (0x20-0x7E) up to the first NUL and only
+// NUL or space after it, else the title is refused (return 0). ae (17 bytes) gets the
+// title without leading and trailing spaces (not significant in an AE title). Returns
+// 2 when the title has a space inside: ShouldIAcceptRemoteApTitle and other code cut
+// such a title at the first space, so the TLS port refuses it and the plain port checks
+// both forms. Returns 1 for a normal title.
+static	int	TLSCanonicalAE(const BYTE *CallingAE, char *ae)
+	{
+	BOOL	pad = FALSE;
+	int	i, n;
+
+	for (i=0; i<16; i++)
+		{
+		BYTE c = CallingAE[i];
+		if (c==0) pad = TRUE;
+		else if (pad && c!=' ') return 0;
+		else if (c<0x20 || c>0x7e) return 0;
+		}
+	memset(ae, 0, 17);
+	for (i=0; i<16 && CallingAE[i]==' '; i++) ;
+	for (n=0; i<16 && CallingAE[i]; i++) ae[n++] = CallingAE[i];
+	while (n && ae[n-1]==' ') ae[--n] = 0;
+	return strchr(ae, ' ') ? 2 : 1;
+	}
+
 // TLS lines from the socket layer go to the operator console or the debug log
 static	void	TLSLogLine(int level, const char *text)
 	{
@@ -20301,12 +20345,6 @@ static	SSL_CTX	*TLSServerCtx = NULL;		// incoming: made once, when the TLS liste
 // (SSL_CTX_set_verify) and read back per connection with SSL_get_verify_mode: no
 // global written while a context is made (the client context can be made by the
 // storage commitment worker while the listener makes the server context).
-
-// the dicom.ini section with the server settings
-static	void	TLSIniSection(char *sc)
-	{
-	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, 64, ConfigFile);
-	}
 
 // the last OpenSSL error as text
 static	const char *TLSErrorText(char *buf, int len)
@@ -20374,18 +20412,17 @@ static	BOOL	TLSSetCiphers(SSL_CTX *ctx, const char *wanted, int minversion)
 static	SSL_CTX	*TLSMakeContext(BOOL server)
 	{
 	const char	*side = server ? "server" : "client";
-	char	sc[64], cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
+	char	cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
 	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore (this context only)
 
-	TLSIniSection(sc);
-	MyGetPrivateProfileString(sc, "TLSCertificate", "", cert, sizeof(cert), ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSPrivateKey", "", key, sizeof(key), ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSCAFile", "", ca, sizeof(ca), ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSVerifyPeer", "require", verify, sizeof(verify), ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSMinVersion", "1.2", minv, sizeof(minv), ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSCipherList", "", ciphers, sizeof(ciphers), ConfigFile);
+	TLSIni("TLSCertificate", "", cert, sizeof(cert));
+	TLSIni("TLSPrivateKey", "", key, sizeof(key));
+	TLSIni("TLSCAFile", "", ca, sizeof(ca));
+	TLSIni("TLSVerifyPeer", "require", verify, sizeof(verify));
+	TLSIni("TLSMinVersion", "1.2", minv, sizeof(minv));
+	TLSIni("TLSCipherList", "", ciphers, sizeof(ciphers));
 
 	if      (stricmp(verify, "require")==0) TLSVerifyMode = 2;
 	else if (stricmp(verify, "verify")==0)  TLSVerifyMode = 1;
@@ -20528,9 +20565,8 @@ static	void	TLSWarnUnbound(const char *AE)
 // TLSVerifyHostname from dicom.ini
 static	BOOL	TLSHostnameCheckOn(void)
 	{
-	char	sc[64], tmp[32];
-	TLSIniSection(sc);
-	MyGetPrivateProfileString(sc, "TLSVerifyHostname", "0", tmp, sizeof(tmp), ConfigFile);
+	char	tmp[32];
+	TLSIni("TLSVerifyHostname", "0", tmp, sizeof(tmp));
 	return atoi(tmp)!=0;
 	}
 
@@ -20611,7 +20647,7 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	{
 	SSL		*ssl = (SSL *) s;
 	X509		*cert;
-	char		sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1];
+	char		key[64], pins[TLS_INI_VALUE], hex[2*EVP_MAX_MD_SIZE+1];
 	int		good = 0;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -20628,9 +20664,8 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 		return FALSE;
 		}
 
-	TLSIniSection(sc);
 	snprintf(key, sizeof(key), "TLSPin_%s", AE);
-	MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+	TLSIni(key, "", pins, sizeof(pins));
 	if (!pins[0])
 		{
 		// identity then rests on TLSCAFile alone: say so once per node
@@ -20672,12 +20707,11 @@ static	BOOL	TLSCheckIncomingPin(PDU_Service *PDU, const char *AE, const char *pe
 	{
 	SSL	*ssl = (SSL *) PDU->Link.TLSHandle;
 	X509	*cert;
-	char	sc[64], key[64], pins[512], hex[2*EVP_MAX_MD_SIZE+1];
+	char	key[64], pins[TLS_INI_VALUE], hex[2*EVP_MAX_MD_SIZE+1];
 	int	good;
 
-	TLSIniSection(sc);
-	snprintf(key, sizeof(key), "TLSPin_%s", AE);
-	MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+	snprintf(key, sizeof(key), "TLSPin_%s", AE);	// key compared without case
+	TLSIni(key, "", pins, sizeof(pins));
 	if (!pins[0])
 		return TRUE;
 
@@ -20787,14 +20821,22 @@ static	struct	TLSHooksInit
 
 // Incoming association, called from ExtendedPDU_Service::ShouldIAcceptRemoteTransport
 // when the A-ASSOCIATE-RQ has been read and before anything is answered; FALSE =
-// A-ASSOCIATE-RJ (calling AE not recognized).
-//  - TLS port: TLSPin_<calling AE>, when set, must match the client certificate.
+// A-ASSOCIATE-RJ (calling AE not recognized). Both ports use ONE form of the calling
+// AE title (TLSCanonicalAE): printable ASCII up to the first NUL, only padding after
+// it, leading/trailing spaces removed; anything else is rejected.
+//  - TLS port: a title with a space inside is rejected (other code cuts it at the
+//    first space). TLSPin_<calling AE> (key compared without case, as acrnema.map
+//    lookups) must match the client certificate when set; when it is not set and the
+//    title resolves to a non-wildcard acrnema.map entry, the pin of that entry's name
+//    applies. Wildcard entries cannot carry pins: TLSPin_<name with *> is never read;
+//    a node behind a wildcard entry is pinned by TLSPin_<its own AE>.
 //  - plain port: with TLSPort set and TLSEnforceForMappedNodes = 1 (default), a
-//    calling AE with T in acrnema.map is rejected. With TLSPort empty (default)
+//    calling AE with T in acrnema.map is rejected; a title with a space inside is
+//    checked as a whole and cut at the first space. With TLSPort empty (default)
 //    nothing is checked, as before.
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	{
-	char		ae[20], peer[24], sc[64], tmp[32];
+	char		ae[20], cut[20], peer[24], tmp[32];
 	ACRNemaAddress	E;
 	struct sockaddr_in	sa;
 #ifdef	UNIX
@@ -20802,17 +20844,10 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 #else
 	int		len = sizeof(sa);
 #endif
-	int		i;
+	int		form;
 
 	if (!PDU->Link.TLSHandle && !TLSPort[0])
 		return TRUE;				// no incoming TLS configured: as before
-
-	// calling AE without padding
-	memset(ae, 0, sizeof(ae));
-	memcpy(ae, CallingAE, 16);
-	for (i=strlen(ae)-1; i>=0 && ae[i]==' '; i--) ae[i] = 0;
-	for (i=0; ae[i]==' '; i++) ;
-	if (i) memmove(ae, ae+i, strlen(ae+i)+1);
 
 	strcpy(peer, "?");
 	memset(&sa, 0, sizeof(sa));
@@ -20825,32 +20860,24 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	if (PDU->Link.TLSHandle)
 		{
 #ifdef	HAVE_OPENSSL
-		// only printable AE titles over TLS (no control characters to play with the lookups):
-		// all 16 received bytes are checked; after the title only padding (NUL or space)
-		BOOL	pad = FALSE, bad = FALSE;
-		for (i=0; i<16; i++)
+		form = TLSCanonicalAE(CallingAE, ae);
+		if (form==0)
 			{
-			BYTE c = CallingAE[i];
-			if (c==0) pad = TRUE;
-			else if (pad && c!=' ') bad = TRUE;
-			else if (c<32 || c>126) bad = TRUE;
+			OperatorConsole.printf("*** TLS: association from %s rejected: calling AE title has control characters (or non-ASCII bytes, or data after the NUL padding)\n", peer);
+			return FALSE;
 			}
-		if (bad) ae[0] = 1;	// refused just below
-		for (i=0; ae[i]; i++)
-			if (ae[i]<32 || ae[i]>126)
-				{
-				OperatorConsole.printf("*** TLS: association from %s rejected: calling AE title has control characters\n", peer);
-				return FALSE;
-				}
+		if (form==2)
+			{
+			OperatorConsole.printf("*** TLS: association from %s rejected: calling AE title '%s' has a space inside\n", peer, ae);
+			return FALSE;
+			}
 
-		// the pin of this AE: TLSPin_<calling AE>, else the pin of the acrnema.map entry the
-		// calling AE resolves to (map lookups ignore case), so another spelling of a pinned
-		// AE does not escape its pin
-		char	pinae[20], key[64], pins[512];	// full size: the ini cache copies without a limit
+		// the pin of this AE: TLSPin_<calling AE>, else the pin of the non-wildcard
+		// acrnema.map entry the calling AE resolves to (map lookups ignore case)
+		char	pinae[20], key[64], pins[TLS_INI_VALUE];
 		strcpy(pinae, ae);
-		TLSIniSection(sc);
 		snprintf(key, sizeof(key), "TLSPin_%s", ae);
-		MyGetPrivateProfileString(sc, key, "", pins, sizeof(pins), ConfigFile);
+		TLSIni(key, "", pins, sizeof(pins));
 		if (!pins[0] && ae[0] && GetACRNemaEntryByAE(ae, &E) && !strchr(E.Name, '*'))
 			strcpy(pinae, E.Name);
 		return TLSCheckIncomingPin(PDU, pinae, peer);
@@ -20860,13 +20887,21 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 		}
 
 	// plain port with TLSPort set
-	MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, sc, 64, ConfigFile);
-	MyGetPrivateProfileString(sc, "TLSEnforceForMappedNodes", "1", tmp, sizeof(tmp), ConfigFile);
+	TLSIni("TLSEnforceForMappedNodes", "1", tmp, sizeof(tmp));
 	if (atoi(tmp)==0)
 		return TRUE;
-	if (ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS))
+	form = TLSCanonicalAE(CallingAE, ae);
+	if (form==0)
 		{
-		OperatorConsole.printf("*** TLS: association from %s (%s) on the plain port rejected: %s has T in acrnema.map, use TLSPort %s\n", ae, peer, ae, (char *)TLSPort);
+		OperatorConsole.printf("*** TLS: association from %s on the plain port rejected: calling AE title has control characters (or non-ASCII bytes, or data after the NUL padding)\n", peer);
+		return FALSE;
+		}
+	strcpy(cut, ae);
+	if (strchr(cut, ' ')) *strchr(cut, ' ') = 0;
+	if ((ae[0] && GetACRNemaEntryByAE(ae, &E) && (E.Flags & ACR_TLS)) ||
+	    (form==2 && cut[0] && GetACRNemaEntryByAE(cut, &E) && (E.Flags & ACR_TLS)))
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) on the plain port rejected: %s has T in acrnema.map, use TLSPort %s\n", ae, peer, E.Name, (char *)TLSPort);
 		return FALSE;
 		}
 	return TRUE;

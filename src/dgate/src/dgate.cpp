@@ -1387,6 +1387,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: a positive "study confirmed" is checked again before it is given:
 			no queue, write-mark or invalidation change and no sentinel since its queries started (else
 			asked again, at most 3 times, then 0); 0 while a rewrite of a sent object is in progress
+20261026	mmd	Outgoing storage commitment: the watchdog's duplicate descriptor is taken at 1 or above (never 0,
+			which the socket layer reads as "no socket"); every non-negative duplicate is used and closed
 
 ENDOFUPDATEHISTORY
 */
@@ -25402,7 +25404,9 @@ static struct SCWatchCriticalInit
 	SCWatchCriticalInit() { InitializeCriticalSection(&SCWatchCritical); }
 	}	SCWatchCriticalInitObject;
 
-// own descriptor for the same socket; -1 when not possible (0 is "no socket" in the socket layer)
+// own descriptor for the same socket; -1 when not possible. The socket layer reads 0 as "no
+// socket", so fd 0 is not a connection, and the duplicate is taken at 1 or above: a duplicate is
+// therefore never 0, and every one >= 0 that is returned is used and later closed (SCCloseDup)
 static int SCDupSocket(int fd)
 	{
 #ifdef WIN32
@@ -25411,9 +25415,11 @@ static int SCDupSocket(int fd)
 #else
 	if (fd<=0) return -1;
 #ifdef F_DUPFD_CLOEXEC
-	return fcntl(fd, F_DUPFD_CLOEXEC, 0);	// not inherited by programs started by the server
+	return fcntl(fd, F_DUPFD_CLOEXEC, 1);	// lowest free number >= 1; not inherited by programs started by the server
 #else
-	return dup(fd);
+	int d = fcntl(fd, F_DUPFD, 1);		// lowest free number >= 1
+	if (d>=0) fcntl(d, F_SETFD, FD_CLOEXEC);
+	return d;
 #endif
 #endif
 	}
@@ -25421,7 +25427,7 @@ static int SCDupSocket(int fd)
 static void SCCloseDup(int fd)
 	{
 #ifndef WIN32
-	if (fd>0) close(fd);
+	if (fd>=0) close(fd);
 #else
 	(void)fd;
 #endif
@@ -25439,7 +25445,7 @@ static BOOL WINAPI SCWatchThread(void *arg)
 			free(w);
 			return TRUE;
 			}
-		if (!w->fired && w->fd>0 && time(NULL) >= w->until)
+		if (!w->fired && w->fd>=0 && time(NULL) >= w->until)
 			{
 			shutdown(w->fd, 2);		// SHUT_RDWR / SD_BOTH, on our own duplicate
 			w->fired = 1;
@@ -25454,7 +25460,7 @@ static BOOL WINAPI SCWatchThread(void *arg)
 static SCWatch *SCStartWatch(int fd, time_t until)
 	{
 	int dfd = SCDupSocket(fd);
-	if (dfd<=0) return NULL;
+	if (dfd<0) return NULL;
 	SCWatch *w = (SCWatch *)malloc(sizeof(SCWatch));
 	if (!w) { SCCloseDup(dfd); return NULL; }
 	w->fd = dfd; w->until = until; w->active = 1; w->fired = 0;

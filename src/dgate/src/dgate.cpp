@@ -1367,6 +1367,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Outgoing storage commitment: the same-association watchdog shuts down its own duplicate
 			of the socket descriptor (never a number the reader closed and another thread reused);
 			without a duplicate or a thread the result is not read there (association closed)
+20261026	mmd	Outgoing storage commitment: a noted send that cannot be recorded (database) stays in the
+			queue and is retried (alarm when old); a send dropped because the queue is full starts an
+			overflow epoch (table SCMarker): "study confirmed" answers 0 until the queue has drained
+			and the operator clears it with sc_overflow_clear:; sc_overflow: shows it
 
 ENDOFUPDATEHISTORY
 */
@@ -1546,6 +1550,7 @@ int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
 int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
 int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
+int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -23151,6 +23156,9 @@ BOOL SCEnsureTables(Database &DB)
 			if (ok) DB.CreateIndex("SCObject", "scobj_inst", "SOPInstUID");
 			}
 		else if (ok) ok = SCAddGenColumn(DB, "SCObject", "SOPInstUID");
+		// markers that make every "study confirmed" answer 0 (Name 'OVERFLOW': sends were lost)
+		if (ok && !DB.Query("SCMarker", "Name", "Name = '0'", NULL))
+			ok = DB.CreateTable("SCMarker", "Name varchar(16), Since int, Drops int");
 		if (ok) OperatorConsole.printf("Outgoing storage commitment tables ready\n");
 		else    OperatorConsole.printf("*** Outgoing storage commitment: could not create tables\n");
 		SCTablesReady = ok;
@@ -23233,6 +23241,7 @@ static void SCImageSeriesJoin(char *out)
 
 static BOOL SCNotedPending(const char *ae, const char *study);
 static BOOL SCSqlText(const char *s, int max);
+static int SCOverflowState(Database &DB);
 
 // Confirmed check with the number of local objects of the study in *objects.
 // Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
@@ -23249,6 +23258,11 @@ static int SCStudyConfirmedCount(Database &DB, const char *StudyUID, const char 
 	if (!StudyUID || !SCIsUID(StudyUID)) return -1;
 	if (nAE<0 || (nAE>0 && !AEs)) return -1;
 	if (!SCEnsureTables(DB)) return -1;
+
+	// sends were dropped (queue full) and the operator has not cleared it yet: no study is
+	// confirmed (a dropped send may belong to any study and destination); -1 when unknown
+	i = SCOverflowState(DB);
+	if (i!=0) return i<0 ? -1 : 0;
 
 	// the given AE titles (spaces around them are not significant), checked before any query
 	if (nAE>0)
@@ -23806,6 +23820,7 @@ static SCNoted		SCNotedQueue[SC_NOTEDMAX];	// ring buffer
 static int		SCNotedHead = 0;		// oldest item
 static int		SCNotedCount = 0;		// items in the queue (including those the worker is recording)
 static unsigned int	SCNotedDropped = 0;		// items dropped because the queue was full
+static unsigned int	SCOverflowSince = 0;		// overflow epoch: time of the first drop not cleared (0 = none)
 static CRITICAL_SECTION	SCNotedCritical;
 static struct SCNotedCriticalInit
 	{
@@ -23949,11 +23964,14 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		return;
 		}
 
+	int max = (SCTestQueueMax>0 && SCTestQueueMax<SC_NOTEDMAX) ? SCTestQueueMax : SC_NOTEDMAX;
+	BOOL first = FALSE;
 	EnterCriticalSection(&SCNotedCritical);
-	if (SCNotedCount >= SC_NOTEDMAX)
+	if (SCNotedCount >= max)
 		{
 		dropped = ++SCNotedDropped;
 		n = SCNotedCount;
+		if (!SCOverflowSince) { SCOverflowSince = (unsigned int)time(NULL); first = TRUE; }
 		}
 	else
 		{
@@ -23974,7 +23992,10 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		}
 	LeaveCriticalSection(&SCNotedCritical);
 
-	// a dropped item is never confirmed (safe side); one line per 1000 drops
+	// a dropped item is never confirmed, and from the first drop no study is (overflow epoch,
+	// see SCOverflowState); one line per 1000 drops
+	if (first)
+		OperatorConsole.printf("*** Storage commitment ALARM: queue full (%d), send of %s to %s not noted: no study is confirmed until the queue has drained and sc_overflow_clear: is given\n", n, SOPInstanceUID, ae);
 	if (dropped && (dropped % 1000)==1)
 		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
 	}
@@ -24092,6 +24113,131 @@ static int SCNotedLength(unsigned int *dropped)
 	*dropped = SCNotedDropped;
 	LeaveCriticalSection(&SCNotedCritical);
 	return n;
+	}
+
+// Overflow epoch. A send dropped because the queue was full is never recorded: its object can be
+// missing from SCObject for that destination (sc_confirmed without AEs would not even look at that
+// destination), or an older COMMITTED row can stand for a send that went somewhere else. Which
+// studies are affected is not known, so from the first drop every "study confirmed" answers 0
+// (sc_confirmed:, sc_confirmed_list:, Lua scconfirmed, the OutgoingSCStudyConfirmed hook), until
+// the queue has drained and the operator clears it with sc_overflow_clear: (after checking or
+// re-sending what was lost). The send path only sets SCOverflowSince (no database there); the
+// worker writes the marker to table SCMarker (Name 'OVERFLOW') on its next pass, so it survives
+// a restart. SCOverflowCritical keeps the worker's write and the operator's clear apart.
+static CRITICAL_SECTION	SCOverflowCritical;
+static struct SCOverflowCriticalInit
+	{
+	SCOverflowCriticalInit() { InitializeCriticalSection(&SCOverflowCritical); }
+	}	SCOverflowCriticalInitObject;
+static unsigned int	SCOverflowStored = 0;		// SCNotedDropped as written to SCMarker (or cleared)
+
+// 1: overflow marker in the table, 0: none, -1: query failed
+static int SCOverflowMarked(Database &DB)
+	{
+	char s[32];
+	SQLLEN len;
+	if (!DB.Query("SCMarker", "Since", "Name = 'OVERFLOW'", NULL)) return -1;
+	s[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, s, sizeof(s), &len);
+	return DB.NextRecord() ? 1 : 0;
+	}
+
+// 1: overflow epoch (in memory or in the table), 0: none, -1: unknown (query failed)
+static int SCOverflowState(Database &DB)
+	{
+	unsigned int since;
+	EnterCriticalSection(&SCNotedCritical);
+	since = SCOverflowSince;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (since) return 1;
+	return SCOverflowMarked(DB);
+	}
+
+// worker: write the overflow epoch to SCMarker when there are drops not written yet
+static void SCOverflowPersist(Database &DB)
+	{
+	unsigned int since, drops;
+	char vals[96], upd[64];
+	int m;
+	EnterCriticalSection(&SCNotedCritical);
+	since = SCOverflowSince;
+	drops = SCNotedDropped;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (!since) return;
+	EnterCriticalSection(&SCOverflowCritical);
+	if (drops != SCOverflowStored)
+		{
+		BOOL ok;
+		m = SCOverflowMarked(DB);
+		sprintf(upd, "Drops = %u", drops);
+		sprintf(vals, "'OVERFLOW', %u, %u", since, drops);
+		if (m==1)      ok = DB.UpdateRecords((char *)"SCMarker", upd, (char *)"Name = 'OVERFLOW'");
+		else if (m==0) ok = DB.AddRecord("SCMarker", "Name, Since, Drops", vals);
+		else           ok = FALSE;
+		if (ok) SCOverflowStored = drops;
+		else    OperatorConsole.printf("*** Storage commitment ALARM: queue overflow could not be written to SCMarker (tried again; confirmations answer 0 meanwhile)\n");
+		}
+	LeaveCriticalSection(&SCOverflowCritical);
+	}
+
+// sc_overflow: -> "0" (none) or "1 since <time> dropped <n>" (in memory) or "1 marked" (table only)
+static void SCOverflowCommand(char *Response)
+	{
+	unsigned int since, drops;
+	strcpy(Response, "0");
+	if (!OutgoingStorageCommitment) return;
+	EnterCriticalSection(&SCNotedCritical);
+	since = SCOverflowSince;
+	drops = SCNotedDropped;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (since) { sprintf(Response, "1 since %u dropped %u", since, drops); return; }
+	Database DB;
+	if (!DB.Open(DataSource, UserName, Password, DataHost) || !SCEnsureTables(DB)) { strcpy(Response, "1 unknown (database)"); return; }
+	int m = SCOverflowMarked(DB);
+	DB.Close();
+	if (m==1) strcpy(Response, "1 marked");
+	else if (m<0) strcpy(Response, "1 unknown (database)");
+	}
+
+// sc_overflow_clear: the operator ends the overflow epoch. Refused while sends are still in the
+// queue, when the marker cannot be removed from SCMarker, or when another send was dropped meanwhile.
+static void SCOverflowClearCommand(char *Response)
+	{
+	unsigned int since, drops;
+	int n;
+	strcpy(Response, "refused: OutgoingStorageCommitment is 0");
+	if (!OutgoingStorageCommitment) return;
+	EnterCriticalSection(&SCNotedCritical);
+	n = SCNotedCount;
+	since = SCOverflowSince;
+	drops = SCNotedDropped;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (n>0) { sprintf(Response, "refused: %d send(s) still in the queue", n); return; }
+
+	Database DB;
+	if (!DB.Open(DataSource, UserName, Password, DataHost) || !SCEnsureTables(DB))
+		{ strcpy(Response, "refused: no database connection"); return; }
+	EnterCriticalSection(&SCOverflowCritical);
+	if (!DB.DeleteRecord("SCMarker", "Name = 'OVERFLOW'"))
+		strcpy(Response, "refused: marker could not be removed");
+	else
+		{
+		EnterCriticalSection(&SCNotedCritical);
+		if (SCNotedDropped == drops)
+			{
+			SCOverflowSince = 0;
+			SCOverflowStored = drops;
+			strcpy(Response, "cleared");
+			}
+		else	strcpy(Response, "refused: more sends were dropped meanwhile");
+		LeaveCriticalSection(&SCNotedCritical);
+		}
+	LeaveCriticalSection(&SCOverflowCritical);
+	DB.Close();
+	if (strcmp(Response, "cleared")==0)
+		OperatorConsole.printf("Storage commitment: queue overflow cleared by the operator (%s)\n", since ? "epoch of this run" : "marker from an earlier run, if any");
+	else
+		OperatorConsole.printf("*** sc_overflow_clear: %s\n", Response);
 	}
 
 // SQL that makes the objects of a where clause unconfirmed after a local change: Gen + 1 (a result
@@ -24407,6 +24553,7 @@ void SCReadWorkerConfig(const char *root)
 	// test-only keys (default 0 = no effect): widen race windows so the tests can hit them
 	SCTestDelayBeforeWrite  = SCIniInt(root, "SCTestDelayBeforeWrite",  0,     0, 60000);
 	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
+	SCTestQueueMax          = SCIniInt(root, "SCTestQueueMax",          0,     0, SC_NOTEDMAX);
 	SCReadRetryInterval(root);
 	}
 
@@ -24637,15 +24784,20 @@ static void SCLookupStudy(Database &DB, const char *inst, char *study)
 // it. Checked after the write: a local store that comes in between either is seen here or changes
 // the row itself afterwards (it registers before it updates the table, and again after its file
 // write, see SCWriteEnd).
-static void SCCheckStale(Database &DB, const char *aew, SCNoted *it)
+// Returns FALSE when a stale row could not be made CHANGED: the item then stays in the queue (so
+// its study is not confirmed) and is recorded and checked again on the next pass.
+static BOOL SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 	{
 	char where[256];
-	if (!it->stale && !SCChangedSince(it->inst, it->seq)) return;
+	if (!it->stale && !SCChangedSince(it->inst, it->seq)) return TRUE;
 	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
 	if (DB.UpdateRecords((char *)"SCObject", (char *)SCChangedUpdate, where))
+		{
 		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send)\n", it->inst, it->ae);
-	else
-		OperatorConsole.printf("*** Storage commitment ALARM: stale send of %s to %s, but the database update failed\n", it->inst, it->ae);
+		return TRUE;
+		}
+	OperatorConsole.printf("*** Storage commitment ALARM: stale send of %s to %s, but the database update failed (kept in the queue)\n", it->inst, it->ae);
+	return FALSE;
 	}
 
 // record one noted send; every send raises the content generation Gen by one: new row NOTED;
@@ -24653,7 +24805,10 @@ static void SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 // NOTED gets the new LastSent; REQUESTED becomes NOTED again (the pending request asked about
 // the earlier generation, its result no longer applies). A send that started before the object
 // was stored again locally (stale) leaves it CHANGED: such a send never confirms the object.
-static void SCRecordNoted(Database &DB, SCNoted *it)
+// Returns FALSE when the database failed: the item stays in the queue and is recorded again on a
+// later pass (every step can be repeated: a repeat only raises Gen once more). TRUE when it is
+// done: recorded, or never recordable (invalid values, destination without SC: logged).
+static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 	{
 	char ae[20], aew[64], where[256], upd[1024], cols[256], vals[1024], state[16], study[68];
 	SQLLEN len;
@@ -24663,7 +24818,7 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	if (!SCCleanAE(it->ae, ae) || !SCIsUID(it->inst) || !SCIsUID(it->cls) || (it->study[0] && !SCIsUID(it->study)))
 		{
 		OperatorConsole.printf("*** Storage commitment: noted send with invalid AE or UID not recorded\n");
-		return;
+		return TRUE;
 		}
 	strcpy(study, it->study);
 	if (study[0]==0) SCLookupStudy(DB, it->inst, study);
@@ -24671,7 +24826,7 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	SCAEWhere(DB, aew, ae);
 	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
 	if (!DB.Query("SCObject", "State", where, NULL))
-		{ OperatorConsole.printf("*** Storage commitment: database query failed, send of %s to %s not recorded\n", it->inst, ae); return; }
+		{ OperatorConsole.printf("*** Storage commitment: database query failed, send of %s to %s kept in the queue\n", it->inst, ae); return FALSE; }
 	state[0] = 0;
 	DB.BindField(1, SQL_C_CHAR, state, sizeof(state), &len);
 	BOOL exists = DB.NextRecord();
@@ -24680,23 +24835,22 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
 		{
 		if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
-			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return; }
+			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return TRUE; }
 		// the destination of this send (the map may have changed since an earlier one)
 		sprintf(upd, "LastSent = %u, Gen = Gen + 1, DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
 			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
 			it->differ ? ", NoResend = 1" : "");
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
-			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae); return; }
-		SCCheckStale(DB, aew, it);
-		return;
+			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s, kept in the queue\n", it->inst, ae); return FALSE; }
+		return SCCheckStale(DB, aew, it);
 		}
 
 	// still SC in acrnema.map; the destination recorded is the one actually used for the send
 	// (never rebuilt from the map): a different map address later holds the object
 	if (!GetACRNemaEntryByAE(ae, &E) || !(E.Flags & ACR_SC))
-		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); return; }
+		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); return TRUE; }
 	if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
-		{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return; }
+		{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return TRUE; }
 
 	if (exists)
 		{
@@ -24705,9 +24859,8 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 			"Gen = Gen + 1",
 			t, t, study, it->ip, it->port, it->tls, it->differ);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
-			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae); return; }
-		SCCheckStale(DB, aew, it);
-		return;
+			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s, kept in the queue\n", it->inst, ae); return FALSE; }
+		return SCCheckStale(DB, aew, it);
 		}
 
 	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
@@ -24715,8 +24868,8 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d, 1",
 		ae, it->inst, it->cls, study, t, t, it->ip, it->port, it->tls, it->differ);
 	if (!DB.AddRecord("SCObject", cols, vals))
-		{ OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae); return; }
-	SCCheckStale(DB, aew, it);
+		{ OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s kept in the queue\n", it->inst, ae); return FALSE; }
+	return SCCheckStale(DB, aew, it);
 	}
 
 // objects of a transaction still REQUESTED: TIMEOUT when the attempts are used up or the
@@ -25875,9 +26028,30 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 		}
 	if (!SCEnsureTables(DB)) { DB.Close(); return; }
 
+	// in queue order; the first one that fails on the database and all after it stay in the
+	// queue (still visible to "study confirmed") and are tried again on the next pass
+	static unsigned int lastnote = 0, lastalarm = 0;
 	n = SCTakeNoted(buf, SC_DRAINMAX);
-	for (i=0; i<n; i++) SCRecordNoted(DB, buf+i);
-	SCDropNoted(n);				// visible to "study confirmed" until recorded
+	for (i=0; i<n; i++)
+		if (!SCRecordNoted(DB, buf+i)) break;
+	SCDropNoted(i);
+	if (i<n)
+		{
+		unsigned int t0 = (unsigned int)time(NULL);
+		unsigned int age = t0 > buf[i].t ? t0 - buf[i].t : 0;
+		unsigned int limit = 10*OutgoingSCScanInterval < 60 ? 60 : 10*OutgoingSCScanInterval;
+		if (t0 >= lastnote + 60)
+			{
+			OperatorConsole.printf("*** Storage commitment: %d noted send(s) not recorded yet (database), kept in the queue and tried again\n", n-i);
+			lastnote = t0;
+			}
+		if (age >= limit && t0 >= lastalarm + 600)
+			{
+			OperatorConsole.printf("*** Storage commitment ALARM: noted sends wait %u s to be recorded (database); their studies are not confirmed meanwhile\n", age);
+			lastalarm = t0;
+			}
+		}
+	SCOverflowPersist(DB);
 
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
@@ -27652,6 +27826,20 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
 		SCStatusText(Response, 5000);
+		return true;
+		}
+
+	// outgoing storage commitment: queue overflow epoch (no study confirmed while it lasts)
+	if (memcmp(SilentText, "sc_overflow_clear:", 18)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCOverflowClearCommand(Response);
+		return true;
+		}
+	if (memcmp(SilentText, "sc_overflow:", 12)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCOverflowCommand(Response);
 		return true;
 		}
 

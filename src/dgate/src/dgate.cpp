@@ -1337,6 +1337,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			object stored again locally becomes CHANGED at once (not confirmed until sent again),
 			and sends that started before that are stale; "study confirmed" is 0 while a send of
 			the study is still in the in-memory queue
+20261026	mmd	Outgoing storage commitment: a send is noted with the destination actually used (called
+			AE of the association, e.g. the dest clause of a forward; address, port and TLS of the
+			connection, PDU_Service::Connected*); requests and re-sends only go there (else HELD)
 
 ENDOFUPDATEHISTORY
 */
@@ -3875,6 +3878,7 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 void SCLocalWritten(const char *inst);
 unsigned int SCSendSeq(void);
 void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 
 void TestCompress(char *filename, const char *modes, ExtendedPDU_Service *PDU);
 void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Service *PDU);
@@ -6146,7 +6150,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
-        if (scOn) SCNoteSentSeq(line+offset, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
+        if (scOn) SCNoteSentPDU(PDU+part, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
       
         ImagesForwarded++;
         if (level==4) 
@@ -10583,7 +10587,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
   	  PDU[channel].Close();
 	}
 	else
-	{ if (scOn) SCNoteSentSeq(line+offset, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
+	{ if (scOn) SCNoteSentPDU(PDU+channel, scCls, scInst, scStudy, script[0]!=0, scSeq);	// script clause: sent copy may differ
 	  ImagesForwarded++;
 
 	  if (level==4) 
@@ -22702,6 +22706,7 @@ static void SCImageSeriesJoin(char *out)
 	}
 
 static BOOL SCNotedPending(const char *ae, const char *study);
+static BOOL SCSqlText(const char *s, int max);
 
 // Confirmed check with the number of local objects of the study in *objects.
 // Returns 1 when confirmed for ALL given AEs, 0 when not, -1 on error. nAE==0: all AEs that
@@ -23263,8 +23268,10 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 //////////////////////////////////////////////////////////////////////////////////////////
 
 // one successful C-STORE to a node, to be picked up by the storage commitment worker;
+// ae/ip/port/tls: the destination actually used (called AE of the association, address, TLS);
 // seq: SCSendSeq() taken when the send started (before the object was read)
-struct SCNoted { char ae[20]; char cls[68]; char inst[68]; char study[68]; unsigned int t; int differ; unsigned int seq; };
+struct SCNoted { char ae[20]; char ip[128]; char port[20]; int tls; char cls[68]; char inst[68]; char study[68];
+		 unsigned int t; int differ; unsigned int seq; };
 
 #define SC_NOTEDMAX 50000
 #define SC_CHANGEMAX 4096
@@ -23335,7 +23342,12 @@ static BOOL SCChangedSince(const char *inst, unsigned int seq)
 // copy, e.g. not anonymised where the sent copy was.
 // seq: SCSendSeq() from the start of the send; a local change of the object after it makes the
 // send stale (never confirmed).
-void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
+// CalledAE, IP, Port, TLS: the destination actually used for the C-STORE (the called AE title of
+// the association, the address and port connected to, TLS or not). The worker records exactly
+// these; requests and re-sends only go there, and are HELD when the map says otherwise.
+// Not noted (never confirmed) when the called AE has no SC in acrnema.map or a value is unusable.
+void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int TLS,
+	const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
 	{
 	ACRNemaAddress	E;
 	char		ae[20];
@@ -23343,15 +23355,20 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 	int		n = 0;
 
 	if (!OutgoingStorageCommitment) return;
-	if (!AE || !SOPClassUID || !SOPInstanceUID) return;
+	if (!CalledAE || !IP || !Port || !SOPClassUID || !SOPInstanceUID) return;
 
 	memset(ae, 0, sizeof(ae));
-	strncpy(ae, AE, 16);
+	strncpy(ae, CalledAE, 16);
 	SCTrim(ae);
 	if (!SCIsAE(ae)) return;
 	if (!GetACRNemaEntryByAE(ae, &E)) return;
 	if (!(E.Flags & ACR_SC)) return;
 	if (!SCIsUID(SOPClassUID) || !SCIsUID(SOPInstanceUID)) return;
+	if (!IP[0] || !Port[0] || !SCSqlText(IP, 127) || !SCSqlText(Port, 16))
+		{
+		OperatorConsole.printf("*** Outgoing storage commitment: send of %s to %s not noted (unusable address)\n", SOPInstanceUID, ae);
+		return;
+		}
 
 	EnterCriticalSection(&SCNotedCritical);
 	if (SCNotedCount >= SC_NOTEDMAX)
@@ -23363,6 +23380,9 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 		{
 		SCNoted *q = SCNotedQueue + (SCNotedHead + SCNotedCount) % SC_NOTEDMAX;
 		strcpy(q->ae, ae);
+		strcpy(q->ip, IP);
+		strcpy(q->port, Port);
+		q->tls = TLS ? 1 : 0;
 		strcpy(q->cls, SOPClassUID);
 		strcpy(q->inst, SOPInstanceUID);
 		if (StudyUID && SCIsUID(StudyUID)) strcpy(q->study, StudyUID);
@@ -23377,6 +23397,28 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 	// a dropped item is never confirmed (safe side); one line per 1000 drops
 	if (dropped && (dropped % 1000)==1)
 		OperatorConsole.printf("*** Outgoing storage commitment: queue full (%d), %u sent object(s) not noted so far\n", n, dropped);
+	}
+
+// The same for a C-STORE on PDU: the destination is the one its last Connect really used
+void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
+	{
+	if (!OutgoingStorageCommitment || !PDU) return;
+	SCNoteSentEx2(PDU->ConnectedAE, PDU->ConnectedHost, PDU->ConnectedPort, PDU->ConnectedTLS,
+		SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq);
+	}
+
+// Older interface (kept as wrappers): the destination is taken from the map entry of AE as it is
+// now, which may not be where the object went; the send paths use SCNoteSentPDU
+void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
+	{
+	ACRNemaAddress	E;
+	char		ae[20];
+	if (!OutgoingStorageCommitment || !AE) return;
+	memset(ae, 0, sizeof(ae));
+	strncpy(ae, AE, 16);
+	SCTrim(ae);
+	if (!SCIsAE(ae) || !GetACRNemaEntryByAE(ae, &E)) return;
+	SCNoteSentEx2(ae, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq);
 	}
 
 // without a send sequence: the send is taken as started now
@@ -23984,7 +24026,10 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 
 	if (exists && (strcmp(state, "NOTED")==0 || strcmp(state, "REQUESTED")==0))
 		{
-		sprintf(upd, "LastSent = %u, Gen = Gen + 1%s%s", t,
+		if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
+			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return; }
+		// the destination of this send (the map may have changed since an earlier one)
+		sprintf(upd, "LastSent = %u, Gen = Gen + 1, DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
 			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
 			it->differ ? ", NoResend = 1" : "");
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
@@ -23993,18 +24038,19 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 		return;
 		}
 
-	// the destination as it is now in acrnema.map: a later address change holds the object
+	// still SC in acrnema.map; the destination recorded is the one actually used for the send
+	// (never rebuilt from the map): a different map address later holds the object
 	if (!GetACRNemaEntryByAE(ae, &E) || !(E.Flags & ACR_SC))
 		{ OperatorConsole.printf("*** Storage commitment: %s no longer has SC in acrnema.map, send of %s not recorded\n", ae, it->inst); return; }
-	if (!SCSqlText(E.IP, 128) || !SCSqlText(E.Port, 16))
-		{ OperatorConsole.printf("*** Storage commitment: unusable address of %s in acrnema.map, send not recorded\n", ae); return; }
+	if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
+		{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return; }
 
 	if (exists)
 		{
 		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
 			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d, "
 			"Gen = Gen + 1",
-			t, t, study, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
+			t, t, study, it->ip, it->port, it->tls, it->differ);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s\n", it->inst, ae); return; }
 		SCCheckStale(DB, aew, it);
@@ -24014,7 +24060,7 @@ static void SCRecordNoted(Database &DB, SCNoted *it)
 	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
 		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend, Gen");
 	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d, 1",
-		ae, it->inst, it->cls, study, t, t, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, it->differ);
+		ae, it->inst, it->cls, study, t, t, it->ip, it->port, it->tls, it->differ);
 	if (!DB.AddRecord("SCObject", cols, vals))
 		{ OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s not recorded\n", it->inst, ae); return; }
 	SCCheckStale(DB, aew, it);
@@ -24276,8 +24322,9 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	UINT16	status;
 	int	i;
 
-	strcpy(ip, E->IP);
-	strcpy(port, E->Port);
+	// the recorded destination of the objects (SCSendChunk held those that differ from the map)
+	strcpy(ip, it[0].ip);
+	strcpy(port, it[0].port);
 	strcpy(called, ae);
 
 	PDU.AttachRTC(&VRType);
@@ -24291,9 +24338,11 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	PDU.AddAbstractSyntax(uid);		// refuses only the commitment class still accepts the
 	PDU.SetTimeOut(TCPIPTimeOut);		// association, so that case is told from a failed connect
 
-	// TLS when the node has T (Connect refuses, never plain, when TLS cannot be used)
+	// TLS as recorded for the objects (= the node's T; Connect refuses, never plain, when TLS
+	// cannot be used)
 	ACRNemaAddress EE = *E;
 	strcpy(EE.Name, called);
+	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
 	SCPrepareTLS(PDU, EE);
 
 	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
@@ -24701,14 +24750,16 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		}
 	uid.Set("1.2.840.10008.1.1");
 	PDU.AddAbstractSyntax(uid);
+	// only the recorded destination of the first send (equal to the map: others were HELD above)
 	ACRNemaAddress EE = E;
 	strcpy(EE.Name, ae);
+	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
 	SCPrepareTLS(PDU, EE);
 
 	OperatorConsole.printf("Storage commitment: re-sending %d object(s) of study %s to %s\n", n, it[0].study, ae);
-	if (!PDU.Connect((unsigned char *)E.IP, (unsigned char *)E.Port))
+	if (!PDU.Connect((unsigned char *)it[0].ip, (unsigned char *)it[0].port))
 		{
-		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), tried again later\n", ae, E.IP, E.Port);
+		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), tried again later\n", ae, it[0].ip, it[0].port);
 		for (i=0; i<n; i++) free(it[i].file);
 		return SC_CHUNK_DOWN;
 		}
@@ -33684,7 +33735,7 @@ static int WINAPI DcmPrintADDO(Array<DICOMDataObject*>*pADDO,
           { OperatorConsole.printf("*** dicomstore: failed to send DICOM image to %s\n", ae);
             nfail++;
 	  }
-	  else if (scOn) SCNoteSentSeq(ae, scCls, scInst, scStudy, 1, scSeq);	// a Lua object: may differ from the archive
+	  else if (scOn) SCNoteSentPDU(&PDU, scCls, scInst, scStudy, 1, scSeq);	// a Lua object: may differ from the archive
 	  delete DDO;
 	}
 	

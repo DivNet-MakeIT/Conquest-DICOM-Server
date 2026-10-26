@@ -31,6 +31,8 @@
 			without HAVE_OPENSSL a TLS connection is refused. Plain sockets unchanged.
 20261026	mmd	Incoming TLS: TLSAccept (server handshake with a time limit on an
 			accepted socket) and the ServerContext hook
+20261026	mmd	TLS mode only: the TCP connect is non-blocking with a deadline of TimeOut
+			(TCPIPTimeOut at the connect sites); plain connect unchanged
 
 */
 
@@ -492,8 +494,26 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 	sa.sin_family = AF_INET;
 	sa.sin_port = secopy.s_port;
 
+#ifdef	HAVE_OPENSSL
+	// TLS mode only: all connect attempts together end at the deadline (a node that
+	// does not answer would otherwise block for the kernel's connect timeout)
+	long	ConnectEnd = (long) time(NULL) + (TimeOut > 0 ? TimeOut : 300);
+#endif
 	for (int i=0; i<5; i++)
 		{
+#ifdef	HAVE_OPENSSL
+		if ( TLSMode )
+			{
+			int r = TLSConnect(ConnectEnd);
+			if ( r == 2 )
+				{
+				SocketTLSPrint(0, "*** TLS: connection to %s (%s) timed out after %d s", TLSPeerAE, ip, TimeOut > 0 ? TimeOut : 300);
+				break;
+				}
+			Error = r ? -1 : 0;
+			}
+		else
+#endif
 		Error = connect(Socketfd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in));
 		if( ! Error )
 			{
@@ -859,6 +879,61 @@ static	void	SocketTLSErrorText(SSL *ssl, int e, char *buf, int len)
 		snprintf(buf, len, "TLS error %d (connection closed or reset)", e);
 	}
 
+// TCP connect for TLS mode: non-blocking, ends at time end (seconds since the
+// epoch). Returns 0 connected, 1 failed (e.g. refused; the caller may retry),
+// 2 timed out. The socket stays non-blocking (TLSOpen needs that anyway).
+int	Socket	::	TLSConnect(long end)
+	{
+	fd_set		wfds, efds;
+	struct	timeval	tv;
+	int		r, err, left;
+#ifdef	WINDOWS
+	int		len = sizeof(err);
+	u_long	nb = 1;
+	ioctlsocket(Socketfd, FIONBIO, &nb);
+#else
+	socklen_t	len = sizeof(err);
+	fcntl(Socketfd, F_SETFL, fcntl(Socketfd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+
+	r = connect(Socketfd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in));
+	if (r == 0)
+		return 0;
+#ifdef	WINDOWS
+	if (WSAGetLastError() != WSAEWOULDBLOCK)
+		return 1;
+#else
+	if (errno != EINPROGRESS && errno != EINTR)
+		return 1;
+#endif
+	for (;;)
+		{
+		left = (int)(end - (long) time(NULL));
+		if (left <= 0)
+			return 2;
+		tv.tv_sec = left;
+		tv.tv_usec = 0;
+		FD_ZERO(&wfds);
+		FD_SET(Socketfd, &wfds);
+		FD_ZERO(&efds);
+		FD_SET(Socketfd, &efds);		// Windows reports a failed connect here
+		r = select(Socketfd + 1, NULL, &wfds, &efds, &tv);
+		if (r == 0)
+			return 2;
+		if (r < 0)
+			{
+#ifndef	WINDOWS
+			if (errno == EINTR) continue;
+#endif
+			return 1;
+			}
+		err = 0;
+		if (getsockopt(Socketfd, SOL_SOCKET, SO_ERROR, (char *) &err, &len) != 0 || err != 0)
+			return 1;
+		return 0;
+		}
+	}
+
 // TLS handshake on the connected socket (client side), with a time limit and
 // the application's certificate checks. On failure the SSL object is freed and
 // FALSE returned; the caller closes the socket.
@@ -1143,6 +1218,7 @@ INT	Socket	::	TLSRead(BYTE *s, UINT count)
 
 // builds without HAVE_OPENSSL: TLS is never active (Open refuses TLSMode)
 BOOL	Socket	::	TLSOpen(char *host)		{ return ( FALSE ); }
+int	Socket	::	TLSConnect(long end)		{ return ( 1 ); }
 BOOL	Socket	::	TLSAccept(int fd, const char *peer)
 	{
 	SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: this dgate was built without TLS support", peer);

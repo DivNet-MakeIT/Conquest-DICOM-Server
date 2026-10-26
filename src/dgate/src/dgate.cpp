@@ -1371,6 +1371,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			queue and is retried (alarm when old); a send dropped because the queue is full starts an
 			overflow epoch (table SCMarker): "study confirmed" answers 0 until the queue has drained
 			and the operator clears it with sc_overflow_clear:; sc_overflow: shows it
+20261026	mmd	Outgoing storage commitment: a regen pass (dgate -r, regen:) no longer makes SC rows
+			CHANGED (regenfile: still does); Gen stops at 2000000000 (never wraps) and a row at
+			that value is never asked about nor confirmed
 
 ENDOFUPDATEHISTORY
 */
@@ -23115,6 +23118,15 @@ static BOOL SCAddGenColumn(Database &DB, const char *table, const char *probe)
 // Gen (SCObject, SCTxMember): content generation of the object as sent to the destination;
 // every noted send and every local overwrite increments it; a result only applies to the
 // generation that was asked about (SCTxMember.Gen)
+//
+// Gen never wraps: it is an int column, and it stops at SC_GENMAX (SC_GENINC). A row at
+// SC_GENMAX can no longer tell a newer generation from an older one, so it is never selected
+// for a request, never reserved and no result applies to it (SC_GENOK): it is never confirmed (fails closed;
+// the deadline makes it TIMEOUT). 2e9 sends or overwrites of one object do not happen in
+// practice; this only makes sure that an overflow cannot confirm anything.
+#define SC_GENMAX "2000000000"
+#define SC_GENINC "Gen = CASE WHEN Gen < " SC_GENMAX " THEN Gen + 1 ELSE " SC_GENMAX " END"
+#define SC_GENOK  "Gen < " SC_GENMAX
 BOOL SCEnsureTables(Database &DB)
 	{
 	BOOL ok = TRUE;
@@ -23617,7 +23629,7 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 		if (m[i].seen==1)
 			{
 			sprintf(upd, "State = 'COMMITTED', CommittedAt = %u, FailReason = 0", (unsigned int)time(NULL));
-			sprintf(where, "%s and SOPInstUID = '%s' and Gen = %d", aew, m[i].inst, m[i].gen);
+			sprintf(where, "%s and SOPInstUID = '%s' and Gen = %d and " SC_GENOK, aew, m[i].inst, m[i].gen);
 			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 			}
 		}
@@ -23628,7 +23640,7 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 				{
 				// NextTry: earliest re-send (only used for nodes with R); a cancelled object stays cancelled
 				sprintf(upd, "State = 'FAILED', FailReason = %d, NextTry = %u", m[i].reason, (unsigned int)time(NULL) + OutgoingSCResendDelay);
-				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and State <> 'CANCELLED' and TxUID = '%s' and Gen = %d", aew, m[i].inst, TxUID, m[i].gen);
+				sprintf(where, "%s and SOPInstUID = '%s' and State <> 'COMMITTED' and State <> 'CANCELLED' and TxUID = '%s' and Gen = %d and " SC_GENOK, aew, m[i].inst, TxUID, m[i].gen);
 				if (!DB.UpdateRecords((char *)"SCObject", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 				}
 
@@ -24244,7 +24256,7 @@ static void SCOverflowClearCommand(char *Response)
 // for an earlier request no longer applies), state CHANGED (not asked, not re-sent: the archive
 // copy is not what was sent) unless CANCELLED; the next noted send starts the object over
 static const char *SCChangedUpdate =
-	"Gen = Gen + 1, TxUID = '', CommittedAt = 0, Attempts = 0, NoResend = 1, NextTry = 0, "
+	SC_GENINC ", TxUID = '', CommittedAt = 0, Attempts = 0, NoResend = 1, NextTry = 0, "
 	"State = CASE WHEN State = 'CANCELLED' THEN 'CANCELLED' ELSE 'CHANGED' END";
 
 // An object is being stored locally (SaveToDataBase, before its image record is written).
@@ -24837,7 +24849,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 		if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
 			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); return TRUE; }
 		// the destination of this send (the map may have changed since an earlier one)
-		sprintf(upd, "LastSent = %u, Gen = Gen + 1, DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
+		sprintf(upd, "LastSent = %u, " SC_GENINC ", DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
 			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
 			it->differ ? ", NoResend = 1" : "");
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
@@ -24856,7 +24868,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 		{
 		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
 			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d, "
-			"Gen = Gen + 1",
+			SC_GENINC,
 			t, t, study, it->ip, it->port, it->tls, it->differ);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s, kept in the queue\n", it->inst, ae); return FALSE; }
@@ -25495,7 +25507,7 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 	sprintf(upd, "State = 'REQUESTED', TxUID = '%s', Attempts = Attempts + 1", TxUID);
 	// only objects still at the generation the request asks about (a newer send or a local change
 	// in between leaves them out; their result will not apply)
-	sprintf(where, "%s and State = 'NOTED' and SOPInstUID in (SELECT SOPInstUID FROM SCTxMember WHERE TxUID = '%s' and SCTxMember.Gen = SCObject.Gen)", aew, TxUID);
+	sprintf(where, "%s and State = 'NOTED' and " SC_GENOK " and SOPInstUID in (SELECT SOPInstUID FROM SCTxMember WHERE TxUID = '%s' and SCTxMember.Gen = SCObject.Gen)", aew, TxUID);
 	if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 		{
 		OperatorConsole.printf("*** Storage commitment: database update failed, nothing sent to %s\n", ae);
@@ -25536,7 +25548,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 	if (!g || !it) { if (g) free(g); if (it) free(it); return; }
 
 	sprintf(cols, "%s, StudyUID, MAX(LastSent), MAX(NextTry), COUNT(*)", SCAEGroup(DB));
-	sprintf(where, "State = 'NOTED' GROUP BY %s, StudyUID", SCAEGroup(DB));
+	sprintf(where, "State = 'NOTED' and " SC_GENOK " GROUP BY %s, StudyUID", SCAEGroup(DB));
 	if (!DB.Query("SCObject", cols, where, NULL))
 		{ OperatorConsole.printf("*** Storage commitment: database query failed (groups)\n"); free(g); free(it); return; }
 	ae[0] = study[0] = last[0] = next[0] = cnt[0] = 0;
@@ -25569,7 +25581,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 		SCAEWhere(DB, aew, g[i].ae);
 		for (round=0; round<1000; round++)
 			{
-			sprintf(where, "%s and StudyUID = '%s' and State = 'NOTED' and NextTry <= %u", aew, g[i].study, now);
+			sprintf(where, "%s and StudyUID = '%s' and State = 'NOTED' and NextTry <= %u and " SC_GENOK, aew, g[i].study, now);
 			if (!DB.Query("SCObject", "SOPInstUID, SOPClassUID, DestIP, DestPort, DestTLS, Gen", where, NULL))
 				{ OperatorConsole.printf("*** Storage commitment: database query failed (objects)\n"); break; }
 			inst[0] = cls[0] = ip[0] = port[0] = tls[0] = gen[0] = 0;
@@ -25830,7 +25842,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		delete DDO;
 		// back into the normal cycle: asked again with a new TxUID after the quiet time
 		// (not through SCNoteSent; FirstSent is kept)
-		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0, Gen = Gen + 1", now);
+		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0, " SC_GENINC, now);
 		if (!SCResendUpdate(DB, aew, it[i].inst, upd))
 			OperatorConsole.printf("*** Storage commitment ALARM: %s re-sent to %s but the database update failed\n", it[i].inst, ae);
 		else

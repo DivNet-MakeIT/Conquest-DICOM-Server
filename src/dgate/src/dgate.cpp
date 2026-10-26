@@ -20291,7 +20291,10 @@ static	struct	TLSCtxCriticalInit
 	}	TLSCtxCriticalInitObject;
 static	SSL_CTX	*TLSClientCtx = NULL;		// made once, on the first TLS connection
 static	SSL_CTX	*TLSServerCtx = NULL;		// incoming: made once, when the TLS listener starts
-static	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore
+// Both contexts are made under TLSCtxCritical. TLSVerifyPeer is kept in each context
+// (SSL_CTX_set_verify) and read back per connection with SSL_get_verify_mode: no
+// global written while a context is made (the client context can be made by the
+// storage commitment worker while the listener makes the server context).
 
 // the dicom.ini section with the server settings
 static	void	TLSIniSection(char *sc)
@@ -20368,6 +20371,7 @@ static	SSL_CTX	*TLSMakeContext(BOOL server)
 	char	sc[64], cert[256], key[256], ca[256], verify[32], minv[32], ciphers[1024], err[256];
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
+	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore (this context only)
 
 	TLSIniSection(sc);
 	MyGetPrivateProfileString(sc, "TLSCertificate", "", cert, sizeof(cert), ConfigFile);
@@ -20610,7 +20614,8 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	cert = SSL_get_peer_certificate(ssl);
 #endif
 
-	if (!TLSVerifyMode && TLSHostnameCheckOn() && (!cert || !TLSCertMatchesHost(cert, host)))
+	// TLSVerifyPeer = ignore for this connection's context: the host name check by hand
+	if (SSL_get_verify_mode(ssl)==SSL_VERIFY_NONE && TLSHostnameCheckOn() && (!cert || !TLSCertMatchesHost(cert, host)))
 		{
 		OperatorConsole.printf("*** TLS: certificate of %s does not match host %s; connection refused\n", AE, host);
 		if (cert) X509_free(cert);
@@ -20723,15 +20728,15 @@ void	StartTLSListener(void)
 		OperatorConsole.printf("*** TLS: no TLS listener on TLSPort %s in non-threaded debug mode\n", (char *)TLSPort);
 		return;
 		}
+	EnterCriticalSection(&TLSCtxCritical);		// as the client context: made under the lock
 	ctx = TLSMakeContext(TRUE);
+	TLSServerCtx = ctx;
+	LeaveCriticalSection(&TLSCtxCritical);
 	if (!ctx)
 		{
 		OperatorConsole.printf("*** TLS: no usable TLS server configuration: no TLS listener on TLSPort %s\n", (char *)TLSPort);
 		return;
 		}
-	EnterCriticalSection(&TLSCtxCritical);
-	TLSServerCtx = ctx;
-	LeaveCriticalSection(&TLSCtxCritical);
 #ifdef WIN32
 	unsigned long ThreadID;
 	CreateThread(NULL, 2097152, (LPTHREAD_START_ROUTINE) TLSListenerThread, NULL, 0, &ThreadID);

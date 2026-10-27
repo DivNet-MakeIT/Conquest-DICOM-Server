@@ -563,7 +563,10 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
 | `0 request not sent` / `0 no response to the request` / `0 request refused` | the N-ACTION could not be sent, got no N-ACTION-RSP, or got an error status |
 | `0 internal error (…)` | no random TransactionUID, out of memory |
 
-- Timeout: default 60 s, 1..600. It covers all chunks.
+- Timeout: default 60 s, 1..600. It covers all chunks, and it is the deadline of every request
+  association too (connect, TLS handshake, N-ACTION, its response, the same-association wait and
+  the release, which is aborted when the archive does not reply): an archive that stops answering
+  at any point gives `0 no result` at the timeout and frees the `OutgoingSCVerifyMax` slot.
 - One console line per verification (3.7), plus one per request and per result.
 - What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). The archive
   does not compare content; step 7 compares the local file with the one last sent and committed.
@@ -730,9 +733,14 @@ rejected (<protocol> <cipher>): <AE> has T without L in acrnema.map, use TLSPort
 **Interoperability note (OsiriX MD)**
 - As measured, OsiriX MD negotiates only TLS 1.0 / 1.2 with AES-CBC suites, so it needs the legacy
   profile.
-- Its default identity is a 1024-bit RSA certificate. The legacy policy rejects that certificate
-  (the refusal reason reads `peer certificate RSA 1024 bit < 2048 (OsiriX default certificate?
-  choose a 2048-bit identity)`), so it must be replaced by a 2048-bit identity.
+- Its default identity is a 1024-bit RSA certificate, self-signed. It is refused in one of two ways,
+  and it must be replaced by a 2048-bit identity in both cases:
+  - not trusted (not in `TLSCAFile`, not pinned, `TLSAcceptSelfSigned=0`): the handshake fails in
+    the certificate check, and the line reads `certificate verification failed: self-signed
+    certificate`;
+  - trusted or pinned (in `TLSCAFile` or `TLSNodeCertsFile`, or `TLSAcceptSelfSigned=1`): the key
+    size check after the handshake refuses it with `peer certificate RSA 1024 bit < 2048 (OsiriX
+    default certificate? choose a 2048-bit identity)`.
 
 ### 4.4 Build without OpenSSL
 
@@ -930,4 +938,11 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `48c2229` Outgoing storage commitment: sc_verify_now: also checks that the local content is the content committed
 - `4d2ad38` Outgoing storage commitment: DestTLS 2 for sends with the TLS legacy profile
 - `dd233de` Comments: remove development-process markers
-- this commit: Docs: worker limits, file stamps, verify step 7, upstream AE options
+- `be60fcc` Docs: worker limits, file stamps, verify step 7, upstream AE options
+
+**Content guarantee, verified delete, deadlines**
+- `0e5d63e` Outgoing storage commitment: a send that may change the content certifies nothing
+- `cb3d4b1` Outgoing storage commitment: check again after step 7; sc_verify_and_delete: with local writes excluded
+- `93fa22b` Outgoing storage commitment: file stamp v2 with the change time
+- `1c9217a` Outgoing storage commitment: one deadline for the worker's connect and association setup
+- this commit: Outgoing storage commitment: sc_verify_now: keeps its timeout when the archive stops answering

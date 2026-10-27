@@ -1464,6 +1464,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			Deadline) for TCP connect, TLS handshake, A-ASSOCIATE-RQ and the A-ASSOCIATE-AC read of
 			the worker's requests and re-sends: a peer that never answers or sends the AC byte by byte
 			is cut off at the deadline
+20261027	mmd	Outgoing storage commitment: sc_verify_now: the verification's deadline is the deadline of
+			its whole request association (connect, N-ACTION, its response, the same-association wait,
+			release); the release is bounded (SCRelease: A-ABORT when no reply) and never waits past
+			the deadline; failures at the deadline answer 0 no result
 
 ENDOFUPDATEHISTORY
 */
@@ -26435,6 +26439,8 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 	if (limit>10) limit = 10;
 	if (!PDU.Link.Connected) { PDU.Link.Close(); return; }
 	time_t until = time(NULL) + limit;
+	if (PDU.Link.Deadline > 0 && (time_t)PDU.Link.Deadline < until)
+		until = (time_t)PDU.Link.Deadline;	// a connection with a deadline (sc_verify_now:) ends by it
 	ok = PDU.AReleaseRQ::Write(PDU);
 	while (ok && !buffered && PDU.Link.Connected && !PDU.Link.Poll())
 		{
@@ -26988,7 +26994,12 @@ static BOOL SCVerifyWaitSameAssoc(SCAssocPDU &PDU, const char *ae, int k, time_t
 // One request of a verification: association to the address of map entry E (TLS when it has T),
 // N-ACTION with TransactionUID tx for exactly the objects o[0..n-1] (pending as k), then the
 // same-association wait (OutgoingSCSameAssocWait, within the deadline). NULL when the request was
-// accepted, else the reason.
+// accepted, else the reason. The verification's deadline is the socket deadline of the whole
+// association (Socket::Deadline: connect, handshake, N-ACTION, its response, the release), and the
+// release is SCRelease (bounded, A-ABORT): an archive that stops answering at any point cannot hold
+// the verification (and its OutgoingSCVerifyMax slot) past its timeout. A failure at the deadline
+// answers "no result".
+#define SCV_LATE(w)	(time(NULL) >= deadline ? "no result" : (w))
 static const char *SCVerifyRequest(const char *ae, ACRNemaAddress *E, const char *tx, SCVerifyObj *o, int n, int k, time_t deadline)
 	{
 	SCAssocPDU PDU;
@@ -27020,10 +27031,11 @@ static const char *SCVerifyRequest(const char *ae, ACRNemaAddress *E, const char
 	ACRNemaAddress EE = *E;
 	strcpy(EE.Name, called);
 	if (!SCPrepareTLS(PDU, EE)) return "TLS not available for this node";
-	if (!PDU.Connect((unsigned char *)E->IP, (unsigned char *)E->Port)) return "no connection";
+	PDU.Link.Deadline = (long)deadline;		// for everything on this association (kept until it is closed)
+	if (!PDU.Connect((unsigned char *)E->IP, (unsigned char *)E->Port)) return SCV_LATE("no connection");
 	if (!PDU.IsAbstractSyntaxAccepted(scclass))
 		{
-		if (!PDU.Close()) PDU.Link.Close();
+		SCRelease(PDU, FALSE, called, "verify association");
 		return "storage commitment not accepted";
 		}
 
@@ -27046,17 +27058,17 @@ static const char *SCVerifyRequest(const char *ae, ACRNemaAddress *E, const char
 	if (!ActionRequest.Write(&PDU, &DDO, &instance, 1))
 		{
 		PDU.Link.Close();
-		return "request not sent";
+		return SCV_LATE("request not sent");
 		}
 	if (!PDU.Read(&DCO) || !ActionResponse.Read(&DCO, &PDU, &RDO))
 		{
 		PDU.Link.Close();
-		return "no response to the request";
+		return SCV_LATE("no response to the request");
 		}
 	if (DCO.GetUINT16(0x0000, 0x0900)!=0)
 		{
 		OperatorConsole.printf("*** Storage commitment verify: N-ACTION refused by %s with status 0x%04x (transaction %s)\n", ae, DCO.GetUINT16(0x0000, 0x0900), tx);
-		if (!PDU.Close()) PDU.Link.Close();
+		SCRelease(PDU, PDU.Pending(), called, "verify association");
 		return "request refused";
 		}
 
@@ -27067,9 +27079,10 @@ static const char *SCVerifyRequest(const char *ae, ACRNemaAddress *E, const char
 		PDU.Link.Close();
 		return NULL;
 		}
-	if (!PDU.Close()) PDU.Link.Close();
+	SCRelease(PDU, PDU.Pending(), called, "verify association");
 	return NULL;
 	}
+#undef SCV_LATE
 
 // One chunk: register a pending request with a new TransactionUID, ask, wait for the result until
 // the deadline, remove the pending request. NULL when every object was reported committed, else

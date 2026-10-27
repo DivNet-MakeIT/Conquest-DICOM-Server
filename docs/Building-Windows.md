@@ -120,6 +120,11 @@ Notes:
 
 ## 4. Running
 
+- Prebuilt: `install64/dgate64.exe` (plain) and `install64/dgate64tls.exe` (TLS, OpenSSL linked
+  statically), built with `amake.bat` and Visual Studio 2022 x64 as in 2.2 and 2.3 (commit
+  "Windows binaries", last on this branch; sha256 sums in its message). They need only
+  `lua5.1.dll` from `install64` and Windows system DLLs. `install32/dgate.exe` is upstream's and
+  was not rebuilt.
 - Files next to `dgate64.exe`:
   - `lua5.1.dll` from `install64` (x64 builds with `LUA51EXTERN`);
   - `dicom.ini` and `acrnema.map`;

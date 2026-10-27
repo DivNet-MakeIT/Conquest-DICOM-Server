@@ -17,3 +17,21 @@ Open source code used includes the Independent JPEG Group's software; charls by 
 In addition, the following minimised sample web viewers are included: papaya (https://github.com/rii-mango/Papaya, build 1446) and ohif (https://github.com/OHIF/Viewers, 1.03). 
 
 The app/newweb code also contains unmaintained interfaces for dwv (https://github.com/ivmartel/dwv), and weasis (https://nroduit.github.io/en/).
+
+---
+
+## Addendum: DivNet-MakeIT fork — about this branch
+
+This is the DivNet-MakeIT fork of [marcelvanherk/Conquest-DICOM-Server](https://github.com/marcelvanherk/Conquest-DICOM-Server); the text above is the upstream readme, unchanged.
+This branch (`sc-outgoing`, variant C, the default branch of this fork) adds storage commitment for incoming and outgoing data with re-send and verify-before-delete to dgate, without DICOM TLS, on top of upstream master `0676009` (1.5.0g4). A node marked `T` (DICOM TLS) in acrnema.map is refused, never sent to in plain text. The same with DICOM TLS is variant B on `sc-outgoing-tls`; incoming storage commitment only is variant A on `sc-incoming`. Every new behaviour is opt-in: with the new settings at their defaults, dgate behaves as 1.5.0g4. Release tag: `sc-outgoing-v1`; the Windows binary `install64/dgate64.exe` is in a separate last commit.
+Start with [docs/README.md](docs/README.md): overview, configuration, build notes, tests, known limitations, upstream observations and a suggested review order.
+
+Branches of this fork:
+
+- `sc-outgoing` (default branch): variant C, storage commitment for incoming and outgoing data with re-send and verify-before-delete, without DICOM TLS (all opt-in), on upstream `0676009` (1.5.0g4); documentation in [docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing/docs/README.md).
+- `sc-outgoing-tls`: variant B, storage commitment for incoming and outgoing data with re-send and verify-before-delete plus DICOM TLS, including a legacy TLS profile (all opt-in), on upstream `0676009` (1.5.0g4); documentation in [docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing-tls/docs/README.md).
+- `sc-incoming`: variant A, storage commitment SCP for incoming data only (opt-in): the same two commits as `storage-commitment`, refreshed on upstream `0676009` (1.5.0g4), with a Windows binary in a separate last commit.
+- `storage-commitment`: the original two-commit version of the incoming storage commitment SCP, on upstream `41575e8` (1.5.0g3); kept unchanged, superseded by `sc-incoming`.
+- `divnet-stable`: upstream `16cfc3e` (1.5.0f) plus one Linux packaging commit (web files installed without overwriting existing ones; Storage Commitment SOP class listed in `linux/dgatesop.lst`).
+- `divnet-stable-1c2ff06`: the same packaging commit on upstream `1c2ff06` (1.5.0g).
+- `master`: untouched copy of upstream master at `16cfc3e` (1.5.0f); not kept in sync with upstream.

@@ -219,7 +219,7 @@ typedef	struct	_ForwardTarget
 	int	Mode;		// 0 plain, 1 TLS, 2 TLS with the legacy profile
 	char	CertAE[20];	// AE whose line in TLSNodeCertsFile binds the peer certificate
 	}	ForwardTarget;
-BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarget *T);
+BOOL	ForwardResolve(char *to, char *dest, char *ip, char *port, char *compress, ForwardTarget *T);
 BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T);
 BOOL	ForwardReuseMismatch(PDU_Service &PDU, const char *ip, const char *port, const char *called, ForwardTarget *T, const char **why);
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport

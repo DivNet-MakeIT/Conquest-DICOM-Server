@@ -629,6 +629,11 @@ sockets keep their old code paths exactly. TLS is built only with `-DHAVE_OPENSS
   - Lua `dicomstore`, `dicomecho`, `dicomquery`, `dicommove`, `dicomget` and `dicomprint`;
   - virtual server, grab and echo;
   - the storage commitment event and worker.
+- A forward with a `dest` clause (`forward to X dest Y`: the address from X, Y is the called AE)
+  uses TLS when X or Y has `T` in the map; the legacy profile only when every one of them that has
+  `T` also has `L`, else strict. The peer certificate is checked against the line of Y in
+  `TLSNodeCertsFile`, or that of X when Y has none. `forward to host:port dest Y` with `T` on Y is
+  TLS (or refused), never plain.
 - The TCP connect is bounded in TLS mode.
 - Converter forwards keep their association open between objects. A kept association is reused
   only when its TLS mode (plain, strict, legacy) is what the map asks for now and, with TLS on

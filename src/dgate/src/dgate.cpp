@@ -1433,6 +1433,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			meanwhile, the path does not read a file, or the system gives no nanoseconds or inode. The
 			reconciliation of sc_unsafe_clear: compares it with the file now (rows without a stamp: the
 			whole-second rule). Test-only key SCTestDelayBeforeRecord
+20261026	mmd	Outgoing storage commitment log: failure and alarm lines start with *** (also a result with
+			failed objects, a failed request, an incomplete re-send); requests and re-sends show the
+			attempt and its limit (attempt a/b; re-sends with the source of the limit: Rn, R from
+			dicom.ini, RI); request, acceptance, result, timeout, UNSUPPORTED, HELD, CANCELLED and
+			CHANGED lines name the study, the number of objects and the transaction where known
 
 ENDOFUPDATEHISTORY
 */
@@ -24088,6 +24093,26 @@ static BOOL SCCheckSequence(DICOMDataObject *DDO, UINT16 element, SCMember *m, i
 // Nothing is changed unless the whole report is consistent. Returns the DIMSE status to answer.
 // Confirmed != NULL (only when the OutgoingSCStudyConfirmed hook is set): receives the
 // studies (malloc'ed, *nConfirmed items) that this result made confirmed for CallingAE.
+// study (one of them when a transaction ever had several: "-") and number of objects of transaction
+// TxUID for destination aew (SCObject rows that carry it); "-" and 0 when the database does not tell
+static void SCTxStudy(Database &DB, const char *aew, const char *TxUID, char *study, int *n)
+	{
+	char where[256], lo[72], hi[72], cnt[32];
+	SQLLEN len;
+	strcpy(study, "-");
+	*n = 0;
+	sprintf(where, "%s and TxUID = '%s'", aew, TxUID);
+	if (!DB.Query("SCObject", "MIN(StudyUID), MAX(StudyUID), COUNT(*)", where, NULL)) return;
+	lo[0] = hi[0] = cnt[0] = 0;
+	DB.BindField(1, SQL_C_CHAR, lo, 70, &len);
+	DB.BindField(2, SQL_C_CHAR, hi, 70, &len);
+	DB.BindField(3, SQL_C_CHAR, cnt, sizeof(cnt), &len);
+	if (!DB.NextRecord()) return;
+	SCTrim(lo); SCTrim(hi);
+	if (lo[0] && strcmp(lo, hi)==0 && SCIsUID(lo)) strcpy(study, lo);
+	*n = atoi(cnt);
+	}
+
 static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DICOMDataObject *DDO,
 	SCConfirmedStudy **Confirmed, int *nConfirmed)
 	{
@@ -24230,7 +24255,13 @@ static UINT16 SCProcessEventReportEx(const char *CallingAE, int EventTypeID, DIC
 	sprintf(where, "TxUID = '%s'", TxUID);
 	if (!DB.UpdateRecords((char *)"SCTransaction", upd, where)) { why = "database update failed (transaction left open)"; goto done; }
 
-	OperatorConsole.printf("Storage commitment result from %s for %s: %d committed, %d failed\n", CallingAE, TxUID, nok, nfail);
+	{
+	char rstudy[72];
+	int nrows;
+	SCTxStudy(DB, aew, TxUID, rstudy, &nrows);
+	OperatorConsole.printf("%sStorage commitment result from %s for %s: %d committed, %d failed (study %s)\n",
+		nfail ? "*** " : "", CallingAE, TxUID, nok, nfail, rstudy);
+	}
 	status = 0;
 
 	// for the hook: those studies that are confirmed now
@@ -25172,7 +25203,11 @@ void SCLocalStored(Database &DB, DICOMDataObject *DDO, BOOL JustAdd)
 		SCUnsafeSet(why);
 		}
 	else
-		OperatorConsole.printf("Storage commitment: %s stored again locally: CHANGED for every destination (not confirmed until it is sent again)\n", inst);
+		{
+		char lstudy[68];
+		if (!SCVRUID(DDO->GetVR(0x0020, 0x000d), lstudy)) strcpy(lstudy, "-");
+		OperatorConsole.printf("Storage commitment: %s stored again locally: CHANGED for every destination (not confirmed until it is sent again; study %s, %d row(s))\n", inst, lstudy, n);
+		}
 	}
 
 // A local write started by SCWriteBegin ends (SaveToDisk; written: the new file is complete).
@@ -25712,7 +25747,8 @@ static BOOL SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 	SCInvalidate();
 	if (demoted)
 		{
-		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send)\n", it->inst, it->ae);
+		OperatorConsole.printf("Storage commitment: send of %s to %s started before the object was stored again locally: CHANGED (not confirmed by this send; study %s)\n",
+			it->inst, it->ae, it->study[0] ? it->study : "-");
 		return TRUE;
 		}
 	OperatorConsole.printf("*** Storage commitment ALARM: stale send of %s to %s, but the database update failed (kept in the queue)\n", it->inst, it->ae);
@@ -25806,14 +25842,15 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 // deadline has passed (alarm), else NOTED again with NextTry from OutgoingSCRetryInterval
 static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned int now)
 	{
-	char aew[64], where[512], upd[256], cnt[32];
+	char aew[64], where[512], upd[256], cnt[32], tstudy[72];
 	SQLLEN len;
-	int i, n, ntimeout = 0, nresend = 0;
+	int i, n, ntimeout = 0, nresend = 0, nrows;
 	long long limit = (long long)now - OutgoingSCDeadline;
 	ACRNemaAddress E;
 	int rlimit = SCResendLimit(ae, &E);	// 0: no re-send to this destination (as before)
 
 	SCAEWhere(DB, aew, ae);
+	SCTxStudy(DB, aew, TxUID, tstudy, &nrows);
 
 	// RI (OutgoingSCResendMissing 1 or 2; 0 = off: rlimit is 0): requests used up -> a new cycle,
 	// never TIMEOUT: an object that may be re-sent is re-sent and then asked again; one with
@@ -25830,8 +25867,8 @@ static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned 
 			{
 			sprintf(upd, "State = 'NOTED', Attempts = 0, NextTry = %u", now + SCRetryDelay(OutgoingSCRetryDelayCount));
 			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) return FALSE;
-			OperatorConsole.printf("*** Storage commitment: %d object(s) for %s (RI, not re-sent: NoResend) without result after all requests: asked again (transaction %s)\n",
-				n, ae, TxUID);
+			OperatorConsole.printf("*** Storage commitment: %d object(s) of study %s for %s (RI, not re-sent: NoResend) without result after all requests: asked again (transaction %s)\n",
+				n, tstudy, ae, TxUID);
 			}
 		}
 
@@ -25852,8 +25889,8 @@ static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned 
 			{
 			sprintf(upd, "State = 'FAILED', FailReason = %d, NextTry = %u", SC_REASON_NORESULT, now + OutgoingSCResendDelay);
 			if (!DB.UpdateRecords((char *)"SCObject", upd, where)) return FALSE;
-			OperatorConsole.printf("*** Storage commitment: %d object(s) for %s without result after all requests: re-send queued (transaction %s)\n",
-				nresend, ae, TxUID);
+			OperatorConsole.printf("*** Storage commitment: %d object(s) of study %s for %s without result after all requests: re-send queued (transaction %s)\n",
+				nresend, tstudy, ae, TxUID);
 			}
 		}
 
@@ -25870,8 +25907,8 @@ static BOOL SCRequeue(Database &DB, const char *ae, const char *TxUID, unsigned 
 	if (ntimeout)
 		{
 		if (!DB.UpdateRecords((char *)"SCObject", (char *)"State = 'TIMEOUT'", where)) return FALSE;
-		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s TIMEOUT (no result: requests used up or deadline passed), transaction %s\n",
-			ntimeout, ae, TxUID);
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) of study %s for %s TIMEOUT (no result: requests used up or deadline passed), transaction %s\n",
+			ntimeout, tstudy, ae, TxUID);
 		}
 
 	// the rest is asked again later; the delay depends on the number of attempts
@@ -25906,6 +25943,8 @@ static void SCAbandon(Database &DB, const char *ae, const char *TxUID, unsigned 
 		OperatorConsole.printf("*** Storage commitment: database update failed for transaction %s\n", TxUID);
 	}
 
+static int SCRequestAttempt(Database &DB, const char *aew, const char *TxUID, char *out);
+
 // step 2: OPEN transactions without result within OutgoingSCReportTimeout
 static void SCCheckReportTimeouts(Database &DB, unsigned int now)
 	{
@@ -25930,7 +25969,13 @@ static void SCCheckReportTimeouts(Database &DB, unsigned int now)
 		}
 	for (i=0; i<n; i++)
 		{
-		OperatorConsole.printf("*** Storage commitment: no result from %s for transaction %s within %d s\n", list[i].ae, list[i].tx, OutgoingSCReportTimeout);
+		char aew[64], tstudy[72], attempt[48];
+		int nrows;
+		SCAEWhere(DB, aew, list[i].ae);
+		SCTxStudy(DB, aew, list[i].tx, tstudy, &nrows);
+		SCRequestAttempt(DB, aew, list[i].tx, attempt);
+		OperatorConsole.printf("*** Storage commitment: no result from %s for transaction %s within %d s (study %s, %d object(s), %s)\n",
+			list[i].ae, list[i].tx, OutgoingSCReportTimeout, tstudy, nrows, attempt);
 		SCAbandon(DB, list[i].ae, list[i].tx, now, FALSE);
 		}
 	free(list);
@@ -26028,7 +26073,7 @@ static void SCSetItems(Database &DB, const char *ae, SCItem *it, int n, const ch
 // "attempt a/b" of a commitment request: a = the highest Attempts of the objects reserved for
 // transaction TxUID, b = OutgoingSCRetries + 1 (requests per cycle; then TIMEOUT, or for R/RI the
 // re-send or a new cycle); '?' when the database does not tell
-static void SCRequestAttempt(Database &DB, const char *aew, const char *TxUID, char *out)
+static int SCRequestAttempt(Database &DB, const char *aew, const char *TxUID, char *out)
 	{
 	char where[256], s[32];
 	SQLLEN len;
@@ -26042,6 +26087,7 @@ static void SCRequestAttempt(Database &DB, const char *aew, const char *TxUID, c
 		}
 	if (a>0) sprintf(out, "attempt %d/%d", a, OutgoingSCRetries+1);
 	else     sprintf(out, "attempt ?/%d", OutgoingSCRetries+1);
+	return a;
 	}
 
 // "a/b (source)" of a re-send: a = the re-send number (ResendRes after the reservation), b and its
@@ -26341,7 +26387,7 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 
 // open the association and send the N-ACTION; 0 = accepted, 1 = failed (ask again later),
 // 2 = the storage commitment class was not accepted
-static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SCItem *it, int n, const char *attempt)
+static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SCItem *it, int n, const char *attempt, const char *study)
 	{
 	SCAssocPDU PDU;
 	UID	uid, scclass("1.2.840.10008.1.20.1"), instance("1.2.840.10008.1.20.1.1");
@@ -26384,7 +26430,7 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 			OperatorConsole.printf("*** Storage commitment: connect to %s (%s %s) timed out after %d s, %s (transaction %s)\n",
 				ae, ip, port, OutgoingSCConnectTimeout, attempt, TxUID);
 		else
-			OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
+			OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s, %s\n", ae, ip, port, TxUID, attempt);
 		return 1;
 		}
 	char what[128];
@@ -26431,7 +26477,7 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 		SCRelease(PDU, PDU.Pending(), ae, what);
 		return 1;
 		}
-	OperatorConsole.printf("Storage commitment request accepted by %s (transaction %s)\n", ae, TxUID);
+	OperatorConsole.printf("Storage commitment request accepted by %s (transaction %s, study %s, %d object(s), %s)\n", ae, TxUID, study, n, attempt);
 
 	if (OutgoingSCSameAssocWait>0 && !SCWaitSameAssoc(PDU, ae))
 		{
@@ -26992,7 +27038,7 @@ static void SCVerifyNowCommand(char *args, char *Response)
 
 // one chunk of NOTED objects of a (destination, study) group: check the destination, write
 // the transaction, then send
-static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned int now)
+static int SCSendChunk(Database &DB, const char *ae, const char *study, SCItem *it, int n, unsigned int now)
 	{
 	static char warntls[SC_WARNMAX][20], warnunsup[SC_WARNMAX][20];
 	static int nwarntls = 0, nwarnunsup = 0;
@@ -27003,7 +27049,7 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 	// the destination now: gone or without SC -> CANCELLED
 	if (!GetACRNemaEntryByAE((char *)ae, &E) || !(E.Flags & ACR_SC))
 		{
-		OperatorConsole.printf("*** Storage commitment: %s is not in acrnema.map with SC any more, %d object(s) CANCELLED\n", ae, n);
+		OperatorConsole.printf("*** Storage commitment: %s is not in acrnema.map with SC any more, %d object(s) of study %s CANCELLED\n", ae, n, study[0] ? study : "-");
 		SCSetItems(DB, ae, it, n, "CANCELLED");
 		return SC_CHUNK_DONE;
 		}
@@ -27026,7 +27072,7 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 			}
 		}
 	if (nheld)
-		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s HELD (not asked at the new address)\n", nheld, ae);
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) of study %s for %s HELD (not asked at the new address)\n", nheld, study[0] ? study : "-", ae);
 	n = k;
 	if (n==0) return SC_CHUNK_DONE;
 
@@ -27076,18 +27122,21 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 		}
 
 	char attempt[48];
-	SCRequestAttempt(DB, aew, TxUID, attempt);
-	OperatorConsole.printf("Storage commitment request to %s: transaction %s, %d object(s)\n", ae, TxUID, n);
-	r = SCSendAction(ae, &E, TxUID, it, n, attempt);
+	const char *st = study[0] ? study : "-";
+	int a = SCRequestAttempt(DB, aew, TxUID, attempt);
+	OperatorConsole.printf("Storage commitment request to %s: study %s, transaction %s, %d object(s), %s\n", ae, st, TxUID, n, attempt);
+	r = SCSendAction(ae, &E, TxUID, it, n, attempt, st);
 	if (r==1)
 		{
 		SCAbandon(DB, ae, TxUID, (unsigned int)time(NULL), FALSE);
-		OperatorConsole.printf("Storage commitment request to %s failed (transaction %s): asked again later\n", ae, TxUID);
+		OperatorConsole.printf("*** Storage commitment request to %s failed (study %s, transaction %s, %d object(s), %s): %s\n", ae, st, TxUID, n, attempt,
+			a>0 && a<=OutgoingSCRetries ? "asked again later" : "requests used up");
 		return SC_CHUNK_DOWN;
 		}
 	if (r==2)
 		{
 		SCAbandon(DB, ae, TxUID, (unsigned int)time(NULL), TRUE);
+		OperatorConsole.printf("*** Storage commitment: %s did not accept the storage commitment class: %d object(s) of study %s UNSUPPORTED (transaction %s)\n", ae, n, st, TxUID);
 		if (SCWarnOnce(warnunsup, &nwarnunsup, ae))
 			OperatorConsole.printf("*** Storage commitment: %s does not accept the storage commitment class, objects UNSUPPORTED (images were sent normally)\n", ae);
 		}
@@ -27186,7 +27235,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 				inst[0] = cls[0] = ip[0] = port[0] = tls[0] = gen[0] = 0;
 				}
 			if (n==0) break;
-			r = SCSendChunk(DB, g[i].ae, it, n, now);
+			r = SCSendChunk(DB, g[i].ae, g[i].study, it, n, now);
 			if (r==SC_CHUNK_DOWN) SCSetDown(g[i].ae);
 			if (r!=SC_CHUNK_DONE) break;		// stays NOTED, or asked again later
 			if (n<OutgoingSCMaxBatch) break;
@@ -27284,7 +27333,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		else it[k++] = it[i];
 		}
 	if (nheld)
-		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) for %s HELD (not re-sent to the new address)\n", nheld, ae);
+		OperatorConsole.printf("*** Storage commitment ALARM: %d object(s) of study %s for %s HELD (not re-sent to the new address)\n", nheld, it[0].study[0] ? it[0].study : "-", ae);
 	n = k;
 	if (n==0) return SC_CHUNK_DONE;
 
@@ -27357,18 +27406,20 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
 	SCPrepareTLS(PDU, EE);
 
-	OperatorConsole.printf("Storage commitment: re-sending %d object(s) of study %s to %s\n", n, it[0].study, ae);
+	char attempt[64];
+	int lo = it[0].res, hi = it[0].res;
+	for (i=1; i<n; i++) { if (it[i].res<lo) lo = it[i].res; if (it[i].res>hi) hi = it[i].res; }
+	SCResendAttempt(hi, rlimit, &E, attempt);
+	if (lo!=hi) { char t[64]; sprintf(t, "%d-%s", lo, attempt); strcpy(attempt, t); }
+	OperatorConsole.printf("Storage commitment re-send to %s: study %s, %d object(s), attempt %s\n", ae, it[0].study[0] ? it[0].study : "-", n, attempt);
 	BOOL timedout;
 	if (!SCConnect(PDU, it[0].ip, it[0].port, &timedout))
 		{
 		if (timedout)
-			{
-			char attempt[64];
-			SCResendAttempt(it[0].res, rlimit, &E, attempt);
 			OperatorConsole.printf("*** Storage commitment: connect to %s (%s %s) timed out after %d s, re-send attempt %s\n",
 				ae, it[0].ip, it[0].port, OutgoingSCConnectTimeout, attempt);
-			}
-		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), tried again later\n", ae, it[0].ip, it[0].port);
+		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), study %s, %d object(s), attempt %s, tried again later\n",
+			ae, it[0].ip, it[0].port, it[0].study[0] ? it[0].study : "-", n, attempt);
 		for (i=0; i<n; i++) free(it[i].file);
 		return SC_CHUNK_DOWN;
 		}
@@ -27425,7 +27476,9 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		RTCStorage.SetUID(uid);
 		if (!RTCStorage.Write(&PDU, DDO, &DCO))
 			{
-			OperatorConsole.printf("*** Storage commitment: re-send of %s to %s failed (re-send %d), tried again later\n", it[i].inst, ae, it[i].res);
+			char a1[64];
+			SCResendAttempt(it[i].res, rlimit, &E, a1);
+			OperatorConsole.printf("*** Storage commitment: re-send of %s to %s failed (attempt %s), tried again later\n", it[i].inst, ae, a1);
 			delete DDO;
 			continue;
 			}
@@ -27436,12 +27489,17 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		if (!SCResendUpdate(DB, aew, it[i].inst, upd))
 			OperatorConsole.printf("*** Storage commitment ALARM: %s re-sent to %s but the database update failed\n", it[i].inst, ae);
 		else
-			OperatorConsole.printf("Storage commitment: re-sent %s to %s (re-send %d)\n", it[i].inst, ae, it[i].res);
+			{
+			char a1[64];
+			SCResendAttempt(it[i].res, rlimit, &E, a1);
+			OperatorConsole.printf("Storage commitment: re-sent %s to %s (attempt %s)\n", it[i].inst, ae, a1);
+			}
 		nsent++;
 		}
 	SCRelease(PDU, FALSE, ae, "re-send association");
 	for (i=0; i<n; i++) free(it[i].file);
-	OperatorConsole.printf("Storage commitment: %d of %d object(s) re-sent to %s\n", nsent, n, ae);
+	OperatorConsole.printf("%sStorage commitment: %d of %d object(s) of study %s re-sent to %s (attempt %s)\n", nsent<n ? "*** " : "",
+		nsent, n, it[0].study[0] ? it[0].study : "-", ae, attempt);
 	return SC_CHUNK_DONE;
 	}
 

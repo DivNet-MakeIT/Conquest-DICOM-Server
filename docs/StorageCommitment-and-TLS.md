@@ -183,6 +183,7 @@ default, with a console warning (printed only while the feature is on).
 | `OutgoingSCResendDelay` | `300` | 0.. | delay before a re-send; after failed re-sends it doubles up to the last `OutgoingSCRetryInterval` value |
 | `SCUnsafeFile` | `sc_unsafe.flag` | name | sentinel file (3.6); a name without a path is in the dgate directory |
 | `OutgoingSCVerifyMax` | `4` | 1..64 | concurrent `sc_verify_now` verifications; one more answers `0 busy` |
+| `OutgoingSCDeleteWriteWait` | `60` | 1..3600 | how long a local write of a study waits while `sc_verify_and_delete` deletes that study; still running after it, the write is refused (3.9) |
 | `OutgoingSCConnectTimeout` | `30` | 1..`TCPIPTimeOut` | worker only (N-ACTION requests and re-sends): one deadline from the start of the connect; TCP connect, TLS handshake and association setup (A-ASSOCIATE-RQ, A-ASSOCIATE-AC read) together end within it; a default above `TCPIPTimeOut` is lowered to it. All other connections keep `TCPIPTimeOut`. |
 
 In `[lua]`:
@@ -194,7 +195,7 @@ In `[lua]`:
 The test harness uses some test-only keys. All default to 0 and are not for production:
 `SCTestDelayBeforeWrite`, `SCTestDelayAfterRead`, `SCTestQueueMax`, `SCTestFailDemote`,
 `SCTestFailFetch`, `SCTestDelayBeforeRecord`, `SCTestNoFileStamp`, `SCTestDelayVerifyStep`,
-`SCTestDelayBeforeDelete`.
+`SCTestDelayBeforeDelete`, `SCTestNoWatch`.
 
 **Production note on `SCUnsafeFile`.** The sentinel and its `.running` marker must be on persistent
 storage that survives a restart of dgate (for example the dgate directory on a host volume), never
@@ -238,7 +239,12 @@ objects end in TIMEOUT and raise an alarm.
    deadline. Their release waits at most
    `OutgoingSCSameAssocWait` seconds, clamped to 2..10 s, for A-RELEASE-RP; without a reply the
    association is aborted (`*** Storage commitment: no release reply from <AE> within <n> s
-   (<association>): association aborted`). A destination that could not be reached in a pass
+   (<association>): association aborted`). The A-RELEASE-RQ and A-ABORT writes are bounded by the
+   same watchdog that bounds the reply read. Where no watchdog can be started (no duplicate
+   descriptor or no thread; always on Windows) nothing is written unbounded: the connection is
+   closed without A-RELEASE and without A-ABORT (console line `Storage commitment: no watchdog for
+   the release write (<AE>, <association>): connection closed without A-RELEASE`); the result then
+   has to come on a new association. A destination that could not be reached in a pass
    (request or re-send) is skipped for the rest of that pass for requests and re-sends, so one
    destination that does not answer costs at most one connect limit per pass and the others go on.
 3. **Write first, then send.** The `SCTransaction` and `SCTxMember` rows and the objects' state
@@ -567,6 +573,16 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
   association too (connect, TLS handshake, N-ACTION, its response, the same-association wait and
   the release, which is aborted when the archive does not reply): an archive that stops answering
   at any point gives `0 no result` at the timeout and frees the `OutgoingSCVerifyMax` slot.
+  The deadline (`Socket::Deadline`) covers:
+  - the TCP connect, plain and TLS (a node whose packets are dropped does not wait for the
+    kernel's connect timeout);
+  - every read, plain and TLS;
+  - every write: TLS on every platform; plain on Unix the writes are non-blocking with `poll()`
+    and end at the deadline (an archive that accepts the association and then stops reading
+    cannot hold a large N-ACTION); on Windows a plain write is only refused once the deadline has
+    passed, a write that has started is not cut;
+  - the release: without a watchdog (Windows) a verification's release is written only on Unix,
+    bounded by the deadline; on Windows its connection is closed without A-RELEASE.
 - One console line per verification (3.7), plus one per request and per result.
 - What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). The archive
   does not compare content; step 7 compares the local file with the one last sent and committed.
@@ -593,10 +609,20 @@ records), with the local writes of the study excluded:
   A write of the study that starts now waits until the delete is done (console line `write of
   <uid> (study <uid>) waited for the verified delete of its study`); it is stored afterwards, as a
   new object of the study.
+- **A write is never admitted while the delete runs.** The delete has no time limit; when it is
+  still running after `OutgoingSCDeleteWriteWait` seconds (default 60), the waiting write is
+  refused before it changes anything (no database record, no file): a C-STORE is answered with
+  `StorageFailedErrorCode` (default 0x0110, processing failure), so the sender sees a failure and
+  may send again after the delete; an import, `modpatid`, attach, merge or Lua `addimage` fails as
+  on any other failed write. Console line `*** Storage commitment: write of <uid> (study <uid>)
+  refused: the verified delete of its study is still running after <n> s (the sender may send
+  again)`. A write whose SOP Instance UID is missing or longer than 64 characters waits while any
+  delete runs and is refused the same way. The write counts from before its file name is chosen
+  (that step reads the database and, for a rewrite with another file extension, removes the old
+  record).
 - The study is deleted and read again: no local object may be left.
 - Answers: `1` (verified and deleted), every `0` of `sc_verify_now`, `0 changed` (a write of the
-  study started during the verification), `0 write during delete` (a write waited longer than 60 s
-  and went on: alarm line, check the study), `0 not deleted completely` (objects left after the
+  study started during the verification), `0 not deleted completely` (objects left after the
   delete: alarm line). The same `checkaccess` as the other commands; with
   `OutgoingStorageCommitment=0` the answer is `0 disabled` and nothing is deleted.
 
@@ -604,7 +630,10 @@ Residual limits: a change of a local file that does not go through a dgate write
 replaced on disk outside dgate, a move between devices) is not excluded; it is only detected by the
 fingerprints of steps 1, 6 and 8, so it can still happen between step 8 and the delete. The delete
 itself is `DeleteStudy` (one file and record after the other), not a transaction: when it fails
-halfway, objects are left and the answer is `0 not deleted completely`.
+halfway, objects are left and the answer is `0 not deleted completely`. Two database writes do not
+go through `SaveToDisk` and are not excluded: a C-STORE to a virtual-compression (`v`) AE and the
+virtual-query cache (`VirtualServerFor`); a record they add during the delete is found by the read
+after it (`0 not deleted completely`).
 
 Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` defines
 `sc_delete_if_verified(patid, study, ae [, timeout])` (default 120 s), which calls
@@ -976,4 +1005,11 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `af58520` TLS: no renegotiation on any context
 - `db14544` Sockets: poll() for the TLS and bounded-connect waits, FD_SETSIZE guard
 - `9ecb6df` Outgoing storage commitment: bound the release and abort writes of the worker
-- this commit: Docs: commit map
+- `6988a72` Docs: commit map
+
+**Verified delete exclusion and deadlines**
+- `bbc3338` Outgoing storage commitment: never admit a write of a study while its verified delete runs
+- `d797035` Sockets: the plain connect honours Deadline
+- `7ca4d31` Sockets: Deadline bounds plain sends (non-blocking with poll() on Unix)
+- `1c46c6b` Outgoing storage commitment: no unbounded release or abort write without a watchdog
+- this commit: Docs: writes refused during a verified delete, deadline coverage, commit map

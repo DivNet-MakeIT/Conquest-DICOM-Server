@@ -292,7 +292,16 @@ regen. Upstream tables are not changed.
 **File stamp (`FileStamp`).** `size:mtime.nanoseconds:inode` of the local file, taken by the send
 path right before it reads the file and checked right after it (no stamp when the file changed
 meanwhile). Forwards (ExportConverter), C-MOVE and re-sends record it; the ImportConverter forward of
-the received object, Lua sends and the older note wrappers record none. Only strong stamps are kept:
+the received object, Lua sends and the older note wrappers record none. A send that may change the
+content records none either and sets NoResend: a `script` clause, an ExportConverter command
+before the forward that may change the object (only `write`, `append`, `copy`, `save to`, the `if…`
+and `between` tests, `prefetch`, `preretrieve`, `system`, `mkdir`, `rm`, `testmode`, `nop`, `stop`,
+`silentstop`, `return`, `defer` and other forwards count as unchanging; `lua`, `call`, `save frame`,
+`save bmp/gif/jpg` and the patient/study/series/image commands do not), a lossy or otherwise
+changing compression (everything except as-is,
+uncompressed and the lossless JPEG, JPEG 2000 and JPEG-LS modes), and for C-MOVE a
+RetrieveConverter0 / RetrieveResultConverter0, scrub, downsizing or frame extraction. The stamp then
+never certifies content the archive did not get. Only strong stamps are kept:
 a system with nanosecond file times (Linux, macOS), a non-zero inode and a non-zero nanosecond part;
 otherwise (e.g. Windows, file systems with whole-second times) the stamp is empty. A table of an
 earlier build gets the column at the first start (`adding column FileStamp to table SCObject`,
@@ -425,7 +434,7 @@ Verify lines:
 Storage commitment verify: request to <AE>, transaction <TxUID>, <n> object(s)
 Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association: <c> committed, <f> failed
 *** Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association refused (<reason>): the verification fails
-*** Storage commitment verify: study <StudyUID>, AE <AE>: <k> of <n> local object(s) not the content last sent and committed (<a> without a COMMITTED row, <b> with another file stamp, <c> local file(s) without a stamp): changed since send
+*** Storage commitment verify: study <StudyUID>, AE <AE>: <k> of <n> local object(s) not the content last sent and committed (<a> without a COMMITTED row, <b> with another file stamp, <c> local file(s) without a stamp, <d> sent with the content transformed): <changed since send|content transformed at send>
 Storage commitment verify: study <StudyUID>, AE <AE>, <n> object(s), <k> chunk(s), transaction(s) <TxUID …|->, <s.mmm> s: <1|0 reason>
 ```
 
@@ -493,12 +502,14 @@ in 3.6 make these cases rare and safe-side, but deletion needs a stronger guaran
 6. Re-reads the local objects and fingerprints. Any difference, a new object, or a write in
    progress gives `0 changed`.
 7. Checks that the local content is the content the archive committed: for every local object
-   there must be a COMMITTED `SCObject` row of that AE with a non-empty `FileStamp` equal to the
-   stamp of the local file as read in step 1. Otherwise `0 changed since send`: no COMMITTED row
-   (never sent there, rewritten through dgate so the row is CHANGED, sent again but not yet
-   committed, or purged after `OutgoingSCKeepDays`), another stamp (rewritten on disk after the
-   committed send), or no stamp (a system without nanosecond file times, a send path that records
-   none). This step only reads the table.
+   there must be a COMMITTED `SCObject` row of that AE with NoResend 0 and a non-empty `FileStamp`
+   equal to the stamp of the local file as read in step 1. A COMMITTED row with NoResend set (the
+   send may have changed the content, see the file stamp in 3.4) gives `0 content transformed at
+   send`. Otherwise `0 changed since send`: no COMMITTED row (never sent there, rewritten through
+   dgate so the row is CHANGED, sent again but not yet committed, or purged after
+   `OutgoingSCKeepDays`), another stamp (rewritten on disk after the committed send), or no stamp
+   (a system without nanosecond file times, a send path that records none). This step only reads
+   the table.
 
 The answer is `1` only after all seven steps pass.
 
@@ -520,6 +531,7 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
 | `0 busy` | `OutgoingSCVerifyMax` verifications already running |
 | `0 database error` | the local objects or the committed rows could not be read, including a fetch error (5) |
 | `0 changed since send` | step 7: a local file is not the content last sent to that AE and committed |
+| `0 content transformed at send` | step 7: the committed send of an object may have had other content than the local file (script, lossy or changing compression, C-MOVE processing) |
 | `0 no local file` / `0 invalid local object` | an object of the study has no readable file, or a bad or repeated UID |
 | `0 TLS not available for this node` | the entry has `T` and this build has no TLS: nothing is sent in plain text |
 | `0 no connection` | no association to the node (also a failed TLS handshake or certificate check) |
@@ -531,6 +543,14 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
 - One console line per verification (3.7), plus one per request and per result.
 - What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). The archive
   does not compare content; step 7 compares the local file with the one last sent and committed.
+- **Content guarantee.** A `1` means: the archive holds these UIDs, and each one was last sent to it
+  from exactly the local file as it is now, byte for byte or through a lossless transfer syntax
+  conversion, and that send was committed. A send that may have changed the content (a script on
+  the sent copy, a lossy or otherwise changing compression, the per-object processing of a C-MOVE)
+  is never taken as the same content, also not through NoResend: such a study answers `0 content
+  transformed at send`. If the archived copy is meant to differ (for example anonymised for a
+  research archive), the local copy is not a copy of it, and deleting on the commitment is a policy
+  decision outside this check.
 - An object stored after the answer is not covered, so delete right after the answer.
 
 Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` defines
@@ -722,7 +742,7 @@ containers. Every commit keeps the compile warning count at the baseline.
 | Confirmed | all committed → 1; one not → 0; object added → 0; two AEs; AE case on MariaDB; switch 0; hook fires once |
 | Fail-closed | local overwrite after COMMITTED; queue not drained; overflow; DB failure during overwrite; unclean kill → sentinel; clean run → no sentinel; regen keeps COMMITTED; `sc_unsafe_clear:` reconciliation |
 | TLS | outgoing and incoming with and without client certificate; wrong CA; node certificate match / mismatch / damaged file; hostname check; self-signed on/off; T node on the plain port rejected; `TLSPort`=`TCPPort`; never plain fallback; build without OpenSSL; connect timeout to a black-hole address; ini cache concurrency stress |
-| Verify | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; never sent, rewritten after the commit (through dgate and on disk) and no file stamps → `0 changed since send`, after a new send and its commit → 1; TLS path, also the legacy profile; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged; Lua in the server and from a client; reconciliation of every state; simulated fetch error |
+| Verify | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; never sent, rewritten after the commit (through dgate and on disk) and no file stamps → `0 changed since send`, after a new send and its commit → 1; forward with a script clause and C-MOVE with RetrieveResultConverter0 → COMMITTED without a stamp, `0 content transformed at send`; TLS path, also the legacy profile; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged; Lua in the server and from a client; reconciliation of every state; simulated fetch error |
 | Worker limits | a destination whose packets are dropped: connect timeout with attempt line, the other destinations commit meanwhile; an archive that freezes after the N-ACTION: release aborted after the limit, others go on; file stamps recorded per send and compared by the reconciliation (untouched objects stay COMMITTED, rewritten ones and the whole-second fallback CHANGED, column added to an old table); log lines with attempts and `***`; `T` ↔ `TL` switch → HELD |
 | Legacy TLS | legacy client on `TLSLegacyPort` accepted and on `TLSPort` refused; NULL/RC4/EXPORT/DES/3DES/anonymous offers refused on both ports; `TL` to a legacy-only receiver; `T` without L to it refused, never plain; node certificate mismatch and weak key refused; modern T node on the legacy port rejected; `L` without `T` warning; `TLSLegacyPort` = `TCPPort` / `TLSPort`; `TLSLegacyPort` alone; build without OpenSSL; map option parse/format unit test |
 

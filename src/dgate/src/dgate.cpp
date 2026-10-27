@@ -1444,6 +1444,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			only turn 1 into 0. Test-only key SCTestNoFileStamp
 20261027	mmd	Outgoing storage commitment: SCObject.DestTLS 2 for a send with the TLS legacy profile (TL; 1 =
 			T, 0 = plain): a node switched between T and TL is a destination change (HELD, no re-send)
+20261027	mmd	Outgoing storage commitment: a send that may change the content (MayDiffer: script, lossy or
+			changing compression, C-MOVE processing, an ExportConverter command before the forward that
+			is not on the read-only list: lua, call, save frame/image, the patient/study/... commands)
+			records no FileStamp; sc_verify_now: step 7 needs NoResend 0 on the COMMITTED row and answers
+			0 content transformed at send when the committed send may have had other content
 
 ENDOFUPDATEHISTORY
 */
@@ -5827,6 +5832,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
   SCStamp scStamp;							// outgoing SC: the file before it is read
   scStamp.valid = 0;
   if (OutgoingStorageCommitment) SCStampFile(pszFileName, &scStamp);
+  int scTouched = 0;							// outgoing SC: a command that may change DDO ran (see below)
 
   PDU2.AttachRTC(&VRType);
 
@@ -6148,6 +6154,21 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
       else
 	strcpy(line, szExecName);
 
+      // outgoing storage commitment: a forward sends the object exactly as stored (and records the
+      // file stamp) only when every command of the chain before it is one of these, which never
+      // change DDO (they read it for % values, or do not use it). Any other command (lua, call,
+      // save frame/bmp/gif/jpg, forward/get/process/merge/submit/delete patient|study|series|image,
+      // and any command not listed) may have changed the object a later forward sends: such a
+      // forward counts as MayDiffer (no file stamp, NoResend).
+      if (!(memicmp(line, "forward to", 10)==0 || memicmp(line, "forward compressed", 18)==0 ||
+            memicmp(line, "write \"", 7)==0 || memicmp(line, "append \"", 8)==0 || memicmp(line, "copy ", 5)==0 ||
+            memicmp(line, "save to ", 8)==0 || memicmp(line, "if", 2)==0 || memicmp(line, "between \"", 9)==0 ||
+            memicmp(line, "prefetch", 8)==0 || memicmp(line, "preretrieve ", 12)==0 || memicmp(line, "system ", 7)==0 ||
+            memicmp(line, "mkdir ", 6)==0 || memicmp(line, "rm ", 3)==0 || memicmp(line, "testmode ", 9)==0 ||
+            memicmp(line, "nop", 3)==0 || memicmp(line, "stop", 4)==0 || memicmp(line, "silentstop", 10)==0 ||
+            memicmp(line, "return", 6)==0 || memicmp(line, "defer", 5)==0))
+        scTouched = 1;
+
       /* converter: direct forward of received object */
 
       if (memicmp(line, "forward to", 10)==0 ||
@@ -6345,10 +6366,12 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           if (atoi(Temp)) return TRUE;
 	  else            return FALSE; // NOT a good idea to retry later
         }
-        // script clause or a lossy/changing compression: sent copy may differ from the archive copy
+        // script clause, a command earlier in the chain that may change DDO (scTouched) or a
+        // lossy/changing compression: the sent copy may differ from the archive copy (then no file
+        // stamp is recorded)
         if (scOn)
         { SCStampCheck(pszFileName, &scStamp);	// the file after it was read: unchanged, else no stamp
-          SCNoteSentPDUStamp(PDU+part, scCls, scInst, scStudy, script[0]!=0 || SCModeMayDiffer(compress), scSeq, &scStamp);
+          SCNoteSentPDUStamp(PDU+part, scCls, scInst, scStudy, script[0]!=0 || scTouched || SCModeMayDiffer(compress), scSeq, &scStamp);
         }
       
         ImagesForwarded++;
@@ -24921,6 +24944,8 @@ static BOOL SCChangedSince(const char *inst, unsigned int seq)
 // these; requests and re-sends only go there, and are HELD when the map says otherwise.
 // Not noted (never confirmed) when the called AE has no SC in acrnema.map or a value is unusable.
 // stamp: the local file as read for this send (SCStampFile/SCStampCheck), NULL or invalid: none.
+// A send with MayDiffer never keeps a stamp: the file it read is not the content it sent, so the
+// stamp must not certify that content (sc_verify_now: step 7, reconciliation: whole-second rule).
 void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int TLS,
 	const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq,
 	const SCStamp *stamp)
@@ -24974,8 +24999,8 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		q->differ = MayDiffer ? 1 : 0;
 		q->seq = seq;
 		q->stale = SCWriteInProgressLocked(q->inst) ? 1 : 0;	// noted while the object is rewritten
-		if (stamp && stamp->valid) q->stamp = *stamp;
-		else                       memset(&q->stamp, 0, sizeof(SCStamp));
+		if (stamp && stamp->valid && !MayDiffer) q->stamp = *stamp;
+		else                                     memset(&q->stamp, 0, sizeof(SCStamp));
 		SCNotedCount++;
 		}
 	SCInvalGen++;					// added or dropped
@@ -25049,7 +25074,8 @@ void SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstance
 // keep it: "" / as / is / v* (as is), u* (uncompressed), j1 j2 (lossless JPEG), jk (lossless
 // JPEG 2000), js (JPEG-LS lossless). Everything else counts as differing: lossy JPEG j3..j6,
 // jl, j7 (near-lossless), clipping (#), NKI modes (n*, also when lossless), downsizing (k*),
-// script compression (s*), unknown modes. Conservative: it only disables automatic re-send.
+// script compression (s*), unknown modes. Conservative: it disables automatic re-send, and the send
+// records no file stamp (sc_verify_now: then answers 0 content transformed at send).
 int SCModeMayDiffer(const char *mode)
 	{
 	char a, b;
@@ -26553,11 +26579,13 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 //  6. the local objects and fingerprints, read again, are the same, no local change of them was
 //     registered meanwhile and no write of the study is in progress, else "0 changed";
 //  7. every local file is the content last sent to that AE and committed: a COMMITTED SCObject
-//     row of the AE with a non-empty FileStamp equal to the stamp of the file as read in step 1
-//     (read only), else "0 changed since send" (also when the file or the row has no stamp: a
-//     system without nanosecond times, a send path that records none, or the row was purged
-//     after OutgoingSCKeepDays). The archive confirms custody of UIDs, not content; this check
-//     only makes the answer stricter (1 -> 0, never 0 -> 1).
+//     row of the AE with NoResend 0 and a non-empty FileStamp equal to the stamp of the file as
+//     read in step 1 (read only). A COMMITTED row with NoResend set (the send may have changed the
+//     content: script, lossy or changing compression, C-MOVE processing; such a send records no
+//     stamp either): "0 content transformed at send"; otherwise "0 changed since send" (also when
+//     the file or the row has no stamp: a system without nanosecond times, a send path that
+//     records none, or the row was purged after OutgoingSCKeepDays). The archive confirms custody
+//     of UIDs, not content; this check only makes the answer stricter (1 -> 0, never 0 -> 1).
 // Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel file is neither
 // read nor set. Any other doubt (database, connection, refusal of the request) answers 0 with a
 // reason. At most OutgoingSCVerifyMax (default 4) at a time ("0 busy"); timeout 1..600 s, default
@@ -26695,19 +26723,24 @@ static int SCVerifyRead(const char *StudyUID, SCVerifyObj **out)
 	}
 
 // Step 7: is the local content the content the archive committed? For every local object o[i]
-// there must be a COMMITTED SCObject row for ae whose FileStamp (the file as its last send read
-// it) is not empty and equal to the stamp of the local file now. The archive only confirms custody
-// of the SOP instance UIDs; a file rewritten locally after its last committed send (the archive
-// holds the old content) must not be deleted. Read only. Returns the number of objects that fail
-// (no such row, another stamp, or no stamp of the file or the row), -1 on a database error. This
-// check can only make a verification stricter: it turns a 1 into 0, never a 0 into 1.
-static int SCVerifySentContent(const char *study, const char *ae, SCVerifyObj *o, int n)
+// there must be a COMMITTED SCObject row for ae with NoResend 0 whose FileStamp (the file as its
+// last send read it) is not empty and equal to the stamp of the local file now. NoResend is set
+// for a send that may have changed the content (MayDiffer); it is never taken as "same content".
+// The archive only confirms custody of the SOP instance UIDs; a file rewritten locally after its
+// last committed send (the archive holds the old content) must not be deleted. Read only. Returns
+// the number of objects that fail (no such row, a transformed send, another stamp, or no stamp of
+// the file or the row), -1 on a database error; *transformed: how many of them only because the
+// committed send may have changed the content. This check can only make a verification
+// stricter: it turns a 1 into 0, never a 0 into 1.
+static int SCVerifySentContent(const char *study, const char *ae, SCVerifyObj *o, int n, int *transformed)
 	{
 	Database DB;
-	char aew[64], where[256], stamp[SC_STAMPLEN+4];
+	char aew[64], where[256], stamp[SC_STAMPLEN+4], nores[32];
 	SQLLEN len;
-	int i, bad = 0, norow = 0, other = 0, none = 0;
-	BOOL found, any;
+	int i, bad = 0, norow = 0, other = 0, none = 0, trans = 0;
+	BOOL found, any, differ;
+
+	*transformed = 0;
 
 	if (!DB.Open(DataSource, UserName, Password, DataHost)) return -1;
 	SCAEWhere(DB, aew, ae);
@@ -26715,28 +26748,33 @@ static int SCVerifySentContent(const char *study, const char *ae, SCVerifyObj *o
 		{
 		if (!o[i].stamp[0]) { none++; bad++; continue; }	// the local file has no stamp
 		sprintf(where, "%s and SOPInstUID = '%s' and State = 'COMMITTED'", aew, o[i].inst);
-		if (!DB.Query("SCObject", "COALESCE(FileStamp, '')", where, NULL)) { DB.Close(); return -1; }
-		stamp[0] = 0;
-		found = any = FALSE;
+		if (!DB.Query("SCObject", "COALESCE(FileStamp, ''), COALESCE(NoResend, 1)", where, NULL)) { DB.Close(); return -1; }
+		stamp[0] = nores[0] = 0;
+		found = any = differ = FALSE;
 		DB.BindField(1, SQL_C_CHAR, stamp, sizeof(stamp), &len);
+		DB.BindField(2, SQL_C_CHAR, nores, sizeof(nores), &len);
 		while (DB.NextRecord())
 			{
 			SCTrim(stamp);
+			SCTrim(nores);
 			any = TRUE;
-			if (stamp[0] && strcmp(stamp, o[i].stamp)==0) found = TRUE;
-			stamp[0] = 0;
+			if (strcmp(nores, "0")!=0) differ = TRUE;	// the committed send may have changed the content
+			else if (stamp[0] && strcmp(stamp, o[i].stamp)==0) found = TRUE;
+			stamp[0] = nores[0] = 0;
 			}
 		if (SCFetchFailed(DB, "sc_verify_now: committed rows", TRUE)) { DB.Close(); return -1; }
-		if (found) continue;
+		if (found && !differ) continue;
 		bad++;
-		if (any) other++;
-		else     norow++;
+		if (differ)   trans++;
+		else if (any) other++;
+		else          norow++;
 		}
 	DB.Close();
 	if (bad)
 		OperatorConsole.printf("*** Storage commitment verify: study %s, AE %s: %d of %d local object(s) not the content last sent and committed "
-			"(%d without a COMMITTED row, %d with another file stamp, %d local file(s) without a stamp): changed since send\n",
-			study, ae, bad, n, norow, other, none);
+			"(%d without a COMMITTED row, %d with another file stamp, %d local file(s) without a stamp, %d sent with the content transformed): %s\n",
+			study, ae, bad, n, norow, other, none, trans, trans ? "content transformed at send" : "changed since send");
+	*transformed = trans;
 	return bad;
 	}
 
@@ -27033,10 +27071,11 @@ static const char *SCVerifyRun(const char *study, const char *aearg, int timeout
 	if (!why)
 		{
 		// 7. the local content (the files as read, unchanged until now) is the one last sent to
-		// ae and committed (file stamps)
-		i = SCVerifySentContent(study, ae, o, n);
+		// ae and committed (file stamps; never a send that may have changed the content)
+		int transformed = 0;
+		i = SCVerifySentContent(study, ae, o, n, &transformed);
 		if (i<0)      why = "database error";
-		else if (i>0) why = "changed since send";
+		else if (i>0) why = transformed ? "content transformed at send" : "changed since send";
 		}
 	SCVerifyFree(o, n);
 	if (n2>0) SCVerifyFree(o2, n2);
@@ -27066,7 +27105,8 @@ int SCVerifyInServer(void)
 
 // Verify now: 1 when the archive committed every local object of the study in this call, else 0
 // with the reason in reason ("disabled", "busy", "empty", "writing", "not an SC node", "no result",
-// "failed <n>", "changed", "changed since send", "database error", ...). timeout: 1..600 seconds.
+// "failed <n>", "changed", "changed since send", "content transformed at send", "database error",
+// ...). timeout: 1..600 seconds.
 int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
 	{
 	char study[80], ae[80], fail[32], txs[1024];

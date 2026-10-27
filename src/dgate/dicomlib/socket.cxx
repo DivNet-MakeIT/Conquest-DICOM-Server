@@ -52,6 +52,8 @@
 			(no FD_SETSIZE limit); Poll and the plain ReadBinary never put a descriptor >=
 			FD_SETSIZE in an fd_set (Poll: poll(); plain ReadBinary: console line, closed)
 20261027	mmd	Plain connect: bounded (non-blocking, SocketConnectBefore) also when only Deadline is set
+20261027	mmd	Deadline bounds plain sends: Unix SocketSendBefore (MSG_DONTWAIT, poll() for writability,
+			partial writes counted, FALSE at the deadline); Windows checks the deadline before the send
 
 */
 
@@ -765,6 +767,8 @@ BOOL	Socket	::	Poll(void)
 	}
 
 #ifdef	WINDOWS
+// Windows: with Deadline set the send fails once the deadline has passed; a plain send that has
+// started is not cut at the deadline (blocking socket, as upstream; TLS sends are bounded)
 BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	{
 	if ( !Connected)
@@ -773,6 +777,8 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	if ( TLSHandle )
 		return ( TLSSend(s, count) );
 #endif
+	if ( Deadline > 0 && (long) time(NULL) >= Deadline )
+		return ( FALSE );		// past the overall deadline
 	
 	if(send ( Socketfd, (char *) s, count, 0)<0)
 		{
@@ -781,6 +787,38 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	return ( TRUE );
 	}
 #else
+// Unix, plain, Deadline set: send all count bytes by the deadline. Each send() is non-blocking
+// (MSG_DONTWAIT; the socket itself stays blocking for the other paths), partial writes are
+// counted, and while the send buffer is full the wait for writability is poll() cut to the
+// deadline. FALSE when the deadline passes first or the connection fails: a peer that stops
+// reading cannot hold the sender past the deadline.
+static	BOOL	SocketSendBefore(int fd, BYTE *s, UINT count, long end)
+	{
+	UINT	done = 0;
+	while (done < count)
+		{
+		long left = end - (long) time(NULL);
+		if (left <= 0)
+			return ( FALSE );
+		long put = send(fd, (char *) s + done, count - done, MSG_DONTWAIT);
+		if (put > 0)
+			{
+			done += (UINT) put;
+			continue;
+			}
+		int err = errno;
+		if (put == 0 || err == EPIPE)
+			return ( FALSE );
+		if (err == EINTR)
+			continue;
+		if (err != EAGAIN && err != EWOULDBLOCK)
+			return ( FALSE );
+		if (SocketWaitFd(fd, 1, (int) left) < 0 && errno != EINTR)
+			return ( FALSE );
+		}
+	return ( TRUE );
+	}
+
 BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	{
         struct timespec t;
@@ -790,6 +828,8 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	if ( TLSHandle )
 		return ( TLSSend(s, count) );
 #endif
+	if ( Deadline > 0 )
+		return ( SocketSendBefore(Socketfd, s, count, Deadline) );
 		
         t.tv_sec =0;
         t.tv_nsec=1000000;

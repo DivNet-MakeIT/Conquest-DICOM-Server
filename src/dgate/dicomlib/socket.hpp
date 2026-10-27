@@ -98,7 +98,9 @@ class	Socket
 		// absolute time (seconds, time()): the connect attempts of Open (plain too), the TLS handshake and
 		// every read and write end by then, and once it has passed every read and write fails at
 		// once (so a peer that sends a message slowly, byte by byte, cannot hold a reader that
-		// ignores single failed reads). Set only by the outgoing storage commitment code around a
+		// ignores single failed reads). Plain writes: Unix sends non-blocking with poll() and ends at
+		// the deadline (a peer that stops reading cannot hold the sender); Windows only checks the
+		// deadline before the send. Set only by the outgoing storage commitment code around a
 		// connect and its association setup.
 		long	Deadline;
 		

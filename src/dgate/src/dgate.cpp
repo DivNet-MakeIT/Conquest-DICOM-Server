@@ -1378,6 +1378,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261027	mmd	TLS: no session resumption on any context, client and server, strict and legacy: no TLS
 			1.2 session tickets (SSL_OP_NO_TICKET), no session cache, no TLS 1.3 tickets; a resumed
 			session is refused on both sides (socket.cxx)
+20261027	mmd	TLS: renegotiation refused on every context, client and server, strict and legacy
+			(SSL_OP_NO_RENEGOTIATION)
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -21164,6 +21166,13 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 	SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
 	SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 	SSL_CTX_set_num_tickets(ctx, 0);
+	// no renegotiation (TLS 1.2 and older), started by either side: a ClientHello or
+	// HelloRequest after the handshake is answered with a no_renegotiation alert
+#ifdef	SSL_OP_NO_RENEGOTIATION
+	SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#else
+#error "TLS support (HAVE_OPENSSL) needs SSL_OP_NO_RENEGOTIATION (OpenSSL 1.1.0h or later)"
+#endif
 	if (legacy ? !TLSSetLegacyCiphers(ctx) : !TLSSetCiphers(ctx, ciphers, minversion))
 		{
 		SSL_CTX_free(ctx);

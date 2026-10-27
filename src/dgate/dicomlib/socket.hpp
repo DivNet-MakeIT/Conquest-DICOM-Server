@@ -95,7 +95,7 @@ class	Socket
 		int	ConnectTimeOut;
 		BOOL	ConnectTimedOut;
 		// Overall deadline (20261027 mmd). 0 (the default) = none, as before. Otherwise an
-		// absolute time (seconds, time()): the connect attempts of Open, the TLS handshake and
+		// absolute time (seconds, time()): the connect attempts of Open (plain too), the TLS handshake and
 		// every read and write end by then, and once it has passed every read and write fails at
 		// once (so a peer that sends a message slowly, byte by byte, cannot hold a reader that
 		// ignores single failed reads). Set only by the outgoing storage commitment code around a

@@ -1509,6 +1509,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			(AddImageFile, AttachFile: SCRefused through SaveToDisk). Other failures as before
 20261027	mmd	Outgoing storage commitment: SCRelease without a watchdog on Windows too goes on bounded by
 			Socket::Deadline (Windows plain sends now end at it)
+20261027	mmd	Outgoing storage commitment: modpatid, anonymize, modifyimage and merge with DelFile apply the
+			worklist and FixImage (SaveToDiskPrepare, split from SaveToDisk) before the destination study
+			is admitted and before anything is removed; SaveToDisk does not repeat them (Prepared): the
+			admitted destination is the study the object is written to (worklist may change it)
 ENDOFUPDATEHISTORY
 */
 
@@ -4061,7 +4065,8 @@ OffsetDatesInDICOMObject(DICOMObject *DO, const char *Exceptions, int Offset, Da
 
 // forward references
 int
-SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE, int *SCRefused=NULL);
+SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE, int *SCRefused=NULL, BOOL Prepared=FALSE);
+int SaveToDiskPrepare(Database *DB, DICOMCommandObject *DCO, DICOMDataObject *DDOPtr, ExtendedPDU_Service *PDU);
 
 int  SCWriteBegin(const char *inst, const char *study);
 void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written);
@@ -4090,6 +4095,8 @@ void SCStudyHoldEnd(int slot);
 // source study and the destination study are admitted (SCStudyHoldBegin) before that first step and
 // held until the replacement is done (destructor), so no verified delete of either study runs in
 // between; FALSE: refused (a verified delete of one of them still running), nothing may be changed.
+// DDO must be in its final form: SCReplacePrepare first applies what SaveToDisk would change (the
+// worklist, FixImage), so the destination admitted is the study the object is written to.
 // Nothing when OutgoingStorageCommitment is 0.
 struct SCReplaceGuard
 	{
@@ -4113,6 +4120,28 @@ struct SCReplaceGuard
 		}
 	~SCReplaceGuard() { SCStudyHoldEnd(dst); SCStudyHoldEnd(src); }
 	};
+
+// Outgoing storage commitment, replacement with DelFile: SaveToDisk's own changes of the object
+// (worklist, FixImage; they may change the StudyInstanceUID) are applied before the destination study
+// is admitted and before anything is removed; SaveToDisk is then called with Prepared (not again).
+// TRUE: done (*prepared set), or nothing to do (off, no DelFile). FALSE: the object was not accepted
+// (WorkListMode 2), nothing changed; *pDDO is deleted and set to NULL.
+static BOOL SCReplacePrepare(Database *DB, DICOMDataObject **pDDO, BOOL DelFile, ExtendedPDU_Service *PDU, BOOL *prepared, const char *file)
+	{
+	*prepared = FALSE;
+	if (!OutgoingStorageCommitment || !DelFile) return TRUE;
+	int r = SaveToDiskPrepare(DB, NULL, *pDDO, PDU);
+	if (r<=0)
+		{
+		if (r<0) delete *pDDO;		// not deleted by SaveToDiskPrepare
+		*pDDO = NULL;
+		OperatorConsole.printf("***[Replace] %s not changed: the new object is not accepted (worklist)\n", file);
+		return FALSE;
+		}
+	*prepared = TRUE;
+	return TRUE;
+	}
+
 unsigned int SCSendSeq(void);
 void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
@@ -4795,6 +4824,9 @@ ModifyPATIDofImageFile(char *filename, char *NewPATID, BOOL DelFile, char *scrip
 	// outgoing storage commitment: source and destination study admitted before anything is removed,
 	// held until the end (no verified delete of either runs in between)
 	SCReplaceGuard scHold;
+	BOOL scPrepared;
+	if (!SCReplacePrepare(&DB, &pDDO, DelFile, PDU, &scPrepared, filename))
+		return ( FALSE );
 	if (DelFile && !scHold.Begin(scSrcStudy, pDDO, filename))
 		{
 		delete pDDO;
@@ -4812,7 +4844,7 @@ ModifyPATIDofImageFile(char *filename, char *NewPATID, BOOL DelFile, char *scrip
 
 	// add the image in memory to the server, also makes a copy of the image
 	// if (!SaveToDisk(DB, pDDO, rFilename, TRUE, (unsigned char *)"modpatid", (unsigned char *)"modpatid", 0, 1))
-	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1))
+	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1, NULL, scPrepared))
 		{
 		//delete pDDO;
 		OperatorConsole.printf("***Error entering object into server: %s\n", filename);
@@ -5262,6 +5294,9 @@ MergeUIDofImageFile(char *filename, BOOL DelFile, const char *type, char *script
 	// outgoing storage commitment: source and destination study admitted before anything is removed,
 	// held until the end (no verified delete of either runs in between)
 	SCReplaceGuard scHold;
+	BOOL scPrepared;
+	if (!SCReplacePrepare(&DB, &pDDO, DelFile, PDU, &scPrepared, filename))
+		return ( FALSE );
 	if (DelFile && !scHold.Begin(scSrcStudy, pDDO, filename))
 		{
 		delete pDDO;
@@ -5279,7 +5314,7 @@ MergeUIDofImageFile(char *filename, BOOL DelFile, const char *type, char *script
 
 	// add the image in memory to the server, also makes a copy of the image
 	//if (!SaveToDisk(DB, pDDO, rFilename, TRUE, (unsigned char *)"merging", (unsigned char *)"merging", 0, 1))
-	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1))
+	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1, NULL, scPrepared))
 		{
 		//delete pDDO;
 		OperatorConsole.printf("***Error entering object into server: %s\n", filename);
@@ -13873,8 +13908,44 @@ BOOL ApplyWorklist(DICOMDataObject *DDOPtr, Database *DB)
 
 BOOL    NewDeleteSopFromDB(char *pat, char *study, char *series, char *sop, Database &aDB);
 
+// The changes SaveToDisk makes to an object before its import converters: worklist (WorkListMode)
+// and FixImage. 1: done; 0: not accepted, DDOPtr deleted; -1: not accepted, DDOPtr not deleted
+// (as before: SaveToDisk returns FALSE in both cases)
+int SaveToDiskPrepare(Database *DB, DICOMCommandObject *DCO, DICOMDataObject *DDOPtr, ExtendedPDU_Service *PDU)
+	{
+	if (WorkListMode==1) 			// optionally update information from worklist db
+		ApplyWorklist(DDOPtr, DB);
+	else if (WorkListMode==2) 		// compulsory update information from worklist db
+		{
+		if (!ApplyWorklist(DDOPtr, DB)) 
+			{
+			OperatorConsole.printf("***[WorkListMode 2] Worklist entry (AccessionNumber) not found; object not saved\n");
+			//return FALSE;
+
+			int rc = CallImportConverterN(DCO, DDOPtr, 2200, NULL, NULL, NULL, NULL, PDU, NULL, NULL);
+			if (rc==7)	// retry command
+				{
+				if (!ApplyWorklist(DDOPtr, DB)) 
+					{
+					OperatorConsole.printf("***[WorkListMode 2] Worklist entry (AccessionNumber) not found on retry; object not saved\n");
+					return -1;
+					}
+				}
+			else
+				{
+				delete DDOPtr;
+				return 0;
+				}
+			}
+		}
+
+	FixImage(DDOPtr);	// Make sure the required DICOM UID's are there + fix patient ID if enabled
+	return 1;
+	}
+
+// Prepared: SaveToDiskPrepare was already applied to DDOPtr (SCReplacePrepare)
 int
-SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax, BOOL nopreget, int *SCRefused)
+SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax, BOOL nopreget, int *SCRefused, BOOL Prepared)
 	{
 //	FILE		*fp;
 	DICOMDataObject	DDO;
@@ -13911,33 +13982,10 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 
 	//PDU.AttachRTC(&VRType);
 
-	if (WorkListMode==1) 			// optionally update information from worklist db
-		ApplyWorklist(DDOPtr, DB);
-	else if (WorkListMode==2) 		// compulsory update information from worklist db
-		{
-		if (!ApplyWorklist(DDOPtr, DB)) 
-			{
-			OperatorConsole.printf("***[WorkListMode 2] Worklist entry (AccessionNumber) not found; object not saved\n");
-			//return FALSE;
-
-			int rc = CallImportConverterN(DCO, DDOPtr, 2200, NULL, NULL, NULL, NULL, PDU, NULL, NULL);
-			if (rc==7)	// retry command
-				{
-				if (!ApplyWorklist(DDOPtr, DB)) 
-					{
-					OperatorConsole.printf("***[WorkListMode 2] Worklist entry (AccessionNumber) not found on retry; object not saved\n");
-					return FALSE;
-					}
-				}
-			else
-				{
-				delete DDOPtr;
-				return FALSE;
-				}
-			}
-		}
-
-	FixImage(DDOPtr);	// Make sure the required DICOM UID's are there + fix patient ID if enabled
+	// the worklist and FixImage (SaveToDiskPrepare); not again for an object already prepared
+	// (Prepared: a replacement with outgoing storage commitment, see SCReplacePrepare)
+	if (!Prepared && SaveToDiskPrepare(DB, DCO, DDOPtr, PDU)<=0)
+		return FALSE;
 
 	/* PDU.SaveDICOMDataObject destroys the contents of DDOPtr. We need to know
 	   the modality in order to decide whether ExportConverters or ImportConverters 

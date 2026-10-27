@@ -1490,6 +1490,11 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			release); the release is bounded (SCRelease: A-ABORT when no reply) and never waits past
 			the deadline; failures at the deadline answer 0 no result
 
+20261027	mmd	Outgoing storage commitment: a local write of a study is never admitted while its verified
+			delete (sc_verify_and_delete:) runs: still running after OutgoingSCDeleteWriteWait (default
+			60 s, 1..3600) the write is refused before anything is written (C-STORE answered with
+			StorageFailedErrorCode, *** line); also a write without a usable SOP instance UID while any
+			delete runs. The write starts before the file name is chosen. No 0 write during delete
 ENDOFUPDATEHISTORY
 */
 
@@ -1673,6 +1678,7 @@ int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
 int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
 int	OutgoingSCVerifyMax=4;				// sc_verify_now: at most this many verifications at the same time (1..64)
 int	OutgoingSCConnectTimeout=30;			// connect + TLS handshake + association of a worker request or re-send (1..TCPIPTimeOut)
+int	OutgoingSCDeleteWriteWait=60;			// seconds a local write waits for a verified delete of its study, then it is refused (1..3600)
 int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
@@ -4055,7 +4061,8 @@ struct SCWriteGuard
 	Database	*db;
 	BOOL		active;
 	SCWriteGuard() : slot(-2), inst(NULL), db(NULL), active(FALSE) {}
-	void Begin(Database *d, const char *i, const char *s) { db = d; inst = i; slot = SCWriteBegin(i, s); active = slot!=-2; }
+	// FALSE: refused (a verified delete of the study is still deleting, see SCWriteBegin): write nothing
+	BOOL Begin(Database *d, const char *i, const char *s) { db = d; inst = i; slot = SCWriteBegin(i, s); active = slot>=-1 || slot==-3; return slot!=-4; }
 	void Written() { if (active) { active = FALSE; SCWriteEnd(db, slot, inst, TRUE); } }
 	~SCWriteGuard() { if (active) SCWriteEnd(db, slot, inst, FALSE); }
 	};
@@ -13857,6 +13864,25 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 		SearchDICOMObject(DDOPtr, "0010,0020", patid);
 		}
 
+	// outgoing storage commitment: the write of this object is in progress from here (before the file
+	// name is chosen: that reads the database and may remove the record of a rewrite) until its file
+	// is written (also on every failure return); nothing when OutgoingStorageCommitment is 0. Refused
+	// (a verified delete of the study still running after OutgoingSCDeleteWriteWait): nothing is
+	// written, the store fails (the sender may send again)
+	SCWriteGuard scWrite;
+	char scStudy[256];
+	scStudy[0] = 0;
+	if (OutgoingStorageCommitment)
+		{
+		SearchDICOMObject(DDOPtr, "0020,000d", scStudy);	// the study of the write (sc_verify_now:)
+		if (!scWrite.Begin(DB, szSop, scStudy))
+			{
+			Filename[0]=0;
+			delete DDOPtr;
+			return FALSE;
+			}
+		}
+
 	// make a filename for the new object; note: rRoot (patient directory part of rFilename) is not used any longer
 	*rRoot=1;
 	if (!GenerateFileName(DDOPtr, Device, rRoot, rFilename, NoKill, Syntax, (char *)called, (char *)calling, DB))
@@ -13918,17 +13944,6 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 	{ *p = 0;
 	  rewrite=FALSE;
 	}
-
-	// outgoing storage commitment: the write of this object is in progress from here until its
-	// file is written (also on every failure return); nothing when OutgoingStorageCommitment is 0
-	SCWriteGuard scWrite;
-	char scStudy[256];
-	scStudy[0] = 0;
-	if (OutgoingStorageCommitment)
-		{
-		SearchDICOMObject(DDOPtr, "0020,000d", scStudy);	// the study of the write (sc_verify_now:)
-		scWrite.Begin(DB, szSop, scStudy);
-		}
 
 	// try to enter object into database (object is not saved when this fails)
 	if(!SaveToDataBase(*DB, DDOPtr, rFilename, Device2, *rRoot))
@@ -24875,11 +24890,12 @@ static int		SCWritesUntracked = 0;		// writes in progress whose SOP instance UID
 // starts (SCWriteBegin) counts on the guards of its study ("seen"; a write whose study is not known
 // counts on every guard). The delete only starts when no write of the study started since the guard
 // was set and none is in progress; from then on the guard blocks: a write of the study that starts
-// waits in SCWriteBegin until the delete is done, at most SC_DELWAITMAX seconds (then it goes on,
-// counts as "raced", and the delete answers 0 with an alarm). All under SCNotedCritical.
+// waits in SCWriteBegin until the delete is done. A write is NEVER admitted while the delete runs
+// (the delete has no time limit): when it is still running after OutgoingSCDeleteWriteWait seconds
+// (default 60) the write is refused before it changes anything (SaveToDisk returns FALSE: a C-STORE
+// is answered with StorageFailedErrorCode, the sender may send again). All under SCNotedCritical.
 #define SC_DELGUARDMAX	64
-#define SC_DELWAITMAX	60
-struct SCDelGuard { int used; int block; unsigned int seen; unsigned int raced; char study[65]; };
+struct SCDelGuard { int used; int block; unsigned int seen; char study[65]; };
 static SCDelGuard	SCDelGuards[SC_DELGUARDMAX];
 
 // under SCNotedCritical: does a delete in progress block a write of study ("" = not known: any)?
@@ -24895,10 +24911,7 @@ static void SCDelNoteWrite(const char *study)
 	{
 	for (int i=0; i<SC_DELGUARDMAX; i++)
 		if (SCDelGuards[i].used && (!study[0] || strcmp(SCDelGuards[i].study, study)==0))
-			{
 			SCDelGuards[i].seen++;
-			if (SCDelGuards[i].block) SCDelGuards[i].raced++;
-			}
 	}
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -25138,7 +25151,9 @@ static BOOL SCWriteInProgressLocked(const char *inst)
 // deletes it counts as a write of every study (it waits while one deletes, and no delete starts while
 // it is in progress; SCWritesUntracked until SCWriteEnd). study: its study ("" or NULL when not
 // known: then sc_verify_now: counts it as a write of every study). While a verified delete of the
-// study is deleting (sc_verify_and_delete:), the write waits for it first.
+// study is deleting (sc_verify_and_delete:), the write waits for it first; -4 when the delete is
+// still running after OutgoingSCDeleteWriteWait seconds: the write is refused (nothing is tracked,
+// the caller must not write and must not call SCWriteEnd).
 int SCWriteBegin(const char *inst, const char *study)
 	{
 	int i, r = -1, waited = 0;
@@ -25152,9 +25167,20 @@ int SCWriteBegin(const char *inst, const char *study)
 	for (;;)
 		{
 		EnterCriticalSection(&SCNotedCritical);	// held from the last check until the slot is taken
-		if (!SCDelBlocking(st) || (until && time(NULL) >= until)) break;
+		if (!SCDelBlocking(st)) break;
 		LeaveCriticalSection(&SCNotedCritical);
-		if (!until) until = time(NULL) + SC_DELWAITMAX;
+		if (!until) until = time(NULL) + OutgoingSCDeleteWriteWait;
+		else if (time(NULL) >= until)
+			{
+			// never admitted while the delete runs: refused before anything is written
+			if (untracked)
+				OperatorConsole.printf("*** Storage commitment: write of an object without a usable SOP instance UID refused: a verified delete is still running after %d s (the sender may send again)\n",
+					OutgoingSCDeleteWriteWait);
+			else
+				OperatorConsole.printf("*** Storage commitment: write of %s (study %s) refused: the verified delete of its study is still running after %d s (the sender may send again)\n",
+					inst, st[0] ? st : "-", OutgoingSCDeleteWriteWait);
+			return -4;
+			}
 		waited = 1;
 		Sleep(50);
 		}
@@ -25867,6 +25893,7 @@ void SCReadWorkerConfig(const char *root)
 	OutgoingSCResendMax     = SCIniInt(root, "OutgoingSCResendMax",     3,     0, 999);
 	OutgoingSCResendDelay   = SCIniInt(root, "OutgoingSCResendDelay",   300,   0, 31536000);
 	OutgoingSCVerifyMax     = SCIniInt(root, "OutgoingSCVerifyMax",     4,     1, 64);	// 64 = SC_VERIFYCAP
+	OutgoingSCDeleteWriteWait = SCIniInt(root, "OutgoingSCDeleteWriteWait", 60, 1, 3600);
 	// read after TCPIPTimeOut (ConfigDgate): never longer than that
 	int maxconnect = TCPIPTimeOut>0 ? TCPIPTimeOut : 300;
 	OutgoingSCConnectTimeout = SCIniInt(root, "OutgoingSCConnectTimeout", 30<maxconnect ? 30 : maxconnect, 1, maxconnect);
@@ -27454,7 +27481,7 @@ static int SCDelGuardAdd(const char *study)
 			{
 			SCDelGuards[i].used = 1;
 			SCDelGuards[i].block = 0;
-			SCDelGuards[i].seen = SCDelGuards[i].raced = 0;
+			SCDelGuards[i].seen = 0;
 			strcpy(SCDelGuards[i].study, study);
 			g = i;
 			break;
@@ -27483,7 +27510,6 @@ static const char *SCVerifyDelete(const char *study, const char *ae, int g, int 
 	char id[80];
 	SCVerifyObj *o = NULL;
 	BOOL busy;
-	unsigned int raced;
 	int left;
 
 	EnterCriticalSection(&SCNotedCritical);
@@ -27501,15 +27527,6 @@ static const char *SCVerifyDelete(const char *study, const char *ae, int g, int 
 	DeleteStudy(id, FALSE, 0);
 	left = SCVerifyRead(study, &o);
 	if (left>0) SCVerifyFree(o, left);
-	EnterCriticalSection(&SCNotedCritical);
-	raced = SCDelGuards[g].raced;
-	LeaveCriticalSection(&SCNotedCritical);
-	if (raced)
-		{
-		OperatorConsole.printf("*** Storage commitment ALARM: verify and delete: study %s, AE %s: %u local write(s) of the study did not wait for the delete (limit %d s): check the study\n",
-			study, ae, raced, SC_DELWAITMAX);
-		return "write during delete";
-		}
 	if (left!=0)
 		{
 		if (left>0) OperatorConsole.printf("*** Storage commitment ALARM: verify and delete: study %s, AE %s: %d local object(s) left after the delete\n", study, ae, left);
@@ -27545,7 +27562,7 @@ int SCVerifyInServer(void)
 // with the reason in reason ("disabled", "busy", "empty", "writing", "not an SC node", "no result",
 // "failed <n>", "changed", "changed since send", "content transformed at send", "database error",
 // ...). timeout: 1..600 seconds. del: then delete the study locally (SCVerifyDelete): 1 only when
-// it was verified and deleted ("write during delete", "not deleted completely": see there).
+// it was verified and deleted ("not deleted completely": see there).
 static int SCVerifyNowEx(const char *StudyUID, const char *AE, int timeout, char *reason, int size, BOOL del)
 	{
 	char study[80], ae[80], fail[32], txs[1024];

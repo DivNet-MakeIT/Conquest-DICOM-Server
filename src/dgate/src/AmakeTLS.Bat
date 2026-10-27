@@ -5,8 +5,10 @@ rem              laid out as the Shining Light installer (Win64OpenSSL): include
 rem              lib\VC\x64\MT\libssl_static.lib, libcrypto_static.lib. Other layouts: set ssllibs first.
 rem              Result: ..\dgate64tls.exe (no OpenSSL DLL needed). See docs/Building-Windows.md
 rem              Visual Studio 2015 and later: set EXTRALIBS=legacy_stdio_definitions.lib (as for amake.bat)
+rem              The default library paths are quoted: OPENSSLDIR may contain spaces (C:\Program Files\OpenSSL-Win64).
+rem              A ssllibs set by hand quotes its own paths when they contain spaces.
 
-if "%ssllibs%"=="" set ssllibs=%OPENSSLDIR%\lib\VC\x64\MT\libssl_static.lib %OPENSSLDIR%\lib\VC\x64\MT\libcrypto_static.lib
+if not defined ssllibs set ssllibs="%OPENSSLDIR%\lib\VC\x64\MT\libssl_static.lib" "%OPENSSLDIR%\lib\VC\x64\MT\libcrypto_static.lib"
 
 copy ..\openjpeg\opj_config.h.ms8 ..\openjpeg\opj_config.h
 copy ..\openjpeg\opj_inttypes.h.ms8 ..\openjpeg\opj_inttypes.h

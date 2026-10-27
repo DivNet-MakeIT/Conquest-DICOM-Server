@@ -290,9 +290,20 @@ regen. Upstream tables are not changed.
 | `CANCELLED` | map entry lost its `SC`, or `sc_cancel:` |
 | `CHANGED` | the object was stored again locally after it was sent; not confirmed until sent again |
 
-**File stamp (`FileStamp`).** `size:mtime.nanoseconds:inode` of the local file, taken by the send
-path right before it reads the file and checked right after it (no stamp when the file changed
-meanwhile). Forwards (ExportConverter), C-MOVE and re-sends record it; the ImportConverter forward of
+**File stamp (`FileStamp`).** `v2:size:mtime.ns:ctime.ns:inode` of the local file, taken by
+the send path right before it reads the file and checked right after it (no stamp when the file
+changed meanwhile). The change time (ctime) is set by the system on every write and cannot be set
+back by user tools, so a rewrite that restores the modification time (`touch -d`, `cp -p`,
+`rsync -t`) still changes the stamp. The device number is not part of it: it can change when a
+file system is mounted again (a container restart on overlay storage, device-mapper numbering after
+a reboot) and would then make every stamp differ after exactly the unclean restart the
+reconciliation runs after (the verification still compares the device within one call, in its
+fingerprint). Stamps detect ordinary rewrites; they are not proof against
+deliberate tampering by a privileged user (who can set the system clock or write to the block
+device). A content digest of the sent bytes was considered and not implemented (the send path
+reads the file through the DICOM parser; hashing would mean reading every file a second time). A
+stamp of an earlier build (`size:mtime.ns:inode`, without `v2:`) counts as no stamp: step 7 of
+`sc_verify_now` never matches it and the reconciliation uses the whole-second rule. Forwards (ExportConverter), C-MOVE and re-sends record it; the ImportConverter forward of
 the received object, Lua sends and the older note wrappers record none. A send that may change the
 content records none either and sets NoResend: a `script` clause, an ExportConverter command
 before the forward that may change the object (only `write`, `append`, `copy`, `save to`, the `if…`
@@ -303,7 +314,8 @@ changing compression (everything except as-is,
 uncompressed and the lossless JPEG, JPEG 2000 and JPEG-LS modes), and for C-MOVE a
 RetrieveConverter0 / RetrieveResultConverter0, scrub, downsizing or frame extraction. The stamp then
 never certifies content the archive did not get. Only strong stamps are kept:
-a system with nanosecond file times (Linux, macOS), a non-zero inode and a non-zero nanosecond part;
+a system with nanosecond file times (Linux, macOS), a non-zero inode and non-zero nanosecond parts
+of both times;
 otherwise (e.g. Windows, file systems with whole-second times) the stamp is empty. A table of an
 earlier build gets the column at the first start (`adding column FileStamp to table SCObject`,
 existing rows empty).

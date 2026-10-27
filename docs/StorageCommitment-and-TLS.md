@@ -577,12 +577,13 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
   - the TCP connect, plain and TLS (a node whose packets are dropped does not wait for the
     kernel's connect timeout);
   - every read, plain and TLS;
-  - every write: TLS on every platform; plain on Unix the writes are non-blocking with `poll()`
-    and end at the deadline (an archive that accepts the association and then stops reading
-    cannot hold a large N-ACTION); on Windows a plain write is only refused once the deadline has
-    passed, a write that has started is not cut;
-  - the release: without a watchdog (Windows) a verification's release is written only on Unix,
-    bounded by the deadline; on Windows its connection is closed without A-RELEASE.
+  - every write: TLS on every platform; plain writes are non-blocking and end at the deadline (an
+    archive that accepts the association and then stops reading cannot hold a large N-ACTION):
+    on Unix with `MSG_DONTWAIT` and `poll()`, on Windows with the socket non-blocking for the send
+    (`FIONBIO`) and `select()` (the Windows path is compiled by reasoning and a mingw-w64 check,
+    not run);
+  - the release: without a watchdog (always on Windows) a verification's release is written
+    bounded by the deadline, its reply read the same way.
 - One console line per verification (3.7), plus one per request and per result.
 - What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). The archive
   does not compare content; step 7 compares the local file with the one last sent and committed.
@@ -613,13 +614,35 @@ records), with the local writes of the study excluded:
   still running after `OutgoingSCDeleteWriteWait` seconds (default 60), the waiting write is
   refused before it changes anything (no database record, no file): a C-STORE is answered with
   `StorageFailedErrorCode` (default 0x0110, processing failure), so the sender sees a failure and
-  may send again after the delete; an import, `modpatid`, attach, merge or Lua `addimage` fails as
-  on any other failed write. Console line `*** Storage commitment: write of <uid> (study <uid>)
-  refused: the verified delete of its study is still running after <n> s (the sender may send
-  again)`. A write whose SOP Instance UID is missing or longer than 64 characters waits while any
-  delete runs and is refused the same way. The write counts from before its file name is chosen
-  (that step reads the database and, for a rewrite with another file extension, removes the old
-  record).
+  may send again after the delete; an attach or Lua `addimage` fails as on any other failed
+  write. Console line `*** Storage commitment: write of <uid> (study <uid>) refused: the verified
+  delete of its study is still running after <n> s (the sender may send again)`. A write whose
+  SOP Instance UID is missing or longer than 64 characters waits while any delete runs and is
+  refused the same way. The write counts from before its file name is chosen (that step reads the
+  database and, for a rewrite with another file extension, removes the old record).
+- **Imports keep a refused file.** The incoming folder and `loadanddeletedir:` (and archives in
+  them) do not remove a file whose store was refused this way: no retries, no
+  `RejectedImageConverter`, console line `*** [LoadAndDeleteDir] <file> kept for a later import:
+  its store was refused (a verified delete of its study is running)`; the next pass imports it.
+  An archive with a refused object is kept whole and imported again later. Every other import
+  failure is handled as before (retries, converter, file removed).
+- **Replacements are admitted before they remove anything.** `modifypatid:`, `anonymize:`,
+  `modifyimage:`, `modifystudy:`, `modifyseries:`, `modifier:` and the merges (`mergestudyfile:`,
+  `mergeseriesfile:`) remove the record and file of the source object before they write the new
+  one. Both the source study and the destination study are admitted first (the same wait and
+  refusal) and held until the new object is written, so no verified delete of either runs in
+  between. Refused: nothing is removed, console lines `*** Storage commitment: replacement of
+  <file> (nothing changed) refused: a verified delete of study <uid> is still running after <n> s`
+  and `***[ModifyPATIDofImageFile] <file> not modified` (`***[MergeUIDofImageFile] <file> not
+  merged`).
+- **Regen.** A regen (`regen:`, `regendevice:`, `regendir:`, `regenfile:`) enters each record under
+  the same admission of its study: refused while a delete of the study still runs (`***
+  Storage commitment: regen of <file> (record not entered) refused: ...`), and a file that a
+  verified delete removed after regen read it is skipped (`***[Regen] <file> -SKIPPED`): no record
+  without a file. A regen pass waits up to `OutgoingSCDeleteWriteWait` per file of a study that is
+  being deleted.
+- These admissions are process-local, as the guards: a `dgate -r` or a modification run in another
+  dgate process is not excluded.
 - The study is deleted and read again: no local object may be left.
 - Answers: `1` (verified and deleted), every `0` of `sc_verify_now`, `0 changed` (a write of the
   study started during the verification), `0 not deleted completely` (objects left after the
@@ -1012,4 +1035,11 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `e408e76` Sockets: the plain connect honours Deadline
 - `e3fb82c` Sockets: Deadline bounds plain sends (non-blocking with poll() on Unix)
 - `b7d5912` Outgoing storage commitment: no unbounded release or abort write without a watchdog
-- this commit: Docs: writes refused during a verified delete, deadline coverage, commit map
+- `08bb743` Docs: writes refused during a verified delete, deadline coverage, commit map
+
+**Imports, replacements and regen during a verified delete; Windows sends**
+- `2dfeda9` Outgoing storage commitment: modpatid and merge admit both studies before removing anything
+- `ec06415` Outgoing storage commitment: an import refused during a verified delete keeps its file
+- `5d2c802` Outgoing storage commitment: regen enters a record only under an admission of its study
+- `6609adf` Sockets: Deadline bounds plain sends on Windows too
+- this commit: Docs: imports, replacements and regen during a verified delete, Windows sends, commit map

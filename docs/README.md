@@ -13,17 +13,22 @@ All AE titles and addresses in the documents are examples. All tests used synthe
 
 ---
 
-## 1. Two variants
+## 1. Three variants
 
-| | Variant A | Variant B |
-|---|---|---|
-| Branch | `sc-incoming` ("incoming") | `sc-outgoing-tls` ("sending and TLS") |
-| Tag | `sc-incoming-v1.1` (`sc-incoming-v1`: the same code without the readme addendum and the binary) | `sc-outgoing-tls-rc2` |
-| Commits on `0676009` | 3 code commits, plus the readme addendum, the upstream Windows build fix `294b633` (as `ca61fd1`) and a Windows binary | the whole series (see §9 of this page) |
-| Contents | storage commitment SCP only: dgate answers N-ACTION requests for data it received | A + outgoing storage commitment (SCU) + DICOM TLS (strict and legacy profile) + verify-before-delete |
-| Startup line | `Build variant: SC-in ...` | `Build variant: SC-in SC-out ...` (without OpenSSL) or `Build variant: SC-in SC-out TLS ...` |
+| | Variant A | Variant B (this branch) | Variant C |
+|---|---|---|---|
+| Branch | `sc-incoming` ("incoming") | `sc-outgoing-tls` ("sending and TLS") | `sc-outgoing` ("sending", default branch of the fork) |
+| Tag | `sc-incoming-v1.1` (`sc-incoming-v1`: the same code without the readme addendum and the binary) | `sc-outgoing-tls-rc2` | `sc-outgoing-v1` |
+| Commits on `0676009` | 3 code commits, plus the readme addendum, the upstream Windows build fix `294b633` (as `ca61fd1`) and a Windows binary | the whole series (see §9 of this page) | the two shared commits, `294b633` (as its own copy), one commit with the storage commitment part of this series, mingw build, GUI, docs, readme, Windows binary |
+| Contents | storage commitment SCP only: dgate answers N-ACTION requests for data it received | A + outgoing storage commitment (SCU) + DICOM TLS (strict and legacy profile) + verify-before-delete | B without DICOM TLS: nodes with `T` in acrnema.map are refused, never sent to in plain text (as a B build without OpenSSL) |
+| Startup line | `Build variant: SC-in ...` | `Build variant: SC-in SC-out ...` (without OpenSSL) or `Build variant: SC-in SC-out TLS ...` | `Build variant: SC-in SC-out ...` |
 
-The first two commits are the same on both branches (`5e60eb3`, `cef67a7`). The third commit of
+The older public branch `storage-commitment` is the earlier two-commit version of the incoming
+SCP on upstream `41575e8`; `sc-incoming` has the same two commits refreshed on 1.5.0g4.
+Variant C is documented on its own branch ([docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing/docs/README.md) there);
+`git diff sc-outgoing sc-outgoing-tls` shows the TLS part that only this branch has.
+
+The first two commits are the same on all three branches (`5e60eb3`, `cef67a7`). The third commit of
 variant A (`557f0cc`, the startup line `SC-in`) has its own counterpart in variant B (`e499039`),
 so the branches diverge after the second commit. Variant A is the smaller change, for a site that
 only needs dgate to confirm what it holds. Variant B is the one to review for everything else.

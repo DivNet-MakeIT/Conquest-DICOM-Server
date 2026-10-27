@@ -1427,6 +1427,12 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			that could not be reached is skipped for the rest of the pass, also for re-sends
 20261026	mmd	Outgoing storage commitment: the worker releases its associations (request, re-send) with a
 			time limit (OutgoingSCSameAssocWait, 2..10 s): no A-RELEASE-RP in time -> A-ABORT, closed
+20261026	mmd	Outgoing storage commitment: SCObject.FileStamp (size, modification time with nanoseconds,
+			inode of the local file) taken by the send paths right before the file is read and checked
+			right after (forward, C-MOVE, re-send; carried in the queue); none when the file changed
+			meanwhile, the path does not read a file, or the system gives no nanoseconds or inode. The
+			reconciliation of sc_unsafe_clear: compares it with the file now (rows without a stamp: the
+			whole-second rule). Test-only key SCTestDelayBeforeRecord
 
 ENDOFUPDATEHISTORY
 */
@@ -1616,6 +1622,7 @@ int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read 
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
 int	SCTestFailDemote=0;				// TEST ONLY: 1 = the invalidation after a local overwrite counts as failed
 int	SCTestFailFetch=0;				// TEST ONLY: 1 = reconciliation, sc_unsafe_clear: and sc_verify_now: see a fetch error
+int	SCTestDelayBeforeRecord=0;			// TEST ONLY: ms the worker waits between taking noted sends and recording them (0 = none)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -3998,6 +4005,52 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 int SCModeMayDiffer(const char *mode);
 
+// Outgoing storage commitment, file stamp (SCObject.FileStamp): size, modification time (seconds and
+// nanoseconds) and inode of the local file of a send. A send path takes it right before it reads the
+// file (SCStampFile) and checks it right after (SCStampCheck); the queue carries it to the worker.
+// valid = 0 (no stamp; the reconciliation then uses its whole-second rule for that send) when the
+// file changed while it was read, when the path does not read a local file, or when the stamp would
+// be weak: only systems that give nanoseconds (Linux, macOS) and only with a non-zero inode and a
+// non-zero nanosecond part (a file system with whole-second times gives 0).
+struct SCStamp { long long size, sec, nsec; unsigned long long ino; int valid; };
+#define SC_STAMPLEN 96
+
+static void SCStampFile(const char *file, SCStamp *s)
+	{
+	struct stat st;
+	memset(s, 0, sizeof(SCStamp));
+	if (!file || stat(file, &st)!=0) return;
+	s->size = (long long)st.st_size;
+	s->sec  = (long long)st.st_mtime;
+	s->ino  = (unsigned long long)st.st_ino;
+#if defined(__linux__)
+	s->nsec = (long long)st.st_mtim.tv_nsec;
+	s->valid = s->nsec!=0 && s->ino!=0;
+#elif defined(__APPLE__)
+	s->nsec = (long long)st.st_mtimespec.tv_nsec;
+	s->valid = s->nsec!=0 && s->ino!=0;
+#endif
+	}
+
+// after the read: no stamp when the file is not the same as before it
+static void SCStampCheck(const char *file, SCStamp *s)
+	{
+	SCStamp now;
+	if (!s->valid) return;
+	SCStampFile(file, &now);
+	if (!now.valid || now.size!=s->size || now.sec!=s->sec || now.nsec!=s->nsec || now.ino!=s->ino) s->valid = 0;
+	}
+
+// the text kept in SCObject.FileStamp ("" = no stamp); out: SC_STAMPLEN bytes
+static void SCStampText(const SCStamp *s, char *out)
+	{
+	out[0] = 0;
+	if (s && s->valid) snprintf(out, SC_STAMPLEN, "%lld:%lld.%09lld:%llu", s->size, s->sec, s->nsec, s->ino);
+	}
+
+void SCNoteSentPDUStamp(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq, const SCStamp *stamp);
+extern int SCTestDelayBeforeRecord;
+
 void TestCompress(char *filename, const char *modes, ExtendedPDU_Service *PDU);
 void TestForward(char *filename, const char *mode, char *server, ExtendedPDU_Service *PDU);
 void TestSyntax(char *filename, int syntax, ExtendedPDU_Service *PDU);
@@ -5749,6 +5802,9 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
   DICOMDataObject  *DDO = NULL;
   ExtendedPDU_Service PDU2;  // not used as script context
   unsigned int scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: before the object is read
+  SCStamp scStamp;							// outgoing SC: the file before it is read
+  scStamp.valid = 0;
+  if (OutgoingStorageCommitment) SCStampFile(pszFileName, &scStamp);
 
   PDU2.AttachRTC(&VRType);
 
@@ -6268,7 +6324,10 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
 	  else            return FALSE; // NOT a good idea to retry later
         }
         // script clause or a lossy/changing compression: sent copy may differ from the archive copy
-        if (scOn) SCNoteSentPDU(PDU+part, scCls, scInst, scStudy, script[0]!=0 || SCModeMayDiffer(compress), scSeq);
+        if (scOn)
+        { SCStampCheck(pszFileName, &scStamp);	// the file after it was read: unchanged, else no stamp
+          SCNoteSentPDUStamp(PDU+part, scCls, scInst, scStudy, script[0]!=0 || SCModeMayDiffer(compress), scSeq, &scStamp);
+        }
       
         ImagesForwarded++;
         if (level==4) 
@@ -19142,6 +19201,8 @@ BOOL	MyPatientStudyOnlyGetGeneric	::	CallBack (
 #define STATUS_RETRIEVED 3
 #define STATUS_BUSY 4
 
+struct SCReadSeq { unsigned int seq; SCStamp stamp; };
+
 struct ReadAheadThreadData
 	{
 	char				*SOPs;
@@ -19170,9 +19231,10 @@ struct ReadAheadThreadData
 	int 				numreadahead;
 	int 				overlap;
 	volatile BOOL 		        reverse;
-	unsigned int			*SCSeqs;	// outgoing SC: send sequence taken just before object i was read (NULL: SC off)
+	struct SCReadSeq		*SCSeqs;	// outgoing SC: send sequence taken just before object i was read and its file stamp (NULL: SC off)
 	unsigned int			SCLastSeq;	// outgoing SC: that of the object RetrieveOn returned last
 	int				SCLastSeqValid;
+	SCStamp				SCLastStamp;	// outgoing SC: the file stamp of that object
 	};
 
 // outgoing storage commitment (nkiqrsop.cpp, C-MOVE): the send sequence taken just before the
@@ -19239,13 +19301,14 @@ static int ProcessRATData(struct ReadAheadThreadData *ratd, int maxfiles)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
-		if (ratd->SCSeqs) ratd->SCSeqs[i] = SCSendSeq();	// outgoing SC: before this object is read
+		if (ratd->SCSeqs) { ratd->SCSeqs[i].seq = SCSendSeq(); SCStampFile(FullFilename, &ratd->SCSeqs[i].stamp); }	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
 		else	
 			DDOOut = PDU.LoadDICOMDataObject(FullFilename);
 		LoadTime += (int)time(NULL)-t;
+		if (ratd->SCSeqs) SCStampCheck(FullFilename, &ratd->SCSeqs[i].stamp);
 
 		if (!DDOOut) 
 			{
@@ -19302,13 +19365,14 @@ static int ProcessRATData(struct ReadAheadThreadData *ratd, int maxfiles)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
-		if (ratd->SCSeqs) ratd->SCSeqs[i] = SCSendSeq();	// outgoing SC: before this object is read
+		if (ratd->SCSeqs) { ratd->SCSeqs[i].seq = SCSendSeq(); SCStampFile(FullFilename, &ratd->SCSeqs[i].stamp); }	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
 		else	
 			DDOOut = PDU.LoadDICOMDataObject(FullFilename);
 		LoadTime += (int)time(NULL)-t;
+		if (ratd->SCSeqs) SCStampCheck(FullFilename, &ratd->SCSeqs[i].stamp);
 
 		if (!DDOOut) 
 			{
@@ -19709,13 +19773,14 @@ static BOOL WINAPI ReadAheadThread(struct ReadAheadThreadData *ratd)
 
 		if (*TestMode) strcat(FullFilename, TestMode);
 
-		if (ratd->SCSeqs) ratd->SCSeqs[ir] = SCSendSeq();	// outgoing SC: before this object is read
+		if (ratd->SCSeqs) { ratd->SCSeqs[ir].seq = SCSendSeq(); SCStampFile(FullFilename, &ratd->SCSeqs[ir].stamp); }	// outgoing SC: before this object is read
 		int t = (int)time(NULL);
 		if (!UseChapter10)
 		  	DDOOut = LoadImplicitLittleEndianFile(FullFilename, ratd->iVrSizeLimit);
 		else	
 			DDOOut = PDU.LoadDICOMDataObject(FullFilename);
 		LoadTime += (int)time(NULL)-t;
+		if (ratd->SCSeqs) SCStampCheck(FullFilename, &ratd->SCSeqs[ir].stamp);
 
 		if (!DDOOut) 
 			// mvh 20060401: fix hang condition when a read ahead failed
@@ -19893,7 +19958,7 @@ RetrieveOn (
 		ratd->ObjectFiles = (char *) malloc(ratd->NumToRead * 256);
 		ratd->Devices     = (char *) malloc(ratd->NumToRead * 32);
 		ratd->Status      = (int  *) malloc(ratd->NumToRead * sizeof(int));
-		ratd->SCSeqs      = OutgoingStorageCommitment ? (unsigned int *) calloc(ratd->NumToRead, sizeof(unsigned int)) : NULL;
+		ratd->SCSeqs      = OutgoingStorageCommitment ? (struct SCReadSeq *) calloc(ratd->NumToRead, sizeof(struct SCReadSeq)) : NULL;
 		memset(ratd->SOPs,    0, ratd->NumToRead * 66);
 		memset(ratd->Series,  0, ratd->NumToRead * 66);
 		memset(ratd->Studies, 0, ratd->NumToRead * 66);
@@ -19965,7 +20030,7 @@ RetrieveOn (
 				if (!ratd->reverse && (ratd->Status[i]==STATUS_READ || ratd->Status[i]==STATUS_FAILED) && pADDO->Get(i)==DDOMask) 
 					{
 					*DDOOutPtr = ratd->DDOOutPtr[i];
-					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[i]; ratd->SCLastSeqValid = 1; }
+					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[i].seq; ratd->SCLastStamp = ratd->SCSeqs[i].stamp; ratd->SCLastSeqValid = 1; }
 					strcpy(Filename, ratd->Filenames + i*1024);
 					ratd->Status[i] = STATUS_RETRIEVED;
 					SystemDebug.printf("RetrieveOn: givenout < %04d\n", i);
@@ -20003,7 +20068,7 @@ RetrieveOn (
 					{
 					ratd->reverse = TRUE;
 					*DDOOutPtr = ratd->DDOOutPtr[ratd->NumToRead-1-i];
-					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[ratd->NumToRead-1-i]; ratd->SCLastSeqValid = 1; }
+					if (ratd->SCSeqs) { ratd->SCLastSeq = ratd->SCSeqs[ratd->NumToRead-1-i].seq; ratd->SCLastStamp = ratd->SCSeqs[ratd->NumToRead-1-i].stamp; ratd->SCLastSeqValid = 1; }
 					strcpy(Filename, ratd->Filenames + (ratd->NumToRead-1-i)*1024);
 					ratd->Status[ratd->NumToRead-1-i] = STATUS_RETRIEVED;
 					SystemDebug.printf("RetrieveOn: givenout < %04d\n", ratd->NumToRead-1-i);
@@ -20141,7 +20206,7 @@ further:
 	if (*TestMode) strcat(FullFilename, TestMode);
 
 	// outgoing SC: send sequence just before this object is read
-	if (OutgoingStorageCommitment) { ratd->SCLastSeq = SCSendSeq(); ratd->SCLastSeqValid = 1; }
+	if (OutgoingStorageCommitment) { ratd->SCLastSeq = SCSendSeq(); SCStampFile(FullFilename, &ratd->SCLastStamp); ratd->SCLastSeqValid = 1; }
 
 	int t = (int)time(NULL);
 	if (!UseChapter10)
@@ -20175,6 +20240,7 @@ further:
 
         }
 	LoadTime += time(NULL)-t;
+	if (OutgoingStorageCommitment) SCStampCheck(FullFilename, &ratd->SCLastStamp);	// outgoing SC: the file after the read
 
 	t= (int)time(NULL);
 	ProcessDDO(DDOOutPtr, pDCO, &PDU);
@@ -23576,6 +23642,19 @@ static BOOL SCAddGenColumn(Database &DB, const char *table, const char *probe)
 	return TRUE;
 	}
 
+// add column FileStamp (varchar, '' for existing rows) to an SCObject table made by an earlier build
+static BOOL SCAddStampColumn(Database &DB)
+	{
+	if (DB.Query("SCObject", "FileStamp", "SOPInstUID = '0'", NULL)) return TRUE;
+	OperatorConsole.printf("Outgoing storage commitment: adding column FileStamp to table SCObject\n");
+	if (!DB.Exec((char *)"ALTER TABLE SCObject ADD FileStamp varchar(96) DEFAULT ''"))
+		{
+		OperatorConsole.printf("*** Outgoing storage commitment: could not add column FileStamp to table SCObject\n");
+		return FALSE;
+		}
+	return TRUE;
+	}
+
 // create the tables when they do not exist yet; FALSE when the database cannot hold them
 // Gen (SCObject, SCTxMember): content generation of the object as sent to the destination;
 // every noted send and every local overwrite increments it; a result only applies to the
@@ -23624,12 +23703,12 @@ BOOL SCEnsureTables(Database &DB)
 				"StudyUID varchar(64), State varchar(12), TxUID varchar(64), Attempts int, "
 				"Resends int, ResendRes int, FirstSent int, LastSent int, NextTry int, "
 				"CommittedAt int, FailReason int, DestIP varchar(128), DestPort varchar(16), "
-				"DestTLS int, MapGen int, NoResend int, Gen int DEFAULT 0");
+				"DestTLS int, MapGen int, NoResend int, Gen int DEFAULT 0, FileStamp varchar(96) DEFAULT ''");
 			if (ok) DB.CreateIndex("SCObject", "scobj_key", "CalledAE, SOPInstUID");
 			if (ok) DB.CreateIndex("SCObject", "scobj_state", "State");
 			if (ok) DB.CreateIndex("SCObject", "scobj_inst", "SOPInstUID");
 			}
-		else if (ok) ok = SCAddGenColumn(DB, "SCObject", "SOPInstUID");
+		else if (ok) ok = SCAddGenColumn(DB, "SCObject", "SOPInstUID") && SCAddStampColumn(DB);
 		// markers that make every "study confirmed" answer 0 (Name 'OVERFLOW': sends were lost)
 		if (ok && !DB.Query("SCMarker", "Name", "Name = '0'", NULL))
 			ok = DB.CreateTable("SCMarker", "Name varchar(16), Since int, Drops int");
@@ -24403,7 +24482,7 @@ BOOL StorageApp ::	SCRefuseActionSupport( CheckedPDU_Service *PDU, DICOMCommandO
 // ae/ip/port/tls: the destination actually used (called AE of the association, address, TLS);
 // seq: SCSendSeq() taken when the send started (before the object was read)
 struct SCNoted { char ae[20]; char ip[128]; char port[20]; int tls; char cls[68]; char inst[68]; char study[68];
-		 unsigned int t; int differ; unsigned int seq; int stale; };
+		 unsigned int t; int differ; unsigned int seq; int stale; SCStamp stamp; };
 
 #define SC_NOTEDMAX 50000
 #define SC_CHANGEMAX 4096
@@ -24770,8 +24849,10 @@ static BOOL SCChangedSince(const char *inst, unsigned int seq)
 // the association, the address and port connected to, TLS or not). The worker records exactly
 // these; requests and re-sends only go there, and are HELD when the map says otherwise.
 // Not noted (never confirmed) when the called AE has no SC in acrnema.map or a value is unusable.
+// stamp: the local file as read for this send (SCStampFile/SCStampCheck), NULL or invalid: none.
 void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int TLS,
-	const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
+	const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq,
+	const SCStamp *stamp)
 	{
 	ACRNemaAddress	E;
 	char		ae[20];
@@ -24822,6 +24903,8 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		q->differ = MayDiffer ? 1 : 0;
 		q->seq = seq;
 		q->stale = SCWriteInProgressLocked(q->inst) ? 1 : 0;	// noted while the object is rewritten
+		if (stamp && stamp->valid) q->stamp = *stamp;
+		else                       memset(&q->stamp, 0, sizeof(SCStamp));
 		SCNotedCount++;
 		}
 	SCInvalGen++;					// added or dropped
@@ -24843,9 +24926,26 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 // The same for a C-STORE on PDU: the destination is the one its last Connect really used
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq)
 	{
+	SCNoteSentPDUStamp(PDU, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq, NULL);
+	}
+
+// with the file stamp of the send (NULL: none)
+void SCNoteSentPDUStamp(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq, const SCStamp *stamp)
+	{
 	if (!OutgoingStorageCommitment || !PDU) return;
 	SCNoteSentEx2(PDU->ConnectedAE, PDU->ConnectedHost, PDU->ConnectedPort, PDU->ConnectedTLS,
-		SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq);
+		SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq, stamp);
+	}
+
+// C-MOVE (nkiqrsop.cpp): send sequence and file stamp of the object RetrieveOn returned last
+// (ExtraBytes = its read-ahead data); fallback sequence and no stamp when they are not known
+void SCNoteSentRetrieve(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, void *ExtraBytes, unsigned int fallback)
+	{
+	struct ReadAheadThreadData *r = (struct ReadAheadThreadData *)ExtraBytes;
+	if (!r || !r->SCLastSeqValid)
+		SCNoteSentPDUStamp(PDU, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, fallback, NULL);
+	else
+		SCNoteSentPDUStamp(PDU, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, r->SCLastSeq, &r->SCLastStamp);
 	}
 
 // Older interface (kept as wrappers): the destination is taken from the map entry of AE as it is
@@ -24859,7 +24959,7 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 	strncpy(ae, AE, 16);
 	SCTrim(ae);
 	if (!SCIsAE(ae) || !GetACRNemaEntryByAE(ae, &E)) return;
-	SCNoteSentEx2(ae, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq);
+	SCNoteSentEx2(ae, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq, NULL);
 	}
 
 // without a send sequence: the send is taken as started now
@@ -25361,6 +25461,7 @@ void SCReadWorkerConfig(const char *root)
 	SCTestQueueMax          = SCIniInt(root, "SCTestQueueMax",          0,     0, SC_NOTEDMAX);
 	SCTestFailDemote        = SCIniInt(root, "SCTestFailDemote",        0,     0, 1);
 	SCTestFailFetch         = SCIniInt(root, "SCTestFailFetch",         0,     0, 1);
+	SCTestDelayBeforeRecord = SCIniInt(root, "SCTestDelayBeforeRecord", 0,     0, 60000);
 	SCReadRetryInterval(root);
 	SCUnsafeFileConfig(root);
 	}
@@ -25618,6 +25719,14 @@ static BOOL SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 	return FALSE;
 	}
 
+// the FileStamp text of a file as it is now ("" when there is no strong stamp, see SCStampFile)
+static void SCFileStamp(const char *file, char *out)
+	{
+	SCStamp s;
+	SCStampFile(file, &s);
+	SCStampText(&s, out);
+	}
+
 // record one noted send; every send raises the content generation Gen by one: new row NOTED;
 // an object in a final state (or CHANGED, cancelled, held) was sent again and starts over;
 // NOTED gets the new LastSent; REQUESTED becomes NOTED again (the pending request asked about
@@ -25626,9 +25735,10 @@ static BOOL SCCheckStale(Database &DB, const char *aew, SCNoted *it)
 // Returns FALSE when the database failed: the item stays in the queue and is recorded again on a
 // later pass (every step can be repeated: a repeat only raises Gen once more). TRUE when it is
 // done: recorded, or never recordable (invalid values, destination without SC: logged).
+// FileStamp: the file as the send path read it (carried in the queue; "" when it has none).
 static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 	{
-	char ae[20], aew[64], where[256], upd[1024], cols[256], vals[1024], state[16], study[68];
+	char ae[20], aew[64], where[256], upd[1024], cols[256], vals[1024], state[16], study[68], stamp[SC_STAMPLEN];
 	SQLLEN len;
 	ACRNemaAddress E;
 	unsigned int t = it->t;
@@ -25641,6 +25751,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 		}
 	strcpy(study, it->study);
 	if (study[0]==0) SCLookupStudy(DB, it->inst, study);
+	SCStampText(&it->stamp, stamp);
 
 	SCAEWhere(DB, aew, ae);
 	sprintf(where, "%s and SOPInstUID = '%s'", aew, it->inst);
@@ -25656,7 +25767,7 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 		if (!it->ip[0] || !it->port[0] || !SCSqlText(it->ip, 127) || !SCSqlText(it->port, 16))
 			{ OperatorConsole.printf("*** Storage commitment: unusable address for %s, send not recorded\n", ae); SCUnsafeSet("a noted send with an unusable address was not recorded"); return TRUE; }
 		// the destination of this send (the map may have changed since an earlier one)
-		sprintf(upd, "LastSent = %u, " SC_GENINC ", DestIP = '%s', DestPort = '%s', DestTLS = %d%s%s", t, it->ip, it->port, it->tls,
+		sprintf(upd, "LastSent = %u, " SC_GENINC ", DestIP = '%s', DestPort = '%s', DestTLS = %d, FileStamp = '%s'%s%s", t, it->ip, it->port, it->tls, stamp,
 			strcmp(state, "REQUESTED")==0 ? ", State = 'NOTED', TxUID = '', NextTry = 0" : "",
 			it->differ ? ", NoResend = 1" : "");
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
@@ -25675,17 +25786,17 @@ static BOOL SCRecordNoted(Database &DB, SCNoted *it)
 		{
 		sprintf(upd, "State = 'NOTED', TxUID = '', Attempts = 0, FirstSent = %u, LastSent = %u, NextTry = 0, "
 			"CommittedAt = 0, FailReason = 0, StudyUID = '%s', DestIP = '%s', DestPort = '%s', DestTLS = %d, NoResend = %d, "
-			SC_GENINC,
-			t, t, study, it->ip, it->port, it->tls, it->differ);
+			"FileStamp = '%s', " SC_GENINC,
+			t, t, study, it->ip, it->port, it->tls, it->differ, stamp);
 		if (!DB.UpdateRecords((char *)"SCObject", upd, where))
 			{ OperatorConsole.printf("*** Storage commitment: database update failed for %s to %s, kept in the queue\n", it->inst, ae); return FALSE; }
 		return SCCheckStale(DB, aew, it);
 		}
 
 	strcpy(cols, "CalledAE, SOPInstUID, SOPClassUID, StudyUID, State, TxUID, Attempts, Resends, ResendRes, "
-		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend, Gen");
-	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d, 1",
-		ae, it->inst, it->cls, study, t, t, it->ip, it->port, it->tls, it->differ);
+		"FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend, Gen, FileStamp");
+	sprintf(vals, "'%s', '%s', '%s', '%s', 'NOTED', '', 0, 0, 0, %u, %u, 0, 0, 0, '%s', '%s', %d, 0, %d, 1, '%s'",
+		ae, it->inst, it->cls, study, t, t, it->ip, it->port, it->tls, it->differ, stamp);
 	if (!DB.AddRecord("SCObject", cols, vals))
 		{ OperatorConsole.printf("*** Storage commitment: database insert failed, send of %s to %s kept in the queue\n", it->inst, ae); return FALSE; }
 	return SCCheckStale(DB, aew, it);
@@ -27151,7 +27262,8 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 	PDU_Service LoadPDU;
 	RunTimeClassStorage RTCStorage;
 	UID uid;
-	char aew[64], upd[256], compress[64], cls[68], inst[68], *p;
+	char aew[64], upd[512], compress[64], cls[68], inst[68], *p, stamp[SC_STAMPLEN];
+	SCStamp rstamp;
 	int i, k, tls, rlimit, nheld = 0, nsent = 0;
 
 	SCAEWhere(DB, aew, ae);
@@ -27273,7 +27385,10 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 			OperatorConsole.printf("Storage commitment: re-send of %s to %s not done (no longer allowed or no longer FAILED)\n", it[i].inst, ae);
 			continue;
 			}
+		SCStampFile(it[i].file, &rstamp);		// before the read ...
 		DDO = LoadPDU.LoadDICOMDataObject(it[i].file);
+		SCStampCheck(it[i].file, &rstamp);		// ... and after it: no stamp when it changed
+		SCStampText(&rstamp, stamp);
 		if (DDO && (!SCVRUID(DDO->GetVR(0x0008, 0x0018), inst) || strcmp(inst, it[i].inst)!=0 ||
 		            !SCVRUID(DDO->GetVR(0x0008, 0x0016), cls)))
 			{ delete DDO; DDO = NULL; }
@@ -27317,7 +27432,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 		delete DDO;
 		// back into the normal cycle: asked again with a new TxUID after the quiet time
 		// (not through SCNoteSent; FirstSent is kept)
-		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0, " SC_GENINC, now);
+		sprintf(upd, "State = 'NOTED', Resends = Resends + 1, LastSent = %u, Attempts = 0, TxUID = '', NextTry = 0, FileStamp = '%s', " SC_GENINC, now, stamp);
 		if (!SCResendUpdate(DB, aew, it[i].inst, upd))
 			OperatorConsole.printf("*** Storage commitment ALARM: %s re-sent to %s but the database update failed\n", it[i].inst, ae);
 		else
@@ -27506,19 +27621,24 @@ static void SCPurge(Database &DB, unsigned int now)
 // failed left the rows of its object as they were, with the Gen of the old content: COMMITTED, and
 // any other state that a late result can still turn into COMMITTED (a COMMITTED result applies
 // to every row WHERE Gen = member Gen, whatever its state: NOTED, REQUESTED, FAILED, TIMEOUT, HELD,
-// CANCELLED). Rule: an object is reconciled when any of its rows that is not CHANGED has a
-// LastSent (when its last send was noted) that is not before the modification time of the object's
-// current local file (whole seconds), or when it has no usable file (not local any more, not
-// found, no time). EVERY row of a reconciled object except the CHANGED ones becomes CHANGED
-// (Gen + 1, so no result of an earlier request applies; CANCELLED included): a reconciled object
-// always needs a new send. Why LastSent and not CommittedAt: the send read the file before LastSent,
+// CANCELLED). An object is reconciled unless its current local file is known to be the one sent:
+// - every row of the object that is not CHANGED has a FileStamp (recorded with its send) and the
+//   current local file has one: reconciled when any of these stamps differs from that of the file
+//   (equal stamps: size, modification time to the nanosecond and inode; not written since the send);
+// - otherwise (a row without a stamp: earlier builds, a path or system without one): reconciled
+//   when any such row has a LastSent (when its last send was noted) that is not before the
+//   modification time of the current local file (whole seconds);
+// - no usable file (not local any more, not found, no time): always reconciled.
+// EVERY row of a reconciled object except the CHANGED ones becomes CHANGED (Gen + 1, so no result
+// of an earlier request applies; CANCELLED included): a reconciled object always needs a new send.
+// Why LastSent and not CommittedAt: the send read the file before LastSent,
 // and LastSent <= CommittedAt, so this catches every overwrite after the send, also one between the
 // send and its result. Why it is enough: a demotion that failed was preceded by the change in
 // memory, so a send recorded after it was stale (CHANGED) or is still queued (the clear is refused
 // then); a row recorded before it has LastSent <= that moment < the end of the file write, which
 // is the file time. An object stored in the same second as its last send counts as changed (safe
 // side). Returns the number of objects made CHANGED, -1 on a database error.
-struct SCReconItem { char inst[65]; unsigned int last; };
+struct SCReconItem { char inst[65]; unsigned int last; char lo[SC_STAMPLEN]; char hi[SC_STAMPLEN]; };
 
 // a reconciled row: CHANGED whatever its state (unlike SCChangedUpdate, CANCELLED too)
 static const char *SCReconcileUpdate =
@@ -27528,14 +27648,18 @@ static int SCReconcile(Database &DB)
 	{
 	SCReconItem *list = NULL, *nl;
 	int n = 0, cap = 0, i, changed = 0;
-	char inst[80], last[32], where[256];
+	char inst[80], last[32], where[512], lo[SC_STAMPLEN+4], hi[SC_STAMPLEN+4], cur[SC_STAMPLEN];
 	SQLLEN len;
 
-	if (!DB.Query("SCObject", "SOPInstUID, MIN(LastSent)", "State <> 'CHANGED' GROUP BY SOPInstUID", NULL))
+	// lo = '' when any row has no stamp; lo = hi: all rows have the same stamp
+	if (!DB.Query("SCObject", "SOPInstUID, MIN(LastSent), MIN(COALESCE(FileStamp, '')), MAX(COALESCE(FileStamp, ''))",
+		"State <> 'CHANGED' GROUP BY SOPInstUID", NULL))
 		return -1;
-	inst[0] = last[0] = 0;
+	inst[0] = last[0] = lo[0] = hi[0] = 0;
 	DB.BindField(1, SQL_C_CHAR, inst, sizeof(inst), &len);
 	DB.BindField(2, SQL_C_CHAR, last, sizeof(last), &len);
+	DB.BindField(3, SQL_C_CHAR, lo, sizeof(lo), &len);
+	DB.BindField(4, SQL_C_CHAR, hi, sizeof(hi), &len);
 	while (DB.NextRecord())
 		{
 		SCTrim(inst);
@@ -27551,9 +27675,14 @@ static int SCReconcile(Database &DB)
 			{
 			strcpy(list[n].inst, inst);
 			list[n].last = (unsigned int)strtoul(last, NULL, 10);
+			SCTrim(lo); SCTrim(hi);
+			if (strlen(lo)>=SC_STAMPLEN || strlen(hi)>=SC_STAMPLEN || !SCSqlText(lo, SC_STAMPLEN) || !SCSqlText(hi, SC_STAMPLEN))
+				lo[0] = hi[0] = 0;	// not a stamp of ours: the whole-second rule
+			strcpy(list[n].lo, lo);
+			strcpy(list[n].hi, hi);
 			n++;
 			}
-		inst[0] = last[0] = 0;
+		inst[0] = last[0] = lo[0] = hi[0] = 0;
 		}
 	if (n>=0 && SCFetchFailed(DB, "reconciliation", TRUE)) { if (list) free(list); return -1; }
 	if (n<0) { if (list) free(list); OperatorConsole.printf("*** sc_unsafe_clear: rows with an invalid UID or out of memory\n"); return -1; }
@@ -27563,13 +27692,17 @@ static int SCReconcile(Database &DB)
 		struct stat st;
 		char *file = SCLocalFile(DB, list[i].inst);
 		BOOL known = file && stat(file, &st)==0;
+		SCFileStamp(known ? file : NULL, cur);
 		if (file) free(file);
-		if (known && (long long)st.st_mtime < (long long)list[i].last) continue;	// every send after the file was written
+		BOOL stamped = known && cur[0] && list[i].lo[0];		// every row has a stamp, and so has the file
+		if (stamped && strcmp(list[i].lo, cur)==0 && strcmp(list[i].hi, cur)==0) continue;	// every send read this file
+		if (!stamped && known && (long long)st.st_mtime < (long long)list[i].last) continue;	// every send after the file was written
 		sprintf(where, "SOPInstUID = '%s' and State <> 'CHANGED'", list[i].inst);
 		BOOL demoted = DB.UpdateRecords((char *)"SCObject", (char *)SCReconcileUpdate, where);
 		SCInvalidate();
 		if (!demoted) { free(list); return -1; }
 		OperatorConsole.printf("Storage commitment: reconciliation: %s made CHANGED (%s)\n", list[i].inst,
+			stamped ? "local file differs from the one sent (file stamp)" :
 			known ? "local file written at or after its last send" : "no local file");
 		changed++;
 		}
@@ -27605,6 +27738,7 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 	static unsigned int lastnote = 0, lastalarm = 0;
 	EnterCriticalSection(&SCDrainCritical);
 	n = SCTakeNoted(buf, SC_DRAINMAX);
+	if (n>0 && SCTestDelayBeforeRecord>0) SCTestSleep(SCTestDelayBeforeRecord);	// test only
 	for (i=0; i<n; i++)
 		if (!SCRecordNoted(DB, buf+i)) break;
 	SCDropNoted(i);

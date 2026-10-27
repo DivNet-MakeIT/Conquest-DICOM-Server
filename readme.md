@@ -1,18 +1,3 @@
-## About this fork / branch
-
-This branch (`sc-outgoing-tls`, variant B) adds storage commitment for incoming and outgoing data,
-DICOM TLS (strict and legacy profile) and verify-before-delete to dgate, on top of upstream master
-`f8c0057` (1.5.0g4). A smaller variant A (incoming storage commitment only) is on branch
-`sc-incoming`. Every new behaviour is opt-in: with the new settings at their defaults, dgate
-behaves as 1.5.0g4.
-
-Start with [docs/README.md](docs/README.md): overview, configuration, build notes, tests, known
-limitations, upstream observations and a suggested review order.
-
-The upstream readme follows unchanged.
-
----
-
 This is the new **Conquest DICOM Server** source code repository, it is the first ever release of the full source code of Conquest Dicom server with full source code, including the windows GUI.
 
 Its USP is simplicity for starters, speed for serious users, and endless configurability for nerds and anybody wanting to automate DICOM workflows.
@@ -32,3 +17,21 @@ Open source code used includes the Independent JPEG Group's software; charls by 
 In addition, the following minimised sample web viewers are included: papaya (https://github.com/rii-mango/Papaya, build 1446) and ohif (https://github.com/OHIF/Viewers, 1.03). 
 
 The app/newweb code also contains unmaintained interfaces for dwv (https://github.com/ivmartel/dwv), and weasis (https://nroduit.github.io/en/).
+
+---
+
+## Addendum: DivNet-MakeIT fork — about this branch
+
+This is the DivNet-MakeIT fork of [marcelvanherk/Conquest-DICOM-Server](https://github.com/marcelvanherk/Conquest-DICOM-Server); the text above is the upstream readme, unchanged.
+This branch (`sc-outgoing-tls`, variant B) adds storage commitment for incoming and outgoing data, DICOM TLS (strict and legacy profile) and verify-before-delete to dgate, on top of upstream master `f8c0057` (1.5.0g4). A smaller variant A (incoming storage commitment only) is on branch `sc-incoming`. Every new behaviour is opt-in: with the new settings at their defaults, dgate behaves as 1.5.0g4.
+Start with [docs/README.md](docs/README.md): overview, configuration, build notes, tests, known limitations, upstream observations and a suggested review order.
+
+Branches of this fork:
+
+- `divnet-stable` (default branch): upstream `16cfc3e` (1.5.0f) plus one Linux packaging commit (web files installed without overwriting existing ones; Storage Commitment SOP class listed in `linux/dgatesop.lst`).
+- `divnet-stable-1c2ff06`: the same packaging commit on upstream `1c2ff06` (1.5.0g).
+- `master`: copy of upstream master at `16cfc3e` (1.5.0f); not kept in sync with upstream.
+- `sc-incoming`: variant A, storage commitment SCP for incoming data (opt-in), on upstream `f8c0057` (1.5.0g4).
+- `sc-outgoing-tls`: variant B, storage commitment for incoming and outgoing data, DICOM TLS and verify-before-delete (all opt-in), on upstream `f8c0057` (1.5.0g4); documentation in [docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing-tls/docs/README.md).
+- `storage-commitment`: earlier version of the incoming storage commitment SCP, on upstream `41575e8`; superseded by `sc-incoming`.
+- `add-license-file`: adds a LICENSE file; merged upstream through pull request #51, kept for reference.

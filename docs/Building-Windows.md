@@ -124,12 +124,14 @@ Notes:
   - `lua5.1.dll` from `install64` (x64 builds with `LUA51EXTERN`);
   - `dicom.ini` and `acrnema.map`;
   - `dgate.dic`;
-  - `dgatesop.lst`, which needs the Storage Commitment Push Model line for incoming SC;
+  - `dgatesop.lst`, which needs the Storage Commitment Push Model line for incoming SC and for
+    outgoing SC (the result comes on a new association, section 5);
   - `dicom.sql`.
 
   Then `dgate64.exe -v -r` once, and `dgate64.exe -v` to serve.
 - Server commands work as on Linux: run `dgate64.exe --sc_status:` in the same directory.
 - Open the firewall for `TCPPort`, `TLSPort` and `TLSLegacyPort`.
+- With the Windows GUI (`ConquestDICOMServer.exe`), read section 6 first.
 
 ## 5. Windows behaviour and limits
 
@@ -168,3 +170,145 @@ These follow from the code and were checked on the test machine.
   valid until 2038.
 - **Wine.** Wine is not a reference. The upstream prebuilt exe and the `-O0` mingw builds run
   there, but command output and some exceptions behave differently. Use a real Windows machine.
+
+## 6. Windows GUI (`ConquestDICOMServer.exe`)
+
+The Windows distribution ships a prebuilt GUI. It starts `dgate64.exe` from its own folder and
+writes `dicom.ini`, `acrnema.map` and `dgatesop.lst` itself. This series changes the GUI source
+(`src/gui/Serverdriver.pas`), but the prebuilt `ConquestDICOMServer.exe` is older than these
+changes. The GUI is a Delphi VCL project for Embarcadero RAD Studio (`src/gui/amake.bat`,
+`ConquestDICOMServer.dproj`). It uses VCL, ADODB, DBGrids, `System.RegularExpressions` and the ICS
+sockets, so it cannot be built with Free Pascal or Lazarus; it has not been rebuilt here. Until it
+is rebuilt, 6.1 to 6.4 apply.
+
+### 6.1 TLS build
+
+The GUI always runs `dgate64.exe`. To use the TLS build, stop the server, close the GUI, rename
+`dgate64.exe` (e.g. to `dgate64-plain.exe`) and `dgate64tls.exe` to `dgate64.exe`.
+
+### 6.2 `dicom.ini`
+
+- The GUI has no fields for the keys of this series. Edit `dicom.ini` with a text editor
+  (Notepad), inside `[sscscp]`: anywhere after the `[sscscp]` line and before the next `[...]`
+  line. Keys in `[lua]` (e.g. `OutgoingSCStudyConfirmed`) go in `[lua]`.
+- **The prebuilt GUI drops these keys.** "Save configuration" (Configuration page) rewrites
+  `dicom.ini` from its fields (`SaveConfigButtonClick`: `Rewrite`, then one line per field). Every
+  `[sscscp]` key without a field is lost: all keys of this series, also `EnableStorageCommitment`.
+  Other sections are kept as they were. The GUI then kills and restarts dgate, so the server runs
+  without them at once. The same save runs from "Make ODBC data source" (Installation page) and
+  at a new installation.
+  - Effect: storage commitment is off in both directions and there are no TLS listeners. Nodes with
+    `T` in the map still get TLS only, never plain, but without the certificate keys these
+    connections normally fail.
+  - After every "Save configuration": open `dicom.ini` again, add the keys again, then "Kill and
+    restart the server" (Server status page).
+  - Most of these keys are read at startup only (sections 3.2 and 4.1 of
+    [StorageCommitment-and-TLS.md](StorageCommitment-and-TLS.md)); restart dgate after an edit.
+- The GUI reads `dicom.ini` only at its start. An edit made while the GUI is open is kept until
+  the next "Save configuration", which writes the GUI's values of its own fields.
+- `dgate64.exe --put_param:Key,value` (run in the dgate folder while the server runs) replaces a
+  key that is already in the file. A key that is not there yet is appended at the **end of the
+  file**, i.e. in the last section, which in a GUI-written `dicom.ini` is usually not `[sscscp]`
+  (checked: it landed in `[lua]`). Use it only for keys that are already present.
+- **Rebuilt GUI (this source):** "Save configuration" keeps the `[sscscp]` lines that start with
+  `TLS`, `OutgoingSC`, `OutgoingStorageCommitment`, `EnableStorageCommitment`, `SCUnsafeFile` or
+  `SCTest`, unchanged, in a block headed `# Storage commitment and DICOM TLS (no fields in this
+  GUI; kept as found)` after the GUI's own keys. A `dicom.ini` without such keys is written as
+  before.
+
+Block to paste (the defaults; only the first lines are needed to switch the features on):
+
+```ini
+# Storage commitment (StorageCommitment-and-TLS.md, sections 2 and 3.2)
+EnableStorageCommitment   = 0
+OutgoingStorageCommitment = 0
+OutgoingSCCheckIP         = 1
+OutgoingSCQuietTime       = 30
+OutgoingSCRetries         = 5
+OutgoingSCRetryInterval   = 60,300,900,3600
+OutgoingSCDeadline        = 86400
+OutgoingSCResendMissing   = 1
+OutgoingSCResendMax       = 3
+OutgoingSCConnectTimeout  = 30
+
+# DICOM TLS (section 4.1); used only by the TLS build
+TLSCertificate            =
+TLSPrivateKey             =
+TLSCAFile                 =
+TLSVerifyPeer             = require
+TLSMinVersion             = 1.2
+TLSAcceptSelfSigned       = 0
+TLSNodeCertsFile          =
+TLSPort                   =
+TLSLegacyPort             =
+```
+
+The keys left empty above are empty by default (an empty `TLSPrivateKey` means the
+`TLSCertificate` file). Use full paths for the certificate files (`C:\Conquest\certs\server.pem`).
+
+### 6.3 `dgatesop.lst`
+
+- A `dgatesop.lst` made by the prebuilt GUI has no storage commitment class. Add this line after
+  the `Verification` line (tabs or spaces), then restart dgate:
+
+  ```
+  StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop
+  ```
+
+  Without it, incoming SC is refused, and so is the result of outgoing SC, which on Windows always
+  comes on a new association (section 5). With `EnableStorageCommitment` and
+  `OutgoingStorageCommitment` both 0, dgate refuses the class even when it is listed.
+- Switching "Enable Explicit and JPEG transfers" (Configuration page) and answering Yes to
+  "Update DGATESOP.LST?" writes the file again and removes the line; add it again.
+- **Rebuilt GUI:** a new `dgatesop.lst` has the line.
+
+### 6.4 `acrnema.map`
+
+- The GUI writes its header only when there is no `acrnema.map` (new installation). The prebuilt
+  GUI's header does not describe the 5th column. An existing map is never given a new header.
+- **Editing in the GUI:** page "Known DICOM providers" is a text editor for the map. "Save this
+  list" saves the text as it is and sends `read_amap:` to dgate, which loads the 5th column at
+  once (no restart). The description block can be pasted there, inside the `/* ... */` comment;
+  section 3.1 of [StorageCommitment-and-TLS.md](StorageCommitment-and-TLS.md) has the options.
+- **`dgate64.exe --write_amap:`** (in the dgate folder, while the server runs; checked on Windows
+  11) rewrites the map from the server's memory with dgate's header, which always describes the
+  options. It drops every comment and the GUI's header, writes the columns with spaces, and the
+  "Written by write_amap on" line has no time (upstream: that line prints a variable that is not
+  set there). "Restore this list" shows the new file in the GUI.
+- "Save configuration" replaces the first map line that has no `*` and is longer than 10
+  characters with `<MyACRNema>  127.0.0.1  <TCPPort>  un` (upstream). Keep the server's own entry
+  as the first line after the header comment, without options, and put no comment line without
+  `*` above it.
+- **Rebuilt GUI:** the header of a new map has the options block, identical to the one written by
+  `write_amap`. The compression lines of the GUI header stay as they were.
+
+Example:
+
+```
+/* **********************************************************
+ * ... (header as written by write_amap or the rebuilt GUI)  *
+ * Options (optional 5th column, letters in this order):    *
+ *   T   = DICOM TLS to this node (TLSCertificate etc.)     *
+ *   L   = with T: legacy TLS profile (TLS 1.0-1.2,         *
+ *         AES-CBC) for older stations, e.g. OsiriX;        *
+ *         incoming: TLSLegacyPort. Keys >= 2048 bit,       *
+ *         no MD5; SHA-1 only for pinned nodes              *
+ *   SC  = storage commitment for data sent to this node    *
+ *   R   = re-send missing objects, limit from dicom.ini    *
+ *         (OutgoingSCResendMax); R needs SC                *
+ *   Rn  = re-send at most n times (n = 1..999), e.g. R5    *
+ *   RI  = re-send until committed (I = infinite)           *
+ * Examples: SC  TSC  TLSC  SCR5  TSCRI  TLSCR5             *
+ * No options = as in previous versions.                    *
+ ********************************************************** */
+
+CONQUESTSRV1     127.0.0.1      5678    un
+ARCHIVE          192.0.2.20     104     un      SCR
+ARCHIVE2         192.0.2.21     2762    un      TSC
+VIEWER           192.0.2.30     2762    un      T
+OSIRIX1          192.0.2.40     2763    un      TL
+
+V*               *              1234    un
+W*               *              666     un
+S*               *              5678    un
+```

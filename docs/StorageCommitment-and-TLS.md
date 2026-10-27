@@ -50,6 +50,26 @@ The TLS build flags (`-DHAVE_OPENSSL -lssl -lcrypto`, OpenSSL ≥ 1.1.1) are **n
 Studio with `amake.bat`, an optional TLS build with OpenSSL, mingw-w64) and the Windows
 limits are described in [Building-Windows.md](Building-Windows.md).
 
+### 1.3 Windows GUI
+
+The Windows GUI (`ConquestDICOMServer.exe`) has no fields for the keys of this series. Its
+source (`src/gui/Serverdriver.pas`) is changed here, but the prebuilt exe is older and has not been
+rebuilt (Delphi VCL). With the prebuilt GUI:
+- Edit `dicom.ini` with a text editor, in `[sscscp]`. **"Save configuration" in the GUI drops every
+  `[sscscp]` key it has no field for**, including all keys of this series and
+  `EnableStorageCommitment`, and then restarts dgate. Add the keys again after each save and
+  restart dgate.
+- Its `dgatesop.lst` has no storage commitment line; add
+  `StorageCommitmentPushModel  1.2.840.10008.1.20.1  sop` by hand.
+- Its `acrnema.map` header does not describe the 5th column. Paste the description on the
+  "Known DICOM providers" page ("Save this list" also reloads the map in dgate), or run
+  `dgate64.exe --write_amap:` while the server runs (it drops comments).
+
+A GUI rebuilt from this source keeps the storage commitment and TLS keys when it saves, lists the
+storage commitment class in a new `dgatesop.lst`, and writes the options description in a new
+map. Details, a block of keys to paste and an example map:
+[Building-Windows.md](Building-Windows.md), section 6.
+
 ---
 
 ## 2. Incoming storage commitment (dgate as SCP)
@@ -887,8 +907,10 @@ and ARM64, mingw-w64, plain and TLS) were run on Windows 11 against a Linux dgat
 ## 7. Known limitations and upstream observations
 
 **Limitations of this change**
-- The Windows GUI (`Serverdriver.pas`) "Save config" rewrites a map line with 4 columns. Since it
+- The Windows GUI (`Serverdriver.pas`) "Save configuration" rewrites a map line with 4 columns. Since it
   rewrites the first matching line without checking the AE, it can drop the 5th column of that line.
+- The prebuilt Windows GUI drops the `dicom.ini` keys of this series on "Save configuration" (1.3).
+  The GUI source keeps them; the GUI has to be rebuilt by its maintainer.
 - Comment handling in `acrnema.map` is unchanged: a comment after data on the same line follows
   the old parsing.
 - Outgoing SC applies to forwards, C-MOVE and Lua `dicomstore`. It does not apply to C-GET or

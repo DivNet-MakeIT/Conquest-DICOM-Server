@@ -1438,6 +1438,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			attempt and its limit (attempt a/b; re-sends with the source of the limit: Rn, R from
 			dicom.ini, RI); request, acceptance, result, timeout, UNSUPPORTED, HELD, CANCELLED and
 			CHANGED lines name the study, the number of objects and the transaction where known
+20261027	mmd	Outgoing storage commitment: sc_verify_now: answers 0 changed since send unless every local
+			file has the FileStamp of a COMMITTED SCObject row of the AE (the archive holds the UIDs, but
+			a file rewritten after its committed send is newer than the archived copy); read only, can
+			only turn 1 into 0. Test-only key SCTestNoFileStamp
 
 ENDOFUPDATEHISTORY
 */
@@ -1628,6 +1632,7 @@ int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 =
 int	SCTestFailDemote=0;				// TEST ONLY: 1 = the invalidation after a local overwrite counts as failed
 int	SCTestFailFetch=0;				// TEST ONLY: 1 = reconciliation, sc_unsafe_clear: and sc_verify_now: see a fetch error
 int	SCTestDelayBeforeRecord=0;			// TEST ONLY: ms the worker waits between taking noted sends and recording them (0 = none)
+int	SCTestNoFileStamp=0;				// TEST ONLY: 1 = no file has a file stamp (as on a system without nanosecond times)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -4020,21 +4025,31 @@ int SCModeMayDiffer(const char *mode);
 struct SCStamp { long long size, sec, nsec; unsigned long long ino; int valid; };
 #define SC_STAMPLEN 96
 
+extern int SCTestNoFileStamp;
+
+// the stamp of a file from one stat() result (also used by sc_verify_now:)
+static void SCStampFromStat(const struct stat *st, SCStamp *s)
+	{
+	memset(s, 0, sizeof(SCStamp));
+	s->size = (long long)st->st_size;
+	s->sec  = (long long)st->st_mtime;
+	s->ino  = (unsigned long long)st->st_ino;
+#if defined(__linux__)
+	s->nsec = (long long)st->st_mtim.tv_nsec;
+	s->valid = s->nsec!=0 && s->ino!=0;
+#elif defined(__APPLE__)
+	s->nsec = (long long)st->st_mtimespec.tv_nsec;
+	s->valid = s->nsec!=0 && s->ino!=0;
+#endif
+	if (SCTestNoFileStamp) s->valid = 0;	// test only: as on a system without strong stamps
+	}
+
 static void SCStampFile(const char *file, SCStamp *s)
 	{
 	struct stat st;
 	memset(s, 0, sizeof(SCStamp));
 	if (!file || stat(file, &st)!=0) return;
-	s->size = (long long)st.st_size;
-	s->sec  = (long long)st.st_mtime;
-	s->ino  = (unsigned long long)st.st_ino;
-#if defined(__linux__)
-	s->nsec = (long long)st.st_mtim.tv_nsec;
-	s->valid = s->nsec!=0 && s->ino!=0;
-#elif defined(__APPLE__)
-	s->nsec = (long long)st.st_mtimespec.tv_nsec;
-	s->valid = s->nsec!=0 && s->ino!=0;
-#endif
+	SCStampFromStat(&st, s);
 	}
 
 // after the read: no stamp when the file is not the same as before it
@@ -25497,6 +25512,7 @@ void SCReadWorkerConfig(const char *root)
 	SCTestFailDemote        = SCIniInt(root, "SCTestFailDemote",        0,     0, 1);
 	SCTestFailFetch         = SCIniInt(root, "SCTestFailFetch",         0,     0, 1);
 	SCTestDelayBeforeRecord = SCIniInt(root, "SCTestDelayBeforeRecord", 0,     0, 60000);
+	SCTestNoFileStamp       = SCIniInt(root, "SCTestNoFileStamp",       0,     0, 1);
 	SCReadRetryInterval(root);
 	SCUnsafeFileConfig(root);
 	}
@@ -26510,17 +26526,25 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 //  5. every chunk reported every object committed (event type 1, all in 0008,1199, nothing in
 //     0008,1198), else "0 failed <n>" (n objects reported failed) or "0 invalid result";
 //  6. the local objects and fingerprints, read again, are the same, no local change of them was
-//     registered meanwhile and no write of the study is in progress, else "0 changed".
+//     registered meanwhile and no write of the study is in progress, else "0 changed";
+//  7. every local file is the content last sent to that AE and committed: a COMMITTED SCObject
+//     row of the AE with a non-empty FileStamp equal to the stamp of the file as read in step 1
+//     (read only), else "0 changed since send" (also when the file or the row has no stamp: a
+//     system without nanosecond times, a send path that records none, or the row was purged
+//     after OutgoingSCKeepDays). The archive confirms custody of UIDs, not content; this check
+//     only makes the answer stricter (1 -> 0, never 0 -> 1).
 // Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel file is neither
 // read nor set. Any other doubt (database, connection, refusal of the request) answers 0 with a
 // reason. At most OutgoingSCVerifyMax (default 4) at a time ("0 busy"); timeout 1..600 s, default
 // 60. One console line per verification. What the archive confirms is its custody of these SOP
-// instance UIDs (PS3.4 annex J); content is not compared. An object of the study stored after the
+// instance UIDs (PS3.4 annex J); content is not compared by the archive (step 7 compares the
+// local file with the one last sent and committed). An object of the study stored after the
 // answer is not covered: the caller deletes right after the answer (lua/sc_delete_if_verified.lua).
 //////////////////////////////////////////////////////////////////////////////////////////
 
 // one local object of the study and the fingerprint of its file
-struct SCVerifyObj { char inst[65]; char cls[65]; char *file; long long size, mts, mtn, cts, ctn; unsigned long long ino, dev; };
+struct SCVerifyObj { char inst[65]; char cls[65]; char *file; long long size, mts, mtn, cts, ctn; unsigned long long ino, dev;
+		     char stamp[SC_STAMPLEN]; };
 
 #define SCV_DBERROR	-1		// SCVerifyLocal: database error (or no SOP class column, out of memory)
 #define SCV_NOFILE	-2		// an object without a readable local file
@@ -26555,6 +26579,9 @@ static BOOL SCVerifyStat(SCVerifyObj *o)
 #endif
 	o->ino  = (unsigned long long)st.st_ino;
 	o->dev  = (unsigned long long)st.st_dev;
+	SCStamp s;
+	SCStampFromStat(&st, &s);		// the file stamp as a send records it ("" when none)
+	SCStampText(&s, o->stamp);
 	return TRUE;
 	}
 
@@ -26640,6 +26667,52 @@ static int SCVerifyRead(const char *StudyUID, SCVerifyObj **out)
 	n = SCVerifyLocal(DB, StudyUID, out);
 	DB.Close();
 	return n;
+	}
+
+// Step 7: is the local content the content the archive committed? For every local object o[i]
+// there must be a COMMITTED SCObject row for ae whose FileStamp (the file as its last send read
+// it) is not empty and equal to the stamp of the local file now. The archive only confirms custody
+// of the SOP instance UIDs; a file rewritten locally after its last committed send (the archive
+// holds the old content) must not be deleted. Read only. Returns the number of objects that fail
+// (no such row, another stamp, or no stamp of the file or the row), -1 on a database error. This
+// check can only make a verification stricter: it turns a 1 into 0, never a 0 into 1.
+static int SCVerifySentContent(const char *study, const char *ae, SCVerifyObj *o, int n)
+	{
+	Database DB;
+	char aew[64], where[256], stamp[SC_STAMPLEN+4];
+	SQLLEN len;
+	int i, bad = 0, norow = 0, other = 0, none = 0;
+	BOOL found, any;
+
+	if (!DB.Open(DataSource, UserName, Password, DataHost)) return -1;
+	SCAEWhere(DB, aew, ae);
+	for (i=0; i<n; i++)
+		{
+		if (!o[i].stamp[0]) { none++; bad++; continue; }	// the local file has no stamp
+		sprintf(where, "%s and SOPInstUID = '%s' and State = 'COMMITTED'", aew, o[i].inst);
+		if (!DB.Query("SCObject", "COALESCE(FileStamp, '')", where, NULL)) { DB.Close(); return -1; }
+		stamp[0] = 0;
+		found = any = FALSE;
+		DB.BindField(1, SQL_C_CHAR, stamp, sizeof(stamp), &len);
+		while (DB.NextRecord())
+			{
+			SCTrim(stamp);
+			any = TRUE;
+			if (stamp[0] && strcmp(stamp, o[i].stamp)==0) found = TRUE;
+			stamp[0] = 0;
+			}
+		if (SCFetchFailed(DB, "sc_verify_now: committed rows", TRUE)) { DB.Close(); return -1; }
+		if (found) continue;
+		bad++;
+		if (any) other++;
+		else     norow++;
+		}
+	DB.Close();
+	if (bad)
+		OperatorConsole.printf("*** Storage commitment verify: study %s, AE %s: %d of %d local object(s) not the content last sent and committed "
+			"(%d without a COMMITTED row, %d with another file stamp, %d local file(s) without a stamp): changed since send\n",
+			study, ae, bad, n, norow, other, none);
+	return bad;
 	}
 
 // a local write in progress (SaveToDisk, SCWriteBegin) of one of the objects o, of an object of the
@@ -26932,6 +27005,14 @@ static const char *SCVerifyRun(const char *study, const char *aearg, int timeout
 				}
 			}
 		}
+	if (!why)
+		{
+		// 7. the local content (the files as read, unchanged until now) is the one last sent to
+		// ae and committed (file stamps)
+		i = SCVerifySentContent(study, ae, o, n);
+		if (i<0)      why = "database error";
+		else if (i>0) why = "changed since send";
+		}
 	SCVerifyFree(o, n);
 	if (n2>0) SCVerifyFree(o2, n2);
 	return why;
@@ -26960,7 +27041,7 @@ int SCVerifyInServer(void)
 
 // Verify now: 1 when the archive committed every local object of the study in this call, else 0
 // with the reason in reason ("disabled", "busy", "empty", "writing", "not an SC node", "no result",
-// "failed <n>", "changed", "database error", ...). timeout: 1..600 seconds.
+// "failed <n>", "changed", "changed since send", "database error", ...). timeout: 1..600 seconds.
 int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
 	{
 	char study[80], ae[80], fail[32], txs[1024];

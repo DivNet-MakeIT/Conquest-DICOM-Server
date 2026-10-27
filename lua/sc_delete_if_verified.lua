@@ -5,6 +5,12 @@
 -- "study confirmed" state (sc_confirmed:, scconfirmed, the OutgoingSCStudyConfirmed hook) is
 -- advisory and is NOT a basis for deleting.
 --
+-- The archive confirms that it holds the SOP instance UIDs, not which content. scverifynow() is
+-- therefore also false ("changed since send") when a local file is not the one last sent to that
+-- archive and committed (its file stamp differs from the one recorded with the committed send, the
+-- committed row is gone after OutgoingSCKeepDays, or there is no stamp: a system without nanosecond
+-- file times or a send path that records none). Send the study again and let it commit first.
+--
 -- Needs OutgoingStorageCommitment = 1 in dicom.ini and SC (or TSC) for the archive in acrnema.map.
 -- Call it from a script that runs in the server, e.g. a [lua] nightly or background script, with
 -- the patient ID, the StudyInstanceUID and the AE of the archive:

@@ -1380,6 +1380,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			session is refused on both sides (socket.cxx)
 20261027	mmd	TLS: renegotiation refused on every context, client and server, strict and legacy
 			(SSL_OP_NO_RENEGOTIATION)
+20261027	mmd	Outgoing storage commitment: the release of a worker association also bounds its writes
+			(A-RELEASE-RQ within the release deadline, A-ABORT within 2 s) with the watchdog
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -26631,8 +26633,10 @@ static BOOL SCStopWatch(SCWatch *w)
 // A-ABORT is sent and the connection closed, with a console line. PDU_Service::Close would wait
 // TCPIPTimeOut for the reply and hold up the worker, and with it every other destination.
 // A reply that has started is read under the watchdog (as in the same-association wait), so it
-// cannot stall halfway either. buffered: data is already read into the PDU buffer (it is read at
-// once); what: the association, for the console line.
+// cannot stall halfway either. The writes are bounded too: a destination that stopped reading
+// (full send buffer) cannot block the A-RELEASE-RQ past the deadline, nor the A-ABORT more than
+// 2 s (watchdog; without one, as before). buffered: data is already read into the PDU buffer
+// (it is read at once); what: the association, for the console line.
 static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const char *what)
 	{
 	int	limit = OutgoingSCSameAssocWait;
@@ -26643,7 +26647,9 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 	time_t until = time(NULL) + limit;
 	if (PDU.Link.Deadline > 0 && (time_t)PDU.Link.Deadline < until)
 		until = (time_t)PDU.Link.Deadline;	// a connection with a deadline (sc_verify_now:) ends by it
+	SCWatch *wwatch = SCStartWatch(PDU.Link.Socketfd, until);	// bounds the write
 	ok = PDU.AReleaseRQ::Write(PDU);
+	if (SCStopWatch(wwatch)) { ok = FALSE; timedout = TRUE; }
 	while (ok && !buffered && PDU.Link.Connected && !PDU.Link.Poll())
 		{
 		if (time(NULL)>=until) { ok = FALSE; timedout = TRUE; break; }
@@ -26665,7 +26671,12 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 	if (!ok && (timedout || PDU.Link.Connected))
 		{
 		OperatorConsole.printf("*** Storage commitment: no release reply from %s within %d s (%s): association aborted\n", ae, limit, what);
-		if (PDU.Link.Connected) PDU.AAbortRQ::Write(PDU);
+		if (PDU.Link.Connected)
+			{
+			SCWatch *awatch = SCStartWatch(PDU.Link.Socketfd, time(NULL) + 2);	// bounds the write
+			PDU.AAbortRQ::Write(PDU);
+			SCStopWatch(awatch);
+			}
 		}
 	PDU.Link.Close();
 	}

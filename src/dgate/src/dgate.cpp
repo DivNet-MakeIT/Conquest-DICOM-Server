@@ -1363,6 +1363,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			make that AE refused (fail closed)
 20261027	mmd	Converter forwards: the destination is resolved into a local value (ForwardResolve); the
 			transport is set on the shared forward PDU only under its lock, right before Connect
+20261027	mmd	Converter forwards: a kept association is closed and made again when its TLS mode differs
+			from the map now (e.g. T added by a map reload while a plain association is open) or,
+			with TLS on either side, its address, port, called AE or certificate AE differ
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -6326,11 +6329,13 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
         // does the existing link accept images of this type - if not then hang up to force a reconnect
         // also hang up when UID at ForwardAssociationLevel changes to start a new association
         if (PDU[part].Link.Connected)
-        { SetUID ( iUID, vr );
-          if (!PDU[part].IsAbstractSyntaxAccepted(iUID) || strcmp(ForwardLastUID+part*66, szTemp)!=0 )
+        { const char *changed = NULL;	// destination or transport of the kept association differs
+          SetUID ( iUID, vr );
+          if (ForwardReuseMismatch(PDU[part], host, port, dest[0] ? (char *)dest : line+offset, &FT, &changed) ||
+              !PDU[part].IsAbstractSyntaxAccepted(iUID) || strcmp(ForwardLastUID+part*66, szTemp)!=0 )
           { //OperatorConsole.printf("!!! ExportConverter%d.%d: attempt to reconnect %s \n", N, part, szTemp);
 	    OperatorConsole.printf("ExportConverter%d.%d: forward association closed by %s\n", 
-	      N, part, strcmp(ForwardLastUID+part*66, szTemp)!=0?Level:"SOPCLASS");
+	      N, part, changed?changed:strcmp(ForwardLastUID+part*66, szTemp)!=0?Level:"SOPCLASS");
             MyGetPrivateProfileString(szRootSC, "ForwardAssociationRelease", "1", Temp, 64, ConfigFile);
             if      (atoi(Temp)==1) { PDU[part].Close(); }
             else if (atoi(Temp)==2) { PDU[part].Close(); PDU[part].Link.Close(); } // SM1312+Claude, needs testing
@@ -10823,11 +10828,13 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
       // does the existing link accept images of this type - if not then hang up to force a reconnect
       // also hang up when UID at ForwardAssociationLevel changes to start a new association
       if (PDU[channel].Link.Connected)
-      { SetUID ( iUID, vr );
-        if (!PDU[channel].IsAbstractSyntaxAccepted(iUID) || strcmp(ForwardLastUID+channel*66, szTemp)!=0 )
+      { const char *changed = NULL;	// destination or transport of the kept association differs
+        SetUID ( iUID, vr );
+        if (ForwardReuseMismatch(PDU[channel], host, port, dest[0] ? (char *)dest : line+offset, &FT, &changed) ||
+            !PDU[channel].IsAbstractSyntaxAccepted(iUID) || strcmp(ForwardLastUID+channel*66, szTemp)!=0 )
         { //if (N >= -1) OperatorConsole.printf("!!! ExportConverter%d.%d: attempt to reconnect %s \n", N, channel, szTemp);
 	  OperatorConsole.printf("%sConverter%d.%d: Forward association closed by %s\n", 
-	    ininame, N, channel, strcmp(ForwardLastUID+channel*66, szTemp)!=0?Level:"SOPCLASS");
+	    ininame, N, channel, changed?changed:strcmp(ForwardLastUID+channel*66, szTemp)!=0?Level:"SOPCLASS");
           MyGetPrivateProfileString(szRootSC, "ForwardAssociationRelease", "1", Temp, 64, ConfigFile);
           if (atoi(Temp)) PDU[channel].Close();
 	  else            PDU[channel].Link.Close();
@@ -20703,6 +20710,35 @@ BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarge
 BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T)
 	{
 	return PDU.SetTLS(T->Mode, T->Mode ? T->CertAE : NULL);
+	}
+
+// A kept forward association (PDU connected; call it under the PDU's lock) is reused only
+// when it goes where this forward asks: the same TLS mode (plain, strict, legacy) and, when
+// it or the forward is TLS, the same address, port, called AE (called: first 16 characters)
+// and AE whose certificate was checked. Plain to plain is not compared: as before, only the
+// association level and SOP class decide. TRUE (with *why for the console) = close it and
+// connect again, e.g. after a map reload added T to a node with an open plain association.
+BOOL	ForwardReuseMismatch(PDU_Service &PDU, const char *ip, const char *port, const char *called, ForwardTarget *T, const char **why)
+	{
+	char	a[20], b[20];
+
+	if (PDU.ConnectedTLS != T->Mode)
+		{ *why = "TRANSPORT (TLS in acrnema.map changed)"; return TRUE; }
+	if (!T->Mode)
+		return FALSE;
+	if (strcmp(PDU.ConnectedHost, ip)!=0 || strcmp(PDU.ConnectedPort, port)!=0)
+		{ *why = "DESTINATION (address or port changed)"; return TRUE; }
+	memset(a, 0, sizeof(a));
+	memcpy(a, PDU.ConnectedAE, 16);
+	memset(b, 0, sizeof(b));
+	if (called) strncpy(b, called, 16);
+	while (a[0] && a[strlen(a)-1]==' ') a[strlen(a)-1] = 0;
+	while (b[0] && b[strlen(b)-1]==' ') b[strlen(b)-1] = 0;
+	if (strcmp(a, b)!=0)
+		{ *why = "DESTINATION (called AE changed)"; return TRUE; }
+	if (strcmp(PDU.ConnectedTLSAE, T->CertAE)!=0)
+		{ *why = "DESTINATION (certificate AE changed)"; return TRUE; }
+	return FALSE;
 	}
 
 // A TLS key from the dicom.ini server section, read into a buffer as large as an ini

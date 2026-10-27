@@ -22,6 +22,7 @@
 20220824    mvh    Added LoadDICOMDataObjectTrunc
 20261026    mmd    Added SetTLS: TLS (or plain) for the next Connect
 20261026    mmd    Added ConnectedAE/Host/Port/TLS: destination actually used by the last Connect
+20261027    mmd    Added ConnectedTLSAE: the AE whose certificate was checked on that connection
 */
 
 /****************************************************************************
@@ -249,6 +250,7 @@ class	PDU_Service	:
 		char	ConnectedHost[128];
 		char	ConnectedPort[64];
 		int	ConnectedTLS;
+		char	ConnectedTLSAE[20];	// with TLS: the AE whose certificate was checked (SetTLS)
 				PDU_Service();
 		virtual	~PDU_Service();
 	private:// This will prevent it from being copied (it has pointers)

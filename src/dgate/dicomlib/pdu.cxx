@@ -53,6 +53,7 @@
 20261019    mmd    Connect keeps SCPSCURoles proposed by caller (for storage commitment event)
 20261026    mmd    Connect records ConnectedAE/Host/Port/TLS (destination actually used)
 20261027    mmd    ConnectedTLS is the TLS mode used: 0 plain, 1 TLS, 2 TLS with the legacy profile
+20261027    mmd    Connect records ConnectedTLSAE (AE whose certificate was checked, empty for plain)
 */
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -107,6 +108,7 @@ pdusize(32768)
 	Buffer :: SetOutgoingEndian(BIG_ENDIAN);
 	ConnectedAE[0] = ConnectedHost[0] = ConnectedPort[0] = 0;
 	ConnectedTLS = 0;
+	ConnectedTLSAE[0] = 0;
 	}
 
 PDU_Service	::	~PDU_Service()
@@ -1060,6 +1062,7 @@ BOOL	PDU_Service	::	Connect ( BYTE *ip, BYTE *port )
 	// the destination of this connection (only kept when it succeeds and everything fits)
 	ConnectedAE[0] = ConnectedHost[0] = ConnectedPort[0] = 0;
 	ConnectedTLS = 0;
+	ConnectedTLSAE[0] = 0;
 
 	// ok, every thing proposed, now try and contact the remote end
 	if ( ! Link.Open ( (char*) ip, (char*)port ) )
@@ -1074,6 +1077,9 @@ BOOL	PDU_Service	::	Connect ( BYTE *ip, BYTE *port )
 		strcpy(ConnectedHost, (char *)ip);
 		strcpy(ConnectedPort, (char *)port);
 		ConnectedTLS = Link.TLSMode;	// 0 plain, 1 TLS, 2 TLS legacy profile
+		memset(ConnectedTLSAE, 0, sizeof(ConnectedTLSAE));
+		if (Link.TLSMode)
+			memcpy(ConnectedTLSAE, Link.TLSPeerAE, sizeof(ConnectedTLSAE)-1);
 		}
 
 	AAssociateRQ :: Size();

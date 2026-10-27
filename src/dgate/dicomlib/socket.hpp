@@ -9,6 +9,7 @@
 // 20261026 mmd     Incoming TLS: TLSAccept and the ServerContext hook
 // 20261026 mmd     TLSMode 2 (legacy profile) and the ClientContextLegacy hook
 // 20261026 mmd     TLSAccept with the legacy server context (ServerContextLegacy hook)
+// 20261026 mmd     ConnectTimeOut / ConnectTimedOut (connect time limit, 0 = as before)
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -85,6 +86,13 @@ class	Socket
 		BOOL	Listen (char *port);
 		BOOL	Accept ();
 		BOOL	SetTimeOut(int);
+		// Connect time limit (20261026 mmd). 0 (the default) = as before. > 0: all connect
+		// attempts of Open together end after this many seconds, plain or TLS, and the TLS
+		// handshake ends after at most this many seconds. Set only by the outgoing storage
+		// commitment worker. ConnectTimedOut: the last Open failed because one of these limits
+		// ran out (a node that does not answer).
+		int	ConnectTimeOut;
+		BOOL	ConnectTimedOut;
 		
 		// UDP Extensions
 		BOOL	BindUDPServer(char *port);

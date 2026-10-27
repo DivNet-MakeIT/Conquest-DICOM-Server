@@ -41,6 +41,9 @@
 20261026	mmd	TLSAccept(fd, peer, Legacy): the legacy server context (ServerContextLegacy)
 20261026	mmd	The legacy connection line moved to the application (one operator line per TLS
 			connection with protocol, cipher, profile and node certificate result)
+20261026	mmd	ConnectTimeOut (0 = as before): when set, all connect attempts end at that
+			limit also for plain sockets (non-blocking connect, then blocking again),
+			the TLS handshake is limited to it, and ConnectTimedOut tells a timeout
 
 */
 
@@ -138,6 +141,8 @@ Socket	::	Socket ()
 	TLSHandle = NULL;	// first: the destructor tests it even when WSAStartup failed
 	TLSMode = 0;
 	TLSPeerAE[0] = 0;
+	ConnectTimeOut = 0;
+	ConnectTimedOut = FALSE;
 	TimeOut = 60 * 5;	// 5 minutes	
 	UDP = 0;
 	if(! WinSockUsed )
@@ -233,6 +238,8 @@ Socket	::	Socket()
 	TLSHandle = NULL;
 	TLSMode = 0;
 	TLSPeerAE[0] = 0;
+	ConnectTimeOut = 0;
+	ConnectTimedOut = FALSE;
 	}
 
 Socket	::	~Socket()
@@ -434,6 +441,79 @@ DicomError(DCM_ERROR_DEBUG, "Connected by address: %08x", sa.sin_addr.s_addr);
 	}
 	
 
+#ifndef	WINDOWS
+#	include	<fcntl.h>
+#	include	<errno.h>
+#endif
+#	include	<time.h>
+
+// Plain TCP connect that ends at time end (seconds since the epoch); only used with
+// ConnectTimeOut. Non-blocking connect, then the socket is blocking again (the plain
+// reads and writes expect that). Returns 0 connected, 1 failed (e.g. refused; the
+// caller may retry), 2 timed out.
+static	int	SocketConnectBefore(int fd, struct sockaddr_in *sa, long end)
+	{
+	fd_set		wfds, efds;
+	struct	timeval	tv;
+	int		r, err, left, result;
+#ifdef	WINDOWS
+	int		len = sizeof(err);
+	u_long		nb = 1;
+	if (ioctlsocket(fd, FIONBIO, &nb) != 0)
+		return 1;
+#else
+	socklen_t	len = sizeof(err);
+	int		fl = fcntl(fd, F_GETFL, 0);
+	if (fl == -1 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) == -1)
+		return 1;
+#endif
+	r = connect(fd, (struct sockaddr *) sa, sizeof(struct sockaddr_in));
+	result = 0;
+#ifdef	WINDOWS
+	if (r != 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+		result = 1;
+#else
+	if (r != 0 && errno != EINPROGRESS && errno != EINTR)
+		result = 1;
+#endif
+	while (r != 0 && result == 0)
+		{
+		left = (int)(end - (long) time(NULL));
+		if (left <= 0)
+			{ result = 2; break; }
+		tv.tv_sec = left;
+		tv.tv_usec = 0;
+		FD_ZERO(&wfds);
+		FD_SET(fd, &wfds);
+		FD_ZERO(&efds);
+		FD_SET(fd, &efds);		// Windows reports a failed connect here
+		r = select(fd + 1, NULL, &wfds, &efds, &tv);
+		if (r == 0)
+			{ result = 2; break; }
+		if (r < 0)
+			{
+#ifndef	WINDOWS
+			if (errno == EINTR) { r = -1; continue; }
+#endif
+			result = 1;
+			break;
+			}
+		err = 0;
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *) &err, &len) != 0 || err != 0)
+			result = 1;
+		break;
+		}
+#ifdef	WINDOWS
+	nb = 0;
+	if (ioctlsocket(fd, FIONBIO, &nb) != 0 && result == 0)
+		result = 1;
+#else
+	if (fcntl(fd, F_SETFL, fl) == -1 && result == 0)
+		result = 1;
+#endif
+	return result;
+	}
+
 BOOL	Socket	::	Open ( char	*ip, char	*port)
 	{
 	struct	hostent		*he;
@@ -448,6 +528,7 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 		closesocket(Socketfd);
 
 	Connected = 0;
+	ConnectTimedOut = FALSE;
 
 #ifndef	HAVE_OPENSSL
 	if ( TLSMode )
@@ -512,11 +593,11 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 	sa.sin_family = AF_INET;
 	sa.sin_port = secopy.s_port;
 
-#ifdef	HAVE_OPENSSL
-	// TLS mode only: all connect attempts together end at the deadline (a node that
-	// does not answer would otherwise block for the kernel's connect timeout)
-	long	ConnectEnd = (long) time(NULL) + (TimeOut > 0 ? TimeOut : 300);
-#endif
+	// all connect attempts together end at the deadline: in TLS mode always (TimeOut, or
+	// ConnectTimeOut when set), plain only with ConnectTimeOut (a node that does not answer
+	// would otherwise block for the kernel's connect timeout, per attempt)
+	int	ConnectLimit = ConnectTimeOut > 0 ? ConnectTimeOut : (TimeOut > 0 ? TimeOut : 300);
+	long	ConnectEnd = (long) time(NULL) + ConnectLimit;
 	for (int i=0; i<5; i++)
 		{
 #ifdef	HAVE_OPENSSL
@@ -525,7 +606,8 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 			int r = TLSConnect(ConnectEnd);
 			if ( r == 2 )
 				{
-				SocketTLSPrint(0, "*** TLS: connection to %s (%s) timed out after %d s", TLSPeerAE, ip, TimeOut > 0 ? TimeOut : 300);
+				SocketTLSPrint(0, "*** TLS: connection to %s (%s) timed out after %d s", TLSPeerAE, ip, ConnectLimit);
+				ConnectTimedOut = TRUE;
 				break;
 				}
 			if ( r == 3 )
@@ -537,6 +619,17 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 			}
 		else
 #endif
+		if ( ConnectTimeOut > 0 )
+			{
+			int r = SocketConnectBefore(Socketfd, &sa, ConnectEnd);
+			if ( r == 2 )
+				{
+				ConnectTimedOut = TRUE;
+				break;
+				}
+			Error = r ? -1 : 0;
+			}
+		else
 		Error = connect(Socketfd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in));
 		if( ! Error )
 			{
@@ -1026,6 +1119,8 @@ BOOL	Socket	::	TLSOpen(char *host)
 	limit = TLS_HANDSHAKE_SECONDS;
 	if (TimeOut > 0 && TimeOut < limit)
 		limit = TimeOut;
+	if (ConnectTimeOut > 0 && ConnectTimeOut < limit)
+		limit = ConnectTimeOut;
 	end = time(NULL) + limit;
 	for (;;)
 		{
@@ -1048,6 +1143,7 @@ BOOL	Socket	::	TLSOpen(char *host)
 		if (left <= 0 || TLSWait(w, left) <= 0)
 			{
 			SocketTLSPrint(0, "*** TLS: handshake with %s (%s) timed out after %d s", TLSPeerAE, host, limit);
+			ConnectTimedOut = TRUE;
 			SSL_set_quiet_shutdown(ssl, 1);
 			TLSFree(FALSE);
 			return ( FALSE );
@@ -1113,6 +1209,8 @@ BOOL	Socket	::	TLSAccept(int fd, const char *peer, int Legacy)
 	limit = TLS_HANDSHAKE_SECONDS;
 	if (TimeOut > 0 && TimeOut < limit)
 		limit = TimeOut;
+	if (ConnectTimeOut > 0 && ConnectTimeOut < limit)
+		limit = ConnectTimeOut;
 	end = time(NULL) + limit;
 	for (;;)
 		{

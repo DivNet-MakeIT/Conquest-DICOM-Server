@@ -1421,6 +1421,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			legacy: AE, peer IP, protocol, cipher, profile and node certificate result
 20261026	mmd	write_amap always writes the description of the 5th-column options (T, L, SC, R, Rn, RI)
 			in the map header comment
+20261026	mmd	Outgoing storage commitment: OutgoingSCConnectTimeout (default 30 s, 1..TCPIPTimeOut) limits
+			TCP connect, TLS handshake and association setup of the worker's requests and re-sends
+			(other connections keep TCPIPTimeOut); a timeout is logged with the attempt; a destination
+			that could not be reached is skipped for the rest of the pass, also for re-sends
 
 ENDOFUPDATEHISTORY
 */
@@ -1604,6 +1608,7 @@ int	OutgoingSCResendMissing=1;			// re-send to nodes with R: 0 never, 1 failed (
 int	OutgoingSCResendMax=3;				// re-sends of one object for R without a number
 int	OutgoingSCResendDelay=300;			// seconds before a re-send, and after a failed one (growing)
 int	OutgoingSCVerifyMax=4;				// sc_verify_now: at most this many verifications at the same time (1..64)
+int	OutgoingSCConnectTimeout=30;			// connect + TLS handshake + association of a worker request or re-send (1..TCPIPTimeOut)
 int	SCTestDelayBeforeWrite=0;			// TEST ONLY: ms to wait before the file of a rewritten object is written (0 = none)
 int	SCTestDelayAfterRead=0;				// TEST ONLY: ms to wait after a C-MOVE has read an object (0 = none)
 int	SCTestQueueMax=0;				// TEST ONLY: smaller size of the noted-send queue (0 = normal size)
@@ -25345,6 +25350,9 @@ void SCReadWorkerConfig(const char *root)
 	OutgoingSCResendMax     = SCIniInt(root, "OutgoingSCResendMax",     3,     0, 999);
 	OutgoingSCResendDelay   = SCIniInt(root, "OutgoingSCResendDelay",   300,   0, 31536000);
 	OutgoingSCVerifyMax     = SCIniInt(root, "OutgoingSCVerifyMax",     4,     1, 64);	// 64 = SC_VERIFYCAP
+	// read after TCPIPTimeOut (ConfigDgate): never longer than that
+	int maxconnect = TCPIPTimeOut>0 ? TCPIPTimeOut : 300;
+	OutgoingSCConnectTimeout = SCIniInt(root, "OutgoingSCConnectTimeout", 30<maxconnect ? 30 : maxconnect, 1, maxconnect);
 	// test-only keys (default 0 = no effect): widen race windows so the tests can hit them
 	SCTestDelayBeforeWrite  = SCIniInt(root, "SCTestDelayBeforeWrite",  0,     0, 60000);
 	SCTestDelayAfterRead    = SCIniInt(root, "SCTestDelayAfterRead",    0,     0, 60000);
@@ -25904,6 +25912,51 @@ static void SCSetItems(Database &DB, const char *ae, SCItem *it, int n, const ch
 		}
 	}
 
+// "attempt a/b" of a commitment request: a = the highest Attempts of the objects reserved for
+// transaction TxUID, b = OutgoingSCRetries + 1 (requests per cycle; then TIMEOUT, or for R/RI the
+// re-send or a new cycle); '?' when the database does not tell
+static void SCRequestAttempt(Database &DB, const char *aew, const char *TxUID, char *out)
+	{
+	char where[256], s[32];
+	SQLLEN len;
+	int a = 0;
+	sprintf(where, "%s and TxUID = '%s'", aew, TxUID);
+	if (DB.Query("SCObject", "MAX(Attempts)", where, NULL))
+		{
+		s[0] = 0;
+		DB.BindField(1, SQL_C_CHAR, s, sizeof(s), &len);
+		if (DB.NextRecord()) a = atoi(s);
+		}
+	if (a>0) sprintf(out, "attempt %d/%d", a, OutgoingSCRetries+1);
+	else     sprintf(out, "attempt ?/%d", OutgoingSCRetries+1);
+	}
+
+// "a/b (source)" of a re-send: a = the re-send number (ResendRes after the reservation), b and its
+// source from the map entry: Rn, R (dicom.ini OutgoingSCResendMax) or RI (no limit)
+static void SCResendAttempt(int a, int rlimit, ACRNemaAddress *E, char *out)
+	{
+	if (rlimit==ACR_RESEND_ALWAYS)            sprintf(out, "%d/inf (RI)", a);
+	else if (E->ResendLimit==ACR_RESEND_INI) sprintf(out, "%d/%d (R, OutgoingSCResendMax)", a, rlimit);
+	else                                      sprintf(out, "%d/%d (R%d)", a, rlimit, rlimit);
+	}
+
+// Connect for the worker (a request or a re-send): TCP connect, TLS handshake and the association
+// setup within OutgoingSCConnectTimeout, so that a destination that does not answer holds up the
+// others for at most that long (ordinary C-STORE and forwards keep TCPIPTimeOut); afterwards the
+// socket time limit is TCPIPTimeOut again. *timedout: failed because the limit ran out.
+static BOOL SCConnect(PDU_Service &PDU, char *ip, char *port, BOOL *timedout)
+	{
+	time_t t0 = time(NULL);
+	BOOL ok;
+	PDU.Link.ConnectTimeOut = OutgoingSCConnectTimeout;
+	PDU.SetTimeOut(OutgoingSCConnectTimeout);
+	ok = PDU.Connect((unsigned char *)ip, (unsigned char *)port);
+	PDU.SetTimeOut(TCPIPTimeOut);
+	PDU.Link.ConnectTimeOut = 0;
+	*timedout = !ok && (PDU.Link.ConnectTimedOut || (long)(time(NULL) - t0) >= OutgoingSCConnectTimeout);
+	return ok;
+	}
+
 // association that exposes whether data is already read into the buffer
 class SCAssocPDU : public PDU_Service
 	{
@@ -26132,7 +26185,7 @@ static BOOL SCWaitSameAssoc(SCAssocPDU &PDU, const char *ae)
 
 // open the association and send the N-ACTION; 0 = accepted, 1 = failed (ask again later),
 // 2 = the storage commitment class was not accepted
-static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SCItem *it, int n)
+static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SCItem *it, int n, const char *attempt)
 	{
 	SCAssocPDU PDU;
 	UID	uid, scclass("1.2.840.10008.1.20.1"), instance("1.2.840.10008.1.20.1.1");
@@ -26168,9 +26221,14 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
 	SCPrepareTLS(PDU, EE);
 
-	if (!PDU.Connect((unsigned char *)ip, (unsigned char *)port))
+	BOOL timedout;
+	if (!SCConnect(PDU, ip, port, &timedout))
 		{
-		OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
+		if (timedout)
+			OperatorConsole.printf("*** Storage commitment: connect to %s (%s %s) timed out after %d s, %s (transaction %s)\n",
+				ae, ip, port, OutgoingSCConnectTimeout, attempt, TxUID);
+		else
+			OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
 		return 1;
 		}
 	if (!PDU.IsAbstractSyntaxAccepted(scclass))
@@ -26859,8 +26917,10 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 		return SC_CHUNK_STOP;
 		}
 
+	char attempt[48];
+	SCRequestAttempt(DB, aew, TxUID, attempt);
 	OperatorConsole.printf("Storage commitment request to %s: transaction %s, %d object(s)\n", ae, TxUID, n);
-	r = SCSendAction(ae, &E, TxUID, it, n);
+	r = SCSendAction(ae, &E, TxUID, it, n, attempt);
 	if (r==1)
 		{
 		SCAbandon(DB, ae, TxUID, (unsigned int)time(NULL), FALSE);
@@ -26876,6 +26936,24 @@ static int SCSendChunk(Database &DB, const char *ae, SCItem *it, int n, unsigned
 	return SC_CHUNK_DONE;
 	}
 
+// Destinations that could not be reached in this worker pass (a request or re-send failed, e.g.
+// the connect timed out): not tried again until the next pass, neither for requests nor for
+// re-sends, so one destination that does not answer costs at most one connect time limit per pass
+// and the others go on. Worker thread only; emptied at the start of every pass.
+static char	SCDownAE[SC_WARNMAX][20];
+static int	SCDownCount = 0;
+
+static BOOL SCIsDown(const char *ae)
+	{
+	for (int i=0; i<SCDownCount; i++) if (strcmp(SCDownAE[i], ae)==0) return TRUE;
+	return FALSE;
+	}
+
+static void SCSetDown(const char *ae)
+	{
+	if (SCDownCount<SC_WARNMAX && !SCIsDown(ae)) strcpy(SCDownAE[SCDownCount++], ae);
+	}
+
 // step 4: groups of NOTED objects per (destination, study) that are quiet and due
 static void SCProcessGroups(Database &DB, unsigned int now)
 	{
@@ -26884,8 +26962,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 	SQLLEN len;
 	SCGroup *g;
 	SCItem *it;
-	char down[SC_WARNMAX][20];
-	int ng = 0, i, j, n, r, round, ndown = 0;
+	int ng = 0, i, n, r, round;
 
 	g = (SCGroup *)malloc(sizeof(SCGroup)*SC_GROUPMAX);
 	it = (SCItem *)malloc(sizeof(SCItem)*OutgoingSCMaxBatch);
@@ -26919,8 +26996,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 	for (i=0; i<ng; i++)
 		{
 		// a destination that failed in this pass is not tried again until the next pass
-		for (j=0; j<ndown; j++) if (strcmp(down[j], g[i].ae)==0) break;
-		if (j<ndown) continue;
+		if (SCIsDown(g[i].ae)) continue;
 
 		SCAEWhere(DB, aew, g[i].ae);
 		for (round=0; round<1000; round++)
@@ -26953,7 +27029,7 @@ static void SCProcessGroups(Database &DB, unsigned int now)
 				}
 			if (n==0) break;
 			r = SCSendChunk(DB, g[i].ae, it, n, now);
-			if (r==SC_CHUNK_DOWN && ndown<SC_WARNMAX) strcpy(down[ndown++], g[i].ae);
+			if (r==SC_CHUNK_DOWN) SCSetDown(g[i].ae);
 			if (r!=SC_CHUNK_DONE) break;		// stays NOTED, or asked again later
 			if (n<OutgoingSCMaxBatch) break;
 			now = (unsigned int)time(NULL);
@@ -27123,8 +27199,16 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 	SCPrepareTLS(PDU, EE);
 
 	OperatorConsole.printf("Storage commitment: re-sending %d object(s) of study %s to %s\n", n, it[0].study, ae);
-	if (!PDU.Connect((unsigned char *)it[0].ip, (unsigned char *)it[0].port))
+	BOOL timedout;
+	if (!SCConnect(PDU, it[0].ip, it[0].port, &timedout))
 		{
+		if (timedout)
+			{
+			char attempt[64];
+			SCResendAttempt(it[0].res, rlimit, &E, attempt);
+			OperatorConsole.printf("*** Storage commitment: connect to %s (%s %s) timed out after %d s, re-send attempt %s\n",
+				ae, it[0].ip, it[0].port, OutgoingSCConnectTimeout, attempt);
+			}
 		OperatorConsole.printf("*** Storage commitment: re-send to %s failed: could not connect (%s %s), tried again later\n", ae, it[0].ip, it[0].port);
 		for (i=0; i<n; i++) free(it[i].file);
 		return SC_CHUNK_DOWN;
@@ -27236,6 +27320,7 @@ static void SCProcessResends(Database &DB, unsigned int now)
 		{
 		rlimit = SCResendLimit(aes[j], &E);
 		if (!rlimit) continue;			// no R (any more), or switched off: stays FAILED
+		if (SCIsDown(aes[j])) continue;		// not reached in this pass: next pass
 		SCAEWhere(DB, aew, aes[j]);
 		SCQueuedWhere(qw, OutgoingSCResendMissing==2 || rlimit==ACR_RESEND_ALWAYS);
 
@@ -27302,7 +27387,7 @@ static void SCProcessResends(Database &DB, unsigned int now)
 		for (i=0; i<n; i=k)
 			{
 			for (k=i+1; k<n && k-i<OutgoingSCMaxBatch && strcmp(it[k].study, it[i].study)==0; k++);
-			if (SCResendBatch(DB, aes[j], it+i, k-i, (unsigned int)time(NULL))==SC_CHUNK_DOWN) break;
+			if (SCResendBatch(DB, aes[j], it+i, k-i, (unsigned int)time(NULL))==SC_CHUNK_DOWN) { SCSetDown(aes[j]); break; }
 			}
 		}
 	free(aes);
@@ -27495,6 +27580,7 @@ static void SCWorkerPass(SCNoted *buf, time_t *lastpurge)
 		}
 	SCMarkerTakeOver(DB);
 
+	SCDownCount = 0;			// every destination is tried again in this pass
 	now = (unsigned int)time(NULL);
 	SCCheckReportTimeouts(DB, now);
 	SCCheckRequestedDeadline(DB, now);

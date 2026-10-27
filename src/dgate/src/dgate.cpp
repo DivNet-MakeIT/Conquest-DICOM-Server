@@ -1499,6 +1499,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			always on Windows) writes nothing unbounded: with Socket::Deadline (Unix) the release goes on
 			bounded by it, otherwise the connection is closed without A-RELEASE (console line) and no
 			A-ABORT is written. Test-only key SCTestNoWatch
+20261027	mmd	Outgoing storage commitment: modpatid, anonymize, modifyimage and merge (ModifyPATIDofImageFile,
+			MergeUIDofImageFile with DelFile) admit the source and the destination study (SCStudyHoldBegin)
+			before the source record and file are removed, held until the new object is written; refused
+			while a verified delete of either still runs after OutgoingSCDeleteWriteWait: nothing changed
 ENDOFUPDATEHISTORY
 */
 
@@ -4071,6 +4075,38 @@ struct SCWriteGuard
 	void Written() { if (active) { active = FALSE; SCWriteEnd(db, slot, inst, TRUE); } }
 	~SCWriteGuard() { if (active) SCWriteEnd(db, slot, inst, FALSE); }
 	};
+
+int  SCStudyHoldBegin(const char *study, const char *what);
+void SCStudyHoldEnd(int slot);
+
+// Outgoing storage commitment: a local replacement of one object (modpatid, anonymize, modifyimage,
+// merge) removes the record and file of the source object before it writes the new one. Both the
+// source study and the destination study are admitted (SCStudyHoldBegin) before that first step and
+// held until the replacement is done (destructor), so no verified delete of either study runs in
+// between; FALSE: refused (a verified delete of one of them still running), nothing may be changed.
+// Nothing when OutgoingStorageCommitment is 0.
+struct SCReplaceGuard
+	{
+	int	src, dst;
+	SCReplaceGuard() : src(-2), dst(-2) {}
+	BOOL Begin(const char *srcStudy, DICOMDataObject *DDO, const char *file)
+		{
+		char dstStudy[256], what[1200];
+		if (!OutgoingStorageCommitment) return TRUE;
+		dstStudy[0] = 0;
+		SearchDICOMObject(DDO, "0020,000d", dstStudy);
+		snprintf(what, sizeof(what), "replacement of %s (nothing changed)", file);
+		src = SCStudyHoldBegin(srcStudy, what);
+		if (src==-4) return FALSE;
+		if (strcmp(srcStudy, dstStudy)!=0)
+			{
+			dst = SCStudyHoldBegin(dstStudy, what);
+			if (dst==-4) return FALSE;
+			}
+		return TRUE;
+		}
+	~SCReplaceGuard() { SCStudyHoldEnd(dst); SCStudyHoldEnd(src); }
+	};
 unsigned int SCSendSeq(void);
 void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
@@ -4692,6 +4728,11 @@ ModifyPATIDofImageFile(char *filename, char *NewPATID, BOOL DelFile, char *scrip
 		return ( FALSE );
 		}
 
+	// outgoing storage commitment: the study of the object before it is changed (SCReplaceGuard)
+	char scSrcStudy[256];
+	scSrcStudy[0] = 0;
+	if (OutgoingStorageCommitment) SearchDICOMObject(pDDO, "0020,000d", scSrcStudy);
+
 	// no script: change patient ID of object file in memory - changes UIDs
 	if (NewPATID && script==NULL) 
 	  if (!ModifyPATIDofDDO(pDDO, NewPATID))
@@ -4713,6 +4754,16 @@ ModifyPATIDofImageFile(char *filename, char *NewPATID, BOOL DelFile, char *scrip
 			OperatorConsole.printf("[ModifyPATIDofImageFile] %s rejected by script\n", filename);
 			return ( FALSE );
 			}
+		}
+
+	// outgoing storage commitment: source and destination study admitted before anything is removed,
+	// held until the end (no verified delete of either runs in between)
+	SCReplaceGuard scHold;
+	if (DelFile && !scHold.Begin(scSrcStudy, pDDO, filename))
+		{
+		delete pDDO;
+		OperatorConsole.printf("***[ModifyPATIDofImageFile] %s not modified: a verified delete of its study or of the new study is running\n", filename);
+		return ( FALSE );
 		}
 
 	// remove image file from database
@@ -5126,6 +5177,11 @@ MergeUIDofImageFile(char *filename, BOOL DelFile, const char *type, char *script
 		return ( FALSE );
 		}
 
+	// outgoing storage commitment: the study of the object before it is changed (SCReplaceGuard)
+	char scSrcStudy[256];
+	scSrcStudy[0] = 0;
+	if (OutgoingStorageCommitment) SearchDICOMObject(pDDO, "0020,000d", scSrcStudy);
+
 	// change patient ID of object file in memory
 	if (!MergeUIDofDDO(pDDO, type, Reason))
 		{
@@ -5157,6 +5213,16 @@ MergeUIDofImageFile(char *filename, BOOL DelFile, const char *type, char *script
 		OperatorConsole.printf("[MergeUIDofImageFile] %s script rejected merge\n", filename);
 		delete pDDO;
 		return FALSE;
+		}
+
+	// outgoing storage commitment: source and destination study admitted before anything is removed,
+	// held until the end (no verified delete of either runs in between)
+	SCReplaceGuard scHold;
+	if (DelFile && !scHold.Begin(scSrcStudy, pDDO, filename))
+		{
+		delete pDDO;
+		OperatorConsole.printf("***[MergeUIDofImageFile] %s not merged: a verified delete of its study or of the merged study is running\n", filename);
+		return ( FALSE );
 		}
 
 	// remove image file from database
@@ -25159,35 +25225,43 @@ static BOOL SCWriteInProgressLocked(const char *inst)
 // study is deleting (sc_verify_and_delete:), the write waits for it first; -4 when the delete is
 // still running after OutgoingSCDeleteWriteWait seconds: the write is refused (nothing is tracked,
 // the caller must not write and must not call SCWriteEnd).
+// Wait until no verified delete blocks a local write of study st ("" = not known: any). TRUE: admitted,
+// SCNotedCritical is held (the caller counts its write, then leaves it). FALSE: a delete still blocks
+// after OutgoingSCDeleteWriteWait seconds (not held). *waited: it had to wait.
+static BOOL SCDelAdmitLock(const char *st, int *waited)
+	{
+	time_t until = 0;
+	for (;;)
+		{
+		EnterCriticalSection(&SCNotedCritical);	// held from the last check until the write is counted
+		if (!SCDelBlocking(st)) return TRUE;
+		LeaveCriticalSection(&SCNotedCritical);
+		if (!until) until = time(NULL) + OutgoingSCDeleteWriteWait;
+		else if (time(NULL) >= until) return FALSE;
+		*waited = 1;
+		Sleep(50);
+		}
+	}
+
 int SCWriteBegin(const char *inst, const char *study)
 	{
 	int i, r = -1, waited = 0;
 	char st[65];
-	time_t until = 0;
 	BOOL untracked;
 	if (!OutgoingStorageCommitment) return -2;
 	untracked = !inst || strlen(inst)>64;
 	st[0] = 0;
 	if (!untracked && study && strlen(study)<=64) { strcpy(st, study); SCTrim(st); }
-	for (;;)
+	if (!SCDelAdmitLock(st, &waited))
 		{
-		EnterCriticalSection(&SCNotedCritical);	// held from the last check until the slot is taken
-		if (!SCDelBlocking(st)) break;
-		LeaveCriticalSection(&SCNotedCritical);
-		if (!until) until = time(NULL) + OutgoingSCDeleteWriteWait;
-		else if (time(NULL) >= until)
-			{
-			// never admitted while the delete runs: refused before anything is written
-			if (untracked)
-				OperatorConsole.printf("*** Storage commitment: write of an object without a usable SOP instance UID refused: a verified delete is still running after %d s (the sender may send again)\n",
-					OutgoingSCDeleteWriteWait);
-			else
-				OperatorConsole.printf("*** Storage commitment: write of %s (study %s) refused: the verified delete of its study is still running after %d s (the sender may send again)\n",
-					inst, st[0] ? st : "-", OutgoingSCDeleteWriteWait);
-			return -4;
-			}
-		waited = 1;
-		Sleep(50);
+		// never admitted while the delete runs: refused before anything is written
+		if (untracked)
+			OperatorConsole.printf("*** Storage commitment: write of an object without a usable SOP instance UID refused: a verified delete is still running after %d s (the sender may send again)\n",
+				OutgoingSCDeleteWriteWait);
+		else
+			OperatorConsole.printf("*** Storage commitment: write of %s (study %s) refused: the verified delete of its study is still running after %d s (the sender may send again)\n",
+				inst, st[0] ? st : "-", OutgoingSCDeleteWriteWait);
+		return -4;
 		}
 	SCDelNoteWrite(st);
 	if (untracked)
@@ -25215,6 +25289,58 @@ int SCWriteBegin(const char *inst, const char *study)
 	if (waited)
 		OperatorConsole.printf("Storage commitment: write of %s (study %s) waited for the verified delete of its study\n", inst, st[0] ? st : "-");
 	return r;
+	}
+
+// Admission of a local operation that removes or replaces objects of a study before it writes
+// (modpatid, anonymize, modifyimage, merge: the record and file of the source object go first) or
+// that enters a database record for a file (regen). Waits while a verified delete of the study runs
+// (as SCWriteBegin; study "" or NULL = not known: any delete); -4 when it still runs after
+// OutgoingSCDeleteWriteWait seconds: refused (*** line naming what), the caller must change nothing.
+// Otherwise a slot that counts as a local write of the study, without an object (no write mark of
+// any object, never relevant), until SCStudyHoldEnd: no verified delete of the study starts while it
+// is held (one that verified the study meanwhile answers "changed"); -1 = no slot was free (counted
+// as unknown), -2 = outgoing storage commitment off. Process-local, as every delete guard.
+int SCStudyHoldBegin(const char *study, const char *what)
+	{
+	int i, r = -1, waited = 0;
+	char st[65];
+	if (!OutgoingStorageCommitment) return -2;
+	st[0] = 0;
+	if (study && strlen(study)<=64) { strcpy(st, study); SCTrim(st); }
+	if (!SCDelAdmitLock(st, &waited))
+		{
+		OperatorConsole.printf("*** Storage commitment: %s refused: a verified delete of study %s is still running after %d s\n",
+			what, st[0] ? st : "(not known: any)", OutgoingSCDeleteWriteWait);
+		return -4;
+		}
+	SCDelNoteWrite(st);
+	for (i=0; i<SC_WRITEMAX; i++)
+		if (!SCWrites[i].used)
+			{
+			SCWrites[i].inst[0] = 0;
+			strcpy(SCWrites[i].study, st);
+			SCWrites[i].used = 1;
+			SCWrites[i].relevant = 0;
+			r = i;
+			break;
+			}
+	if (r<0) SCWritesUnknown++;
+	SCInvalGen++;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (waited)
+		OperatorConsole.printf("Storage commitment: %s waited for the verified delete of study %s\n", what, st[0] ? st : "(not known: any)");
+	return r;
+	}
+
+// the end of an admission of SCStudyHoldBegin (nothing for -2 and -4)
+void SCStudyHoldEnd(int slot)
+	{
+	if (slot==-2 || slot==-4) return;
+	EnterCriticalSection(&SCNotedCritical);
+	if (slot>=0 && slot<SC_WRITEMAX) { SCWrites[slot].used = 0; SCWrites[slot].relevant = 0; }
+	else if (slot==-1 && SCWritesUnknown>0) SCWritesUnknown--;
+	SCInvalGen++;
+	LeaveCriticalSection(&SCNotedCritical);
 	}
 
 // test only (SCTestDelayAfterRead): sleep ms milliseconds (used from nkiqrsop.cpp)

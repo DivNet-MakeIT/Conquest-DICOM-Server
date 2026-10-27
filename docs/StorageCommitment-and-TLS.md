@@ -634,13 +634,17 @@ records), with the local writes of the study excluded:
   between. Refused: nothing is removed, console lines `*** Storage commitment: replacement of
   <file> (nothing changed) refused: a verified delete of study <uid> is still running after <n> s`
   and `***[ModifyPATIDofImageFile] <file> not modified` (`***[MergeUIDofImageFile] <file> not
-  merged`).
+  merged`). The destination is the study the object is written to: the worklist (`WorkListMode`
+  1 or 2, which may set another StudyInstanceUID) and `FixImage` are applied before the admission
+  and not again by the write. An object that `WorkListMode` 2 does not accept is not changed
+  (`***[Replace] <file> not changed: the new object is not accepted (worklist)`), nothing removed.
 - **Regen.** A regen (`regen:`, `regendevice:`, `regendir:`, `regenfile:`) enters each record under
   the same admission of its study: refused while a delete of the study still runs (`***
   Storage commitment: regen of <file> (record not entered) refused: ...`), and a file that a
   verified delete removed after regen read it is skipped (`***[Regen] <file> -SKIPPED`): no record
-  without a file. A regen pass waits up to `OutgoingSCDeleteWriteWait` per file of a study that is
-  being deleted.
+  without a file. When the import converter of regen (`RegenConverter`) changes the
+  StudyInstanceUID of the record, the study of the file (as read) is admitted too. A regen pass
+  waits up to `OutgoingSCDeleteWriteWait` per file (and per study) that is being deleted.
 - These admissions are process-local, as the guards: a `dgate -r` or a modification run in another
   dgate process is not excluded.
 - The study is deleted and read again: no local object may be left.
@@ -1042,4 +1046,9 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `f2bdd7e` Outgoing storage commitment: an import refused during a verified delete keeps its file
 - `24993b7` Outgoing storage commitment: regen enters a record only under an admission of its study
 - `3a45388` Sockets: Deadline bounds plain sends on Windows too
-- this commit: Docs: imports, replacements and regen during a verified delete, Windows sends, commit map
+- `e6629ff` Docs: imports, replacements and regen during a verified delete, Windows sends, commit map
+
+**Final studies of replacements and regen**
+- `bfefd9c` Outgoing storage commitment: replacements admit the study the worklist writes them to
+- `525f22f` Outgoing storage commitment: regen admits the study of the file as well as that of the record
+- this commit: Docs: the final study of replacements and regen, commit map

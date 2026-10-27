@@ -1372,6 +1372,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261027	mmd	TLSNodeCertsFile set but not loaded (unreadable or damaged at its first load in the
 			process): every TLS association is refused, outgoing and incoming, until it loads
 			(read_tlscerts:); a failed reload keeps the previous table as before
+20261027	mmd	TLSCipherList with an @ directive (e.g. @SECLEVEL=0) is ignored with a console line (the
+			built-in list is used); strict contexts keep at least the library's default security
+			level, and certificates are checked at that level (auth level)
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -21097,6 +21100,7 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 	SSL_CTX	*ctx;
 	int	minversion = TLS1_2_VERSION;
 	int	TLSVerifyMode = 2;		// 2 require, 1 verify, 0 ignore (this context only)
+	int	seclevel;			// security level of a new context (library default)
 
 	TLSIni("TLSCertificate", "", cert, sizeof(cert));
 	TLSIni("TLSPrivateKey", "", key, sizeof(key));
@@ -21128,6 +21132,16 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 		OperatorConsole.printf("*** TLS: cannot create %s context: %s\n", side, TLSErrorText(err, sizeof(err)));
 		return NULL;
 		}
+	seclevel = SSL_CTX_get_security_level(ctx);
+	if (seclevel < 1) seclevel = 1;
+
+	// TLSCipherList names cipher suites only: an @ directive (@SECLEVEL=0 would lower the
+	// security level of the strict profile, @STRENGTH reorders) makes the whole value ignored
+	if (!legacy && strchr(ciphers, '@'))
+		{
+		OperatorConsole.printf("*** TLS: TLSCipherList has an @ directive (e.g. @SECLEVEL), not allowed: TLSCipherList ignored, the built-in list is used (%s context)\n", side);
+		ciphers[0] = 0;
+		}
 	if (SSL_CTX_set_min_proto_version(ctx, minversion)!=1)
 		{
 		OperatorConsole.printf("*** TLS: cannot set minimum version: %s\n", TLSErrorText(err, sizeof(err)));
@@ -21145,6 +21159,14 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 		{
 		SSL_CTX_free(ctx);
 		return NULL;
+		}
+	// strict: never below the library default security level (at least 1), whatever the
+	// cipher list did; certificates are checked at the same level
+	if (!legacy)
+		{
+		if (SSL_CTX_get_security_level(ctx) < seclevel)
+			SSL_CTX_set_security_level(ctx, seclevel);
+		X509_VERIFY_PARAM_set_auth_level(SSL_CTX_get0_param(ctx), SSL_CTX_get_security_level(ctx));
 		}
 	// legacy: security level 0 is only for the protocol (TLS 1.0/1.1 and their MD5+SHA-1
 	// handshake signature); certificate chains are still verified at level 1 (keys >= 80

@@ -659,7 +659,7 @@ sockets keep their old code paths exactly. TLS is built only with `-DHAVE_OPENSS
 | `TLSCAFile` | empty | trusted CAs or peer certificates (PEM); needed unless `TLSVerifyPeer=ignore` or `TLSAcceptSelfSigned=1` |
 | `TLSVerifyPeer` | `require` | `require` / `verify` / `ignore`. Incoming: client certificate required / checked when sent / not asked for. Outgoing: `require` = `verify`. |
 | `TLSMinVersion` | `1.2` | `1.2` or `1.3`; TLS ≤ 1.1 is never used (strict profile) |
-| `TLSCipherList` | built-in list | TLS 1.2 suites; can only **narrow** the default (ECDHE with AES-GCM or CHACHA20-POLY1305, RFC 9325); TLS 1.3 uses OpenSSL defaults |
+| `TLSCipherList` | built-in list | TLS 1.2 suites; can only **narrow** the default (ECDHE with AES-GCM or CHACHA20-POLY1305, RFC 9325); TLS 1.3 uses OpenSSL defaults. A value with an `@` directive (e.g. `@SECLEVEL=0`) is ignored with a console line and the built-in list is used. The strict contexts never go below OpenSSL's default security level (at least 1), also for certificate checks |
 | `TLSVerifyHostname` | `0` | 1 = the certificate SAN must match the node's host or IP in the map (outgoing) |
 | `TLSAcceptSelfSigned` | `0` | 1 = accept self-signed peer certificates in both directions. Only the "self-signed" errors are forgiven; expired, not yet valid, bad signature, wrong purpose and host mismatch still fail. Logged once per AE. |
 | `TLSNodeCertsFile` | empty | per-node certificate fingerprints (4.2) |

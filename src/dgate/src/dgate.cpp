@@ -1503,6 +1503,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			MergeUIDofImageFile with DelFile) admit the source and the destination study (SCStudyHoldBegin)
 			before the source record and file are removed, held until the new object is written; refused
 			while a verified delete of either still runs after OutgoingSCDeleteWriteWait: nothing changed
+20261027	mmd	Outgoing storage commitment: LoadAndDeleteDir (incoming folder, loadanddeletedir:) keeps a file
+			whose store was refused by a verified delete of its study (*** line, no retries, no
+			RejectedImageConverter; a later pass imports it); an archive with a refused object is kept
+			(AddImageFile, AttachFile: SCRefused through SaveToDisk). Other failures as before
 ENDOFUPDATEHISTORY
 */
 
@@ -4055,7 +4059,7 @@ OffsetDatesInDICOMObject(DICOMObject *DO, const char *Exceptions, int Offset, Da
 
 // forward references
 int
-SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE);
+SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax=0, BOOL nopreget=FALSE, int *SCRefused=NULL);
 
 int  SCWriteBegin(const char *inst, const char *study);
 void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written);
@@ -4189,7 +4193,7 @@ void TestSyntax(char *filename, int syntax, ExtendedPDU_Service *PDU);
 void TestThreadedSave(char *filename);
 void ProcessHL7Data(char *data);
 static void NewTempFile(char *name, const char *ext);
-BOOL AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database *PDB=NULL);
+BOOL AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database *PDB=NULL, int *SCRefused=NULL);
 
 static BOOL dgate_IsDirectory(char *TempPath)
 {
@@ -4208,10 +4212,25 @@ static BOOL dgate_IsDirectory(char *TempPath)
 
 int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, char *pszModality, char *pszStationName, char *pszSop, char *patid, ExtendedPDU_Service *PDU, char *Storage, char *Script);
 extern "C" void lua_setvar(ExtendedPDU_Service *pdu, char *name, char *value);
-BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Service *PDU);
+BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Service *PDU, int *SCRefused=NULL);
 
+// LoadAndDeleteDir, outgoing storage commitment: the store of an imported file was refused because a
+// verified delete of its study is running (SaveToDisk *SCRefused; never when OutgoingStorageCommitment
+// is 0). It is counted in *SCRefused. KeepRefused: the file stays in place for a later import (***
+// line, no retries, no RejectedImageConverter); else (a temporary copy unpacked from an archive, whose
+// caller keeps the archive) it is removed as every other file. TRUE: keep the file.
+static BOOL LoadAndDeleteKeep(const char *file, int refused, int *SCRefused, BOOL KeepRefused)
+	{
+	if (!refused) return FALSE;
+	if (SCRefused) (*SCRefused)++;
+	if (!KeepRefused) return FALSE;
+	OperatorConsole.printf("*** [LoadAndDeleteDir] %s kept for a later import: its store was refused (a verified delete of its study is running)\n", file);
+	return TRUE;
+	}
+
+// SCRefused, KeepRefused: see LoadAndDeleteKeep (defaults: a directory of input files, kept when refused)
 #ifdef WIN32
-BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int Thread, char *script, Database *DB)
+BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int Thread, char *script, Database *DB, int *SCRefused=NULL, BOOL KeepRefused=TRUE)
 	{
 	HANDLE		fdHandle;
 	WIN32_FIND_DATA	FileData;
@@ -4250,7 +4269,7 @@ BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int T
 				strcpy(TempPath, dir);
 				strcat(TempPath, FileData.cFileName);
 				strcat(TempPath, "\\");
-				LoadAndDeleteDir(TempPath, NewPatid, PDU, Thread==0?0:Thread+1, script, DB);
+				LoadAndDeleteDir(TempPath, NewPatid, PDU, Thread==0?0:Thread+1, script, DB, SCRefused, KeepRefused);
 				rmdir(TempPath);
 				}
 			}
@@ -4273,38 +4292,41 @@ BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int T
 				FILE *f = fopen(TempPath, "at");
 				if (f)
 					{
+					int refused = 0;	// outgoing storage commitment: see LoadAndDeleteKeep
 					fclose(f);
 					if (script)
 						{
 						char dum[1024];
-						if (!AttachFile(TempPath, script, dum, PDU))
+						if (!AttachFile(TempPath, script, dum, PDU, &refused) && !refused)
 							for (int i=0; i<3; i++)
-								{ 
+								{
 								Sleep(5000);
-								if (AttachFile(TempPath, script, dum, PDU)) 
+								if (AttachFile(TempPath, script, dum, PDU, &refused) || refused)
 									break;
 								}
 						}
-					else if (!AddImageFile (TempPath, NewPatid, PDU, DB))
+					else if (!AddImageFile (TempPath, NewPatid, PDU, DB, &refused) && !refused)
 						{
 						BOOL success = FALSE;
 						for (int i=0; i<3; i++)
-							{ 
+							{
 							Sleep(5000);
-							if (AddImageFile (TempPath, NewPatid, PDU, DB)) 
-								{ 
+							if (AddImageFile (TempPath, NewPatid, PDU, DB, &refused))
+								{
 								success = TRUE;
 								break;
 								}
+							if (refused) break;
 							}
-						if (!success)
+						if (!success && !refused)
 							{
 							DICOMDataObject	DDO;
 							lua_setvar(PDU, "Filename", TempPath);
 							int rc = CallImportConverterN(NULL, &DDO, 2100, NULL, NULL, NULL, NULL, PDU, NULL, NULL);
 							}
 						}
-					unlink(TempPath);
+					if (!LoadAndDeleteKeep(TempPath, refused, SCRefused, KeepRefused))
+						unlink(TempPath);
 					if (Thread) Progress.printf("Process=%d, Total=%d, Current=%d\n", Thread, 100, count++);
 					}
 				}
@@ -4321,7 +4343,7 @@ BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int T
 	}
 
 #else
-BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int Thread, char *script, Database *DB)
+BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int Thread, char *script, Database *DB, int *SCRefused=NULL, BOOL KeepRefused=TRUE)
       {
       DIR             *dird;
       dirent          *diren;
@@ -4363,7 +4385,7 @@ BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int T
                               long length=strlen(TempPath);
                               TempPath[length] = PATHSEPCHAR;
                               TempPath[length+1] = '\0';
-                              LoadAndDeleteDir(TempPath, NewPatid, PDU, Thread==0?0:Thread+1, script, DB);
+                              LoadAndDeleteDir(TempPath, NewPatid, PDU, Thread==0?0:Thread+1, script, DB, SCRefused, KeepRefused);
                               rmdir(TempPath);
                               }
                         }
@@ -4376,31 +4398,34 @@ BOOL LoadAndDeleteDir(char *dir, char *NewPatid, ExtendedPDU_Service *PDU, int T
 			
 			else if (strstr (n, ".partial"     ) == NULL)
 				{
+				int refused = 0;	// outgoing storage commitment: see LoadAndDeleteKeep
 				if (script)
 					{
 					char dum[1024];
-					AttachFile(TempPath, script, dum, PDU);
+					AttachFile(TempPath, script, dum, PDU, &refused);
 					}
-				else if (!AddImageFile (TempPath, NewPatid, PDU, DB))
-                                    { 
+				else if (!AddImageFile (TempPath, NewPatid, PDU, DB, &refused) && !refused)
+                                    {
 			            BOOL success = FALSE;
                                     for (int i=0; i<30; i++)
-                                          { 
+                                          {
 				          Sleep(5000);
-                                          if (AddImageFile (TempPath, NewPatid, PDU, DB)) 
+                                          if (AddImageFile (TempPath, NewPatid, PDU, DB, &refused))
                                               { success = TRUE;
                                                 break;
                                               }
+                                          if (refused) break;
                                           }
-                                    
-                                    if (!success)
+
+                                    if (!success && !refused)
                                           {
                                           DICOMDataObject DDO;
                                           lua_setvar(PDU, "Filename", TempPath);
                                           int rc = CallImportConverterN(NULL, &DDO, 2100, NULL, NULL, NULL, NULL, PDU, NULL, NULL);
                                           }
                                     }
-                              unlink(TempPath);
+                              if (!LoadAndDeleteKeep(TempPath, refused, SCRefused, KeepRefused))
+                                    unlink(TempPath);
                               }
                         }
                   }
@@ -4434,8 +4459,10 @@ dTestDICOM(char *Path)
 
 
 // Add image file to server (also copies file!); optional changes patient ID before entering file
+// SCRefused (outgoing storage commitment): set to 1 when the store (or the store of an object unpacked
+// from an archive) was refused because a verified delete of its study is running (FALSE returned)
 BOOL
-AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database	*PDB)
+AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database	*PDB, int *SCRefused)
 	{
 	DICOMDataObject*	pDDO;
 	int			i;//, len;
@@ -4567,8 +4594,15 @@ AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database	
 		system(line);
 		strcat(dir, "/");
 #endif
-		LoadAndDeleteDir(dir, NewPatid, PDU, 0, NULL, pDB);
+		int refused = 0;	// unpacked copies are removed; a refused one keeps the archive (caller)
+		LoadAndDeleteDir(dir, NewPatid, PDU, 0, NULL, pDB, &refused, FALSE);
 		rmdir(dir);
+		if (refused)
+			{
+			if (SCRefused) *SCRefused = 1;
+			OperatorConsole.printf("***[AddImageFile] %s: %d object(s) refused (a verified delete of their study is running)\n", filename, refused);
+			return FALSE;
+			}
 
 		return TRUE;
 		}
@@ -4618,7 +4652,7 @@ AddImageFile(char *filename, char *NewPatid, ExtendedPDU_Service *PDU, Database	
         rc = TRUE;	// failed compression leaves original object
 
 	// if ((rc == FALSE) || (!SaveToDisk(DB, pDDO, rFilename, TRUE, (unsigned char *)"dropped", (unsigned char *)"dropped", 0, !atoi(szTemp))))
-	if ((rc == FALSE) || (!SaveToDisk(pDB, NULL, pDDO, rFilename, TRUE, PDU, 0, !atoi(szTemp))))
+	if ((rc == FALSE) || (!SaveToDisk(pDB, NULL, pDDO, rFilename, TRUE, PDU, 0, !atoi(szTemp), SCRefused)))
 		{
 		OperatorConsole.printf("***[AddImageFile] Error entering object into server: %s\n", filename);
 //		if (pDDO)
@@ -4920,7 +4954,8 @@ int	ImageStripforSeries(char *study, char *series, char *filename, int size, int
 	}
 
 // The attach functions load a (copy) the input (plan/any) data into the dicom server
-BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Service *PDU)
+// SCRefused: as for AddImageFile
+BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Service *PDU, int *SCRefused)
         {
 	DICOMDataObject*	pDDO;
 	Database		DB;
@@ -4955,8 +4990,15 @@ BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Servi
 		system(line);
 		strcat(dir, "/");
 #endif
-		LoadAndDeleteDir(dir, NULL, PDU, 0, script, &DB);
+		int refused = 0;	// unpacked copies are removed; a refused one keeps the archive (caller)
+		LoadAndDeleteDir(dir, NULL, PDU, 0, script, &DB, &refused, FALSE);
 		rmdir(dir);
+		if (refused)
+			{
+			if (SCRefused) *SCRefused = 1;
+			OperatorConsole.printf("***[AttachFile] %s: %d object(s) refused (a verified delete of their study is running)\n", filename, refused);
+			return FALSE;
+			}
 
 		return TRUE;
 		}
@@ -4979,7 +5021,7 @@ BOOL AttachFile(char *filename, char *script, char *rFilename, ExtendedPDU_Servi
 		}
 
 	//if (!SaveToDisk(DB, pDDO, rFilename, TRUE, (unsigned char *)"AttachFile", (unsigned char *)"AttachFile", 0, 1))
-	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1))
+	if (!SaveToDisk(&DB, NULL, pDDO, rFilename, TRUE, PDU, 0, 1, SCRefused))
 		{
 		//delete pDDO;
 		OperatorConsole.printf("***[AttachFile] Error entering object into server: %s\n", filename);
@@ -13830,7 +13872,7 @@ BOOL ApplyWorklist(DICOMDataObject *DDOPtr, Database *DB)
 BOOL    NewDeleteSopFromDB(char *pat, char *study, char *series, char *sop, Database &aDB);
 
 int
-SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax, BOOL nopreget)
+SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 	*Filename, BOOL NoKill, ExtendedPDU_Service *PDU, int Syntax, BOOL nopreget, int *SCRefused)
 	{
 //	FILE		*fp;
 	DICOMDataObject	DDO;
@@ -13939,7 +13981,7 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 	// name is chosen: that reads the database and may remove the record of a rewrite) until its file
 	// is written (also on every failure return); nothing when OutgoingStorageCommitment is 0. Refused
 	// (a verified delete of the study still running after OutgoingSCDeleteWriteWait): nothing is
-	// written, the store fails (the sender may send again)
+	// written, the store fails (the sender may send again); *SCRefused is set to 1 (an import keeps its file)
 	SCWriteGuard scWrite;
 	char scStudy[256];
 	scStudy[0] = 0;
@@ -13948,6 +13990,7 @@ SaveToDisk(Database	*DB, DICOMCommandObject *DCO, DICOMDataObject	*DDOPtr, char 
 		SearchDICOMObject(DDOPtr, "0020,000d", scStudy);	// the study of the write (sc_verify_now:)
 		if (!scWrite.Begin(DB, szSop, scStudy))
 			{
+			if (SCRefused) *SCRefused = 1;
 			Filename[0]=0;
 			delete DDOPtr;
 			return FALSE;

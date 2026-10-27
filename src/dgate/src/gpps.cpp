@@ -35,6 +35,9 @@
 //			cached when the cache was emptied while it was read (it may be the old one).
 //			Lookup order and the values returned are unchanged.
 // 20261026	mmd	GppsStatistics: gpps and gppstime read together under the cache lock
+// 20261027	mmd	The cache lock is made at its first use (IniLock), not by a static object: global
+//			PDU objects in dgate.cpp read dicom.ini in their constructors before the static
+//			objects of this file are made (a zeroed CRITICAL_SECTION crashes on Windows)
 
 int      gpps=0, gppstime=0;
 
@@ -65,16 +68,26 @@ int			IniTop=0, IniBottom=0;
 time_t			IniTm=0, lasttime=0;
 static unsigned int	IniGeneration=0;	// + 1 whenever the cache is emptied or flushed
 
-// The lock is made once, before main() starts any thread (as AMapCritical in amap.cpp)
-static struct IniCriticalInit
+// The lock is made at its first use, which comes before main() starts any thread: the global
+// ExtendedPDU_Service objects in dgate.cpp read dicom.ini in their constructors while the static
+// objects are made, before those of this file (included last in total.cpp). A lock made by a
+// static object here was entered there before it was made: harmless with a zeroed pthread
+// mutex, a crash with a zeroed Windows CRITICAL_SECTION.
+static CRITICAL_SECTION *IniLock(void)
 	{
-	IniCriticalInit() { InitializeCriticalSection(&IniCritical); }
-	}	IniCriticalInitObject;
+	static int made = 0;
+	if (!made)
+		{
+		InitializeCriticalSection(&IniCritical);
+		made = 1;
+		}
+	return &IniCritical;
+	}
 
 // statistics (gpps, gppstime) under the cache lock
 static void IniAddTime(int t)
 	{
-	EnterCriticalSection(&IniCritical);
+	EnterCriticalSection(IniLock());
 	gppstime += time(NULL)-t;
 	LeaveCriticalSection(&IniCritical);
 	}
@@ -96,7 +109,7 @@ int into_IniCache(const char *section, const char *in, char *value, unsigned int
 	p = section;
 	while(*p) sum+=*p++;
 
-	EnterCriticalSection(&IniCritical);
+	EnterCriticalSection(IniLock());
 
 	if (gen != IniGeneration)
 		{
@@ -135,7 +148,7 @@ int isin_IniCache(const char *section, const char *in, char *file, char *out, si
 	const char *p;
 	struct stat statbuf;
 
-	EnterCriticalSection(&IniCritical);
+	EnterCriticalSection(IniLock());
 	gpps++;
 	*gen = IniGeneration;
 
@@ -429,14 +442,14 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 
 // the statistics (number of reads, seconds spent) as one consistent pair, under the cache lock
 void GppsStatistics(int *count, int *seconds)
-{ EnterCriticalSection(&IniCritical);
+{ EnterCriticalSection(IniLock());
   if (count)   *count   = gpps;
   if (seconds) *seconds = gppstime;
   LeaveCriticalSection(&IniCritical);
 }
 
 void FlushPrivateProfileStringCache(void)
-{ EnterCriticalSection(&IniCritical);
+{ EnterCriticalSection(IniLock());
   lasttime = 0;
   IniTm    = 0;
   IniGeneration++;	// a value being read now is not cached

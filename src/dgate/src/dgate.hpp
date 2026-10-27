@@ -221,6 +221,7 @@ typedef	struct	_ForwardTarget
 	}	ForwardTarget;
 BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarget *T);
 BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T);
+BOOL	ForwardReuseMismatch(PDU_Service &PDU, const char *ip, const char *port, const char *called, ForwardTarget *T, const char **why);
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport
 void	StartTLSNodeCerts(void);	// load TLSNodeCertsFile at server start (nothing when not set)
 BOOL	ReadTLSNodeCerts(void);	// server command read_tlscerts:

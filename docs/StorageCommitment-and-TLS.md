@@ -630,6 +630,12 @@ sockets keep their old code paths exactly. TLS is built only with `-DHAVE_OPENSS
   - virtual server, grab and echo;
   - the storage commitment event and worker.
 - The TCP connect is bounded in TLS mode.
+- Converter forwards keep their association open between objects. A kept association is reused
+  only when its TLS mode (plain, strict, legacy) is what the map asks for now and, with TLS on
+  either side, it goes to the same address, port and called AE with the same certificate AE.
+  Otherwise it is closed and made again (console: `forward association closed by TRANSPORT` or
+  `DESTINATION`), e.g. after a map reload added `T` to a node with an open plain association.
+  Plain to plain is compared as before (association level and SOP class only).
 - A failed handshake or certificate check is a failed connection. **There is never a plain
   fallback.**
 

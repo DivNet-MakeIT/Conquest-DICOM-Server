@@ -33,6 +33,8 @@
 -- mvh 20260920 Added -y flag to update step
 -- mvh 20261009 Set MyACRNema in webserver/dicom.ini and in config.php; required when filtering on AE
 --              Added samples for AllowedIPs and AllowOnlyMapped configuration
+-- mmd 20261027 dgatesop.lst lists StorageCommitmentPushModel (refused by dgate while
+--              EnableStorageCommitment and OutgoingStorageCommitment are 0)
 
 --[[Note: auto installs packages; for Rocky Linux must do manual package install first:
 # assumes using built-in lua5.1/luasocket and built-in webserver
@@ -1005,6 +1007,7 @@ s = s or '#'
 #None				none				LocalAE
 #DICOM				1.2.840.10008.3.1.1.1		application
 Verification			1.2.840.10008.1.1		sop
+StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop
 RETIRED_StoredPrintStorage                           1.2.840.10008.5.1.1.27		sop
 RETIRED_HardcopyGrayscaleImageStorage                1.2.840.10008.5.1.1.29		sop
 RETIRED_HardcopyColorImageStorage                    1.2.840.10008.5.1.1.30		sop

@@ -716,6 +716,11 @@ When            Who     What
 20261008	mvh	Added CheckBoxRestrict, allowonlymapped, allowedIPs and DeniedIPs
 20261008	mvh	Write headerbmpname, footerbmpname, backgroundbmpname and ladlePort 
 20261009	mvh	Write MyACRNema to webserver and zbs dicom.ini and -h to config.php files
+20261026	mmd	New acrnema.map header describes the 5th-column options (T, L, SC, R, Rn, RI)
+20261027	mmd	Save configuration keeps the dgate storage commitment and TLS keys of [sscscp]
+			(TLS*, OutgoingSC*, OutgoingStorageCommitment, EnableStorageCommitment, SCUnsafeFile,
+			SCTest*) that have no GUI fields; dgatesop.lst lists StorageCommitmentPushModel
+			(dgate refuses it while EnableStorageCommitment and OutgoingStorageCommitment are 0)
 
 Todo for odbc: dgate64 -v "-sSQL Server;DSN=conquest;Description=bla;Server=.\SQLEXPRESS;Database=conquest;Trusted_Connection=Yes"
 Update -e command
@@ -1935,6 +1940,7 @@ begin
   writeln(f, '#None				none				LocalAE');
   writeln(f, '#DICOM				1.2.840.10008.3.1.1.1		application');
   writeln(f, 'Verification			1.2.840.10008.1.1		sop');
+  writeln(f, 'StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop');
 
 
   writeln(f, 'RETIRED_StoredPrintStorage                           1.2.840.10008.5.1.1.27		sop');
@@ -4417,12 +4423,50 @@ begin
   ModeNJRadioButton.Enabled          := V2RadioButton.Checked and EnableJPEGCheckBox.Checked;
 end;
 
+// dgate keys for storage commitment and DICOM TLS have no fields in this GUI. Save configuration
+// rewrites dicom.ini from its fields, so the [sscscp] lines that start with these names are read
+// here from the old file and written back unchanged (before, they were dropped).
+// Lines are matched as by RestoreconfigButtonClick: lower case, no trimming.
+function KeptDgateIniLines(const FileName: string): TStringList;
+var lines: TStringList;
+    i: integer;
+    s: string;
+    inmain: boolean;
+begin
+  Result := TStringList.Create;
+  if not FileExists(FileName) then exit;
+
+  lines := TStringList.Create;
+  try
+    lines.LoadFromFile(FileName);
+    inmain := true;
+    for i:=0 to lines.Count-1 do
+    begin
+      s := LowerCase(lines[i]);
+      if Copy(s, 1, length('[sscscp]')) = '[sscscp]' then
+        inmain := true
+      else if Copy(s, 1, 1) = '[' then
+        inmain := false
+      else if inmain and (
+        (Copy(s, 1, length('tls')) = 'tls') or
+        (Copy(s, 1, length('outgoingsc')) = 'outgoingsc') or
+        (Copy(s, 1, length('outgoingstoragecommitment')) = 'outgoingstoragecommitment') or
+        (Copy(s, 1, length('enablestoragecommitment')) = 'enablestoragecommitment') or
+        (Copy(s, 1, length('scunsafefile')) = 'scunsafefile') or
+        (Copy(s, 1, length('sctest')) = 'sctest')) then
+        Result.Add(lines[i]);
+    end;
+  finally
+    lines.Free;
+  end;
+end;
+
 procedure TForm1.SaveConfigButtonClick(Sender: TObject);
 var f: TextFile;
     p, c, i, j, resp: integer;
     UseDBFWithoutODBC, changepage: boolean;
     i_f: TInifile;
-    amap, php: TStringList;
+    amap, php, kept: TStringList;
 begin
   UseDBFWithoutODBC := false;
   if FileExists(curdir + '\USEDBASEIIIWITHOUTODBC') then UseDBFWithoutODBC := true;
@@ -4461,6 +4505,8 @@ begin
   if FileExists(curdir + '\USEDBASEIIIWITHOUTODBC') then
     if not DirectoryExists(DataSource) then
       DataSource := DataDir + '\dbase\';
+
+  kept := KeptDgateIniLines(CurDir + '\dicom.ini');
 
   AssignFile(f, //ExtractFileDir(ParamStr(0))
     CurDir + '\dicom.ini');
@@ -4947,6 +4993,15 @@ begin
                                     then writeln(f, 'VirtualServerQueryConverter0      = ' + VirtualServerQueryConverter[0]);
   if VirtualServerQueryResultConverter[0]<>''
                                     then writeln(f, 'VirtualServerQueryResultConverter0= ' + VirtualServerQueryResultConverter[0]);
+  if kept.Count>0 then
+  begin
+    writeln(f, '');
+    writeln(f, '# Storage commitment and DICOM TLS (no fields in this GUI; kept as found)');
+    for i:=0 to kept.Count-1 do
+      writeln(f, kept[i]);
+  end;
+  kept.Free;
+
   if othersections.count>0 then
   begin
     writeln(f, '');

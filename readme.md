@@ -1,3 +1,18 @@
+## About this fork / branch
+
+This branch (`sc-outgoing-tls`, variant B) adds storage commitment for incoming and outgoing data,
+DICOM TLS (strict and legacy profile) and verify-before-delete to dgate, on top of upstream master
+`f8c0057` (1.5.0g4). A smaller variant A (incoming storage commitment only) is on branch
+`sc-incoming`. Every new behaviour is opt-in: with the new settings at their defaults, dgate
+behaves as 1.5.0g4.
+
+Start with [docs/README.md](docs/README.md): overview, configuration, build notes, tests, known
+limitations, upstream observations and a suggested review order.
+
+The upstream readme follows unchanged.
+
+---
+
 This is the new **Conquest DICOM Server** source code repository, it is the first ever release of the full source code of Conquest Dicom server with full source code, including the windows GUI.
 
 Its USP is simplicity for starters, speed for serious users, and endless configurability for nerds and anybody wanting to automate DICOM workflows.

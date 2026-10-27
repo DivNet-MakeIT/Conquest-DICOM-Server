@@ -38,6 +38,8 @@
 // 20261027	mmd	The cache lock is made at its first use (IniLock), not by a static object: global
 //			PDU objects in dgate.cpp read dicom.ini in their constructors before the static
 //			objects of this file are made (a zeroed CRITICAL_SECTION crashes on Windows)
+// 20261027	mmd	IniLock makes the lock exactly once also under concurrent first use
+//			(pthread_once; on Windows an interlocked state)
 
 int      gpps=0, gppstime=0;
 
@@ -73,16 +75,40 @@ static unsigned int	IniGeneration=0;	// + 1 whenever the cache is emptied or flu
 // objects are made, before those of this file (included last in total.cpp). A lock made by a
 // static object here was entered there before it was made: harmless with a zeroed pthread
 // mutex, a crash with a zeroed Windows CRITICAL_SECTION.
+// The lock is made exactly once, also when two threads use it first at the same time:
+// pthread_once on Unix; on Windows an interlocked state (0 not made, 1 being made, 2 made),
+// which needs no Vista API and no thread-safe local statics (Visual Studio 2010).
+#ifdef WIN32
+static volatile LONG IniLockState = 0;
+
 static CRITICAL_SECTION *IniLock(void)
 	{
-	static int made = 0;
-	if (!made)
+	if (InterlockedCompareExchange(&IniLockState, 1, 0) == 0)
 		{
 		InitializeCriticalSection(&IniCritical);
-		made = 1;
+		InterlockedExchange(&IniLockState, 2);
+		}
+	else
+		{
+		while (InterlockedCompareExchange(&IniLockState, 2, 2) != 2)
+			Sleep(0);
 		}
 	return &IniCritical;
 	}
+#else
+static pthread_once_t IniLockOnce = PTHREAD_ONCE_INIT;
+
+static void IniLockInit(void)
+	{
+	InitializeCriticalSection(&IniCritical);
+	}
+
+static CRITICAL_SECTION *IniLock(void)
+	{
+	pthread_once(&IniLockOnce, IniLockInit);
+	return &IniCritical;
+	}
+#endif
 
 // statistics (gpps, gppstime) under the cache lock
 static void IniAddTime(int t)

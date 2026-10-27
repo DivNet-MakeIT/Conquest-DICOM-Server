@@ -696,7 +696,12 @@ MODALITY1     ab:cd:...:01, 77e0...9c        # two during a certificate change
 - A line that cannot be read, or an AE listed twice, makes that AE "certificate invalid", and all
   its TLS connections are refused.
 - A file that cannot be read, or a damaged file (unterminated comment, NUL byte), keeps the
-  previously loaded table. At startup that table is empty, and the console says so.
+  previously loaded table.
+- When `TLSNodeCertsFile` is set but no table was ever loaded from it (the file cannot be read
+  or is damaged at its first load in the process, e.g. at startup), **every TLS association is
+  refused**, outgoing and incoming, with a `*** TLS: … is not loaded` line, until a load succeeds
+  (`read_tlscerts:`). Plain associations are not affected. A command line process (e.g.
+  `dgate --dolua:`) loads the file on its first TLS connection, with the same rule.
 
 ### 4.3 Profiles
 

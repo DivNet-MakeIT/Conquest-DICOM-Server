@@ -17,3 +17,20 @@ Open source code used includes the Independent JPEG Group's software; charls by 
 In addition, the following minimised sample web viewers are included: papaya (https://github.com/rii-mango/Papaya, build 1446) and ohif (https://github.com/OHIF/Viewers, 1.03). 
 
 The app/newweb code also contains unmaintained interfaces for dwv (https://github.com/ivmartel/dwv), and weasis (https://nroduit.github.io/en/).
+
+---
+
+## Addendum: DivNet-MakeIT fork — about this branch
+
+This is the DivNet-MakeIT fork of [marcelvanherk/Conquest-DICOM-Server](https://github.com/marcelvanherk/Conquest-DICOM-Server); the text above is the upstream readme, unchanged.
+Branch `sc-incoming` (variant A) adds a storage commitment SCP for incoming data to dgate, on upstream master `f8c0057` (1.5.0g4): Storage Commitment Push Model requests (N-ACTION) are answered with an N-EVENT-REPORT after each instance is checked in the database and on disk; requests from calling AEs not in acrnema.map are refused; the server prints "Build variant: SC-in" at startup. It is off by default (`EnableStorageCommitment = 0` in dicom.ini), so with default settings dgate behaves as 1.5.0g4. Release tag: `sc-incoming-v1`. Documentation for both variants: [docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing-tls/docs/README.md) on `sc-outgoing-tls`.
+
+Branches of this fork:
+
+- `divnet-stable` (default branch): upstream `16cfc3e` (1.5.0f) plus one Linux packaging commit (web files installed without overwriting existing ones; Storage Commitment SOP class listed in `linux/dgatesop.lst`).
+- `divnet-stable-1c2ff06`: the same packaging commit on upstream `1c2ff06` (1.5.0g).
+- `master`: copy of upstream master at `16cfc3e` (1.5.0f); not kept in sync with upstream.
+- `sc-incoming`: variant A, storage commitment SCP for incoming data (opt-in), on upstream `f8c0057` (1.5.0g4).
+- `sc-outgoing-tls`: variant B, storage commitment for incoming and outgoing data, DICOM TLS and verify-before-delete (all opt-in), on upstream `f8c0057` (1.5.0g4); documentation in [docs/README.md](https://github.com/DivNet-MakeIT/Conquest-DICOM-Server/blob/sc-outgoing-tls/docs/README.md).
+- `storage-commitment`: earlier version of the incoming storage commitment SCP, on upstream `41575e8`; superseded by `sc-incoming`.
+- `add-license-file`: adds a LICENSE file; merged upstream through pull request #51, kept for reference.

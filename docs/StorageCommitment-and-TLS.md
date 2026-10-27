@@ -193,7 +193,8 @@ In `[lua]`:
 
 The test harness uses some test-only keys. All default to 0 and are not for production:
 `SCTestDelayBeforeWrite`, `SCTestDelayAfterRead`, `SCTestQueueMax`, `SCTestFailDemote`,
-`SCTestFailFetch`, `SCTestDelayBeforeRecord`, `SCTestNoFileStamp`.
+`SCTestFailFetch`, `SCTestDelayBeforeRecord`, `SCTestNoFileStamp`, `SCTestDelayVerifyStep`,
+`SCTestDelayBeforeDelete`.
 
 **Production note on `SCUnsafeFile`.** The sentinel and its `.running` marker must be on persistent
 storage that survives a restart of dgate (for example the dgate directory on a host volume), never
@@ -456,6 +457,7 @@ All commands are guarded by `checkaccess(ca_script)`.
 | `sc_unsafe_clear:` | reconcile and remove the sentinel (see 3.6); `sc_overflow_clear:` is an alias |
 | `sc_overflow:` | `0`, `1 since <time> dropped <n>`, or `1 marked: <reason>` |
 | `sc_verify_now:<StudyUID>,<AE>[,<timeout>]` | `1`, or `0 <reason>` (3.9) |
+| `sc_verify_and_delete:<StudyUID>,<AE>[,<timeout>]` | `1` when verified and deleted locally, or `0 <reason>` (3.9) |
 
 Lua functions:
 - `scconfirmed(studyuid [, ae, …])` returns `true` or `false`, or `nil` on error. It returns
@@ -464,6 +466,8 @@ Lua functions:
   Inside the server it calls the verification directly; outside (e.g. `dgate --dolua:`) it sends
   `sc_verify_now:` to the server, where results on a new association arrive (no answer from the
   server: `false, "no answer from the server"`). Bad arguments: `false, "usage"`.
+- `scverifyanddelete(studyuid, ae [, timeout])`: the same, through `sc_verify_and_delete:`; `true`
+  only when the study was verified and deleted locally.
 
 Hook: `[lua] OutgoingSCStudyConfirmed`
 - It runs after the N-EVENT-REPORT response has been sent, once for each study that this result made
@@ -477,7 +481,8 @@ Hook: `[lua] OutgoingSCStudyConfirmed`
 > **`sc_confirmed:`, `sc_confirmed_list:`, `scconfirmed()` and the `OutgoingSCStudyConfirmed`
 > hook are ADVISORY.** Use them for monitoring and to schedule work. **Do not delete on them.**
 >
-> Delete a study locally only when `sc_verify_now` (Lua `scverifynow`) returned `1` **immediately
+> Delete a study locally with `sc_verify_and_delete` (Lua `scverifyanddelete`), which verifies and
+> deletes in one call, or only when `sc_verify_now` (Lua `scverifynow`) returned `1` **immediately
 > before** the deletion.
 
 Successive reviews kept finding edge cases where the persistent state can be wrong: a crash, a
@@ -511,7 +516,10 @@ in 3.6 make these cases rare and safe-side, but deletion needs a stronger guaran
    (a system without nanosecond file times, a send path that records none). This step only reads
    the table.
 
-The answer is `1` only after all seven steps pass.
+8. Checks the local side once more as in step 6 (a write during step 7, which reads the table and
+   not the files, gives `0 changed`).
+
+The answer is `1` only after all eight steps pass.
 
 Step 7 makes the verification depend on the advisory `SCObject` table for one question only, "is
 the archived content the current local content", and only in one direction: it can turn a `1` into
@@ -551,15 +559,41 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
   transformed at send`. If the archived copy is meant to differ (for example anonymised for a
   research archive), the local copy is not a copy of it, and deleting on the commitment is a policy
   decision outside this check.
-- An object stored after the answer is not covered, so delete right after the answer.
+- An object stored after the answer is not covered by `sc_verify_now`; `sc_verify_and_delete`
+  closes that window (below).
+
+**`sc_verify_and_delete:<StudyUID>,<AE>[,<timeout>]`** (Lua `scverifyanddelete`) runs the same
+verification and then deletes the study locally, as `deletestudy:` does (files and database
+records), with the local writes of the study excluded:
+- A guard for the study is set before the verification reads it. Every local write that starts
+  (`SaveToDisk`, the path of every C-STORE and every rewrite through dgate) counts on it; a write
+  whose study is not known, or whose SOP Instance UID is missing or longer than 64 characters,
+  counts on every guard.
+- After the answer `1`, in one locked step: when a write of the study started since the guard was
+  set, or one is in progress, nothing is deleted (`0 changed`); otherwise the guard starts to block.
+  A write of the study that starts now waits until the delete is done (console line `write of
+  <uid> (study <uid>) waited for the verified delete of its study`); it is stored afterwards, as a
+  new object of the study.
+- The study is deleted and read again: no local object may be left.
+- Answers: `1` (verified and deleted), every `0` of `sc_verify_now`, `0 changed` (a write of the
+  study started during the verification), `0 write during delete` (a write waited longer than 60 s
+  and went on: alarm line, check the study), `0 not deleted completely` (objects left after the
+  delete: alarm line). The same `checkaccess` as the other commands; with
+  `OutgoingStorageCommitment=0` the answer is `0 disabled` and nothing is deleted.
+
+Residual limits: a change of a local file that does not go through a dgate write (a file edited or
+replaced on disk outside dgate, a move between devices) is not excluded; it is only detected by the
+fingerprints of steps 1, 6 and 8, so it can still happen between step 8 and the delete. The delete
+itself is `DeleteStudy` (one file and record after the other), not a transaction: when it fails
+halfway, objects are left and the answer is `0 not deleted completely`.
 
 Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` defines
-`sc_delete_if_verified(patid, study, ae [, timeout])` (default 120 s), which deletes with
-`deletestudy:` only on `true` and prints the reason otherwise. In short:
+`sc_delete_if_verified(patid, study, ae [, timeout])` (default 120 s), which calls
+`scverifyanddelete` and prints the reason when the study was not deleted. In short:
 
 ```lua
-local ok, why = scverifynow(study, 'ARCHIVE', 120)
-if ok == true then servercommand('deletestudy:' .. patid .. ':' .. study) end
+local ok, why = scverifyanddelete(study, 'ARCHIVE', 120)
+if ok ~= true then print('not deleted: ' .. tostring(why)) end
 ```
 
 ---

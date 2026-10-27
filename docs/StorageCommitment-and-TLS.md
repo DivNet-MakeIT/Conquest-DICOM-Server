@@ -1,9 +1,9 @@
 # Storage Commitment (incoming and outgoing) and DICOM TLS in dgate
 
 This document covers changes to dgate on top of upstream master `f8c0057` (1.5.0g4). It is written for
-someone who knows the Conquest code base. Each statement here has been checked against the code on
-branch `sc-outgoing-tls`: `sc-outgoing-tls` with verify-before-delete (`sco-verify`) and the legacy TLS
-profile (`sco-tls-legacy`) merged on top.
+someone who knows the Conquest code base. Each statement here has been checked against the code at
+the end of this series: outgoing storage commitment with verify-before-delete, the legacy TLS
+profile and the worker time limits.
 
 All AE titles, addresses and file names below are examples (RFC 5737 addresses `192.0.2.x`).
 
@@ -75,7 +75,9 @@ association refuses it as before.
 - Calling AE not in `acrnema.map` (normal `GetACRNema` matching, including wildcards): N-ACTION-RSP
   **0x0124** (not authorised), no event, and a console line. Other services from that AE are not
   affected. Without this check, any SCU could probe for SOP Instance UIDs, and the return address
-  for a new association can only come from the map anyway.
+  for a new association can only come from the map anyway. This check is done by
+  `StorageCommitmentSupport` itself for every N-ACTION it reads; it does not depend on the upstream
+  keys `AllowOnlyMappedRemoteAE` / `CheckIPofRemoteAE`, which have no effect (section 7).
 - Request without an instance list: **0x0120**.
 - N-ACTION that cannot be read: no event.
 - `OutgoingStorageCommitment=1` with `EnableStorageCommitment=0`: an incoming N-ACTION gets
@@ -181,6 +183,7 @@ default, with a console warning (printed only while the feature is on).
 | `OutgoingSCResendDelay` | `300` | 0.. | delay before a re-send; after failed re-sends it doubles up to the last `OutgoingSCRetryInterval` value |
 | `SCUnsafeFile` | `sc_unsafe.flag` | name | sentinel file (3.6); a name without a path is in the dgate directory |
 | `OutgoingSCVerifyMax` | `4` | 1..64 | concurrent `sc_verify_now` verifications; one more answers `0 busy` |
+| `OutgoingSCConnectTimeout` | `30` | 1..`TCPIPTimeOut` | worker only (N-ACTION requests and re-sends): TCP connect, TLS handshake and association setup end within it; a default above `TCPIPTimeOut` is lowered to it. All other connections keep `TCPIPTimeOut`. |
 
 In `[lua]`:
 
@@ -190,7 +193,12 @@ In `[lua]`:
 
 The test harness uses some test-only keys. All default to 0 and are not for production:
 `SCTestDelayBeforeWrite`, `SCTestDelayAfterRead`, `SCTestQueueMax`, `SCTestFailDemote`,
-`SCTestFailFetch`.
+`SCTestFailFetch`, `SCTestDelayBeforeRecord`, `SCTestNoFileStamp`.
+
+**Production note on `SCUnsafeFile`.** The sentinel and its `.running` marker must be on persistent
+storage that survives a restart of dgate (for example the dgate directory on a host volume), never
+on the writable layer of a container that is recreated: a lost sentinel would let "study
+confirmed" answer 1 again without a reconciliation, and a lost running marker hides an unclean stop.
 
 Changing a key needs a restart. Lowering a limit does not interrupt work in progress.
 
@@ -201,8 +209,9 @@ objects end in TIMEOUT and raise an alarm.
 ### 3.3 Flow
 
 1. **Noting.** After a C-STORE succeeds, the UIDs (taken just before `Write`, after any script or
-   recompression), the called AE, and the address, port and TLS actually used are put into a
-   bounded in-memory queue. There is no database access in the send path. This happens in four
+   recompression), the called AE, the address, port and TLS mode actually used, and the file stamp
+   of the local file the send read (3.4) are put into a bounded in-memory queue. There is no
+   database access in the send path. This happens in four
    places:
    - ExportConverter forward (including a `dest` clause);
    - ImportConverter forward;
@@ -218,6 +227,15 @@ objects end in TIMEOUT and raise an alarm.
    5. after `OutgoingSCQuietTime`, sends an N-ACTION per (destination, study), in chunks of
       `OutgoingSCMaxBatch`, on a new association that offers only the storage commitment class.
       TLS is used if the node has `T`; a T node never gets a plain-text request.
+
+   **Time limits of the worker's own connections.** The request and re-send connections end their
+   TCP connect, TLS handshake and association setup within `OutgoingSCConnectTimeout` (also for
+   plain sockets; other dgate connections are unchanged). Their release waits at most
+   `OutgoingSCSameAssocWait` seconds, clamped to 2..10 s, for A-RELEASE-RP; without a reply the
+   association is aborted (`*** Storage commitment: no release reply from <AE> within <n> s
+   (<association>): association aborted`). A destination that could not be reached in a pass
+   (request or re-send) is skipped for the rest of that pass for requests and re-sends, so one
+   destination that does not answer costs at most one connect limit per pass and the others go on.
 3. **Write first, then send.** The `SCTransaction` and `SCTxMember` rows and the objects' state
    REQUESTED are committed before the N-ACTION goes out. A restart resumes from the tables.
 4. **TransactionUID.** It is built from the server UID root plus ≥ 64 random bits (`/dev/urandom`,
@@ -252,7 +270,7 @@ regen. Upstream tables are not changed.
 
 | Table | Content |
 |---|---|
-| `SCObject` | one row per (CalledAE, SOPInstUID): State, TxUID, Attempts, Resends, ResendRes, FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS, MapGen, NoResend, Gen |
+| `SCObject` | one row per (CalledAE, SOPInstUID): State, TxUID, Attempts, Resends, ResendRes, FirstSent, LastSent, NextTry, CommittedAt, FailReason, DestIP, DestPort, DestTLS (0 plain, 1 `T`, 2 `TL` legacy profile), MapGen, NoResend, Gen, FileStamp |
 | `SCTransaction` | one row per N-ACTION: TxUID, CalledAE, SentAt, ClosedAt, State, Result, Members; not changed once closed |
 | `SCTxMember` | (TxUID, SOPInstUID, SOPClassUID, Gen), written before the N-ACTION; Outcome (1 committed / 2 failed), Reason |
 | `SCMarker` | overflow marker of earlier development builds; only read once and taken over by the sentinel (3.6) |
@@ -267,9 +285,18 @@ regen. Upstream tables are not changed.
 | `FAILED` | reported failed (FailReason = 0008,1197 or a local reason: re-send limit, not local) |
 | `TIMEOUT` | re-asks exhausted or deadline passed |
 | `UNSUPPORTED` | the destination did not accept the SC class; images were still sent normally |
-| `HELD` | the map address, port or TLS of the destination changed since the send; nothing is sent to the new address |
+| `HELD` | the map address, port or TLS of the destination changed since the send (also a switch between `T` and `TL`); nothing is sent to the new address |
 | `CANCELLED` | map entry lost its `SC`, or `sc_cancel:` |
 | `CHANGED` | the object was stored again locally after it was sent; not confirmed until sent again |
+
+**File stamp (`FileStamp`).** `size:mtime.nanoseconds:inode` of the local file, taken by the send
+path right before it reads the file and checked right after it (no stamp when the file changed
+meanwhile). Forwards (ExportConverter), C-MOVE and re-sends record it; the ImportConverter forward of
+the received object, Lua sends and the older note wrappers record none. Only strong stamps are kept:
+a system with nanosecond file times (Linux, macOS), a non-zero inode and a non-zero nanosecond part;
+otherwise (e.g. Windows, file systems with whole-second times) the stamp is empty. A table of an
+earlier build gets the column at the first start (`adding column FileStamp to table SCObject`,
+existing rows empty).
 
 **Transaction states:** `OPEN`, `CLOSED`, and `ABANDONED` (replaced by a newer request). A late
 report to an ABANDONED transaction is still validated against that transaction's own members.
@@ -333,11 +360,19 @@ re-sent automatically. This covers:
   `scconfirmed`), and the hook does not fire.
 - `sc_unsafe_clear:` removes it. The command is refused while the queue is not empty, while a local
   write is in progress, or while the database is unreachable.
-- Before removing the file, `sc_unsafe_clear:` reconciles: every COMMITTED row whose object was
-  stored locally after `CommittedAt` becomes CHANGED (Gen + 1). Every other row of such an object
-  becomes CHANGED as well, whatever its state (also FAILED, TIMEOUT, HELD, CANCELLED, because a late
-  result could still make them COMMITTED); only rows already CHANGED stay as they are. A database
-  fetch error while the rows are read refuses the clear, and the sentinel stays.
+- Before removing the file, `sc_unsafe_clear:` reconciles every object that has rows not in
+  CHANGED. The object is left as it is only when its current local file is known to be the one sent:
+  - when every such row has a `FileStamp` and the current file has one: all these stamps equal the
+    stamp of the current file;
+  - otherwise (a row without a stamp): every such row has a `LastSent` before the modification time
+    of the current file (whole seconds; a file written in the same second as its send counts as
+    changed);
+  - no usable local file: always reconciled.
+
+  Every row of a reconciled object becomes CHANGED (Gen + 1, TxUID cleared, NoResend 1), whatever
+  its state (also FAILED, TIMEOUT, HELD, CANCELLED, because a late result could still make them
+  COMMITTED); only rows already CHANGED stay as they are. A reconciled object always needs a new
+  send. A database fetch error while the rows are read refuses the clear, and the sentinel stays.
 - SIGTERM, SIGINT and `quit:` stop the server cleanly.
 
 **Write-in-progress marks.** A local rewrite is marked from the moment its rows are demoted until
@@ -355,7 +390,7 @@ started. If anything changed, it asks again, at most 3 times, and then answers 0
 ### 3.7 Logging
 
 Console (OperatorConsole) lines are written for:
-- every N-ACTION (AE, TxUID, number of objects) and its outcome;
+- every N-ACTION and its outcome, with study, transaction, number of objects and the attempt;
 - every received result, and every refused one with the reason;
 - UNSUPPORTED (once per AE), HELD, CANCELLED and TIMEOUT;
 - every re-send;
@@ -365,14 +400,37 @@ Console (OperatorConsole) lines are written for:
 - `sc_verify_now` (3.9): one line per N-ACTION, one per result received or refused, and one summary
   line per verification:
 
+Worker lines (a = attempt, b = its limit: `OutgoingSCRetries` + 1 for requests; for re-sends
+`a/b (Rn)` from the map, `a/b (R, OutgoingSCResendMax)` from dicom.ini, `a/inf (RI)`, a range
+`a1-a2/b` when the objects of a batch differ):
+
+```
+Storage commitment request to <AE>: study <StudyUID>, transaction <TxUID>, <n> object(s), attempt a/b
+Storage commitment request accepted by <AE> (transaction <TxUID>, study <StudyUID>, <n> object(s), attempt a/b)
+*** Storage commitment request to <AE> failed (study <StudyUID>, transaction <TxUID>, <n> object(s), attempt a/b): asked again later | requests used up
+*** Storage commitment: connect to <AE> (<ip> <port>) timed out after <s> s, attempt a/b (transaction <TxUID>)
+*** Storage commitment: could not connect to <AE> (<ip> <port>) for transaction <TxUID>, attempt a/b
+*** Storage commitment: no release reply from <AE> within <s> s (<association>): association aborted
+Storage commitment result from <AE> for <TxUID>: <c> committed, 0 failed (study <StudyUID>)
+*** Storage commitment result from <AE> for <TxUID>: <c> committed, <f> failed (study <StudyUID>)
+Storage commitment re-send to <AE>: study <StudyUID>, <n> object(s), attempt a/b (Rn)
+*** Storage commitment: connect to <AE> (<ip> <port>) timed out after <s> s, re-send attempt a/b (Rn)
+Storage commitment: re-sent <SOPInstanceUID> to <AE> (attempt a/b (Rn))
+*** Storage commitment ALARM: <AE> changed in acrnema.map (sent to <ip> <port>[ TLS| TLS legacy], now <ip> <port>[ TLS| TLS legacy])
+```
+
+Verify lines:
+
 ```
 Storage commitment verify: request to <AE>, transaction <TxUID>, <n> object(s)
 Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association: <c> committed, <f> failed
 *** Storage commitment verify: result from <AE> for <TxUID> on the <request|new> association refused (<reason>): the verification fails
+*** Storage commitment verify: study <StudyUID>, AE <AE>: <k> of <n> local object(s) not the content last sent and committed (<a> without a COMMITTED row, <b> with another file stamp, <c> local file(s) without a stamp): changed since send
 Storage commitment verify: study <StudyUID>, AE <AE>, <n> object(s), <k> chunk(s), transaction(s) <TxUID …|->, <s.mmm> s: <1|0 reason>
 ```
 
-Lines starting with `***` are warnings or alarms.
+Lines starting with `***` are warnings, failures or alarms: every storage commitment line with
+TIMEOUT, ALARM, failed, could not, timed out, refused or aborted starts with `***`.
 
 ### 3.8 Server commands, Lua and hook
 
@@ -434,8 +492,21 @@ in 3.6 make these cases rare and safe-side, but deletion needs a stronger guaran
    answer is `0 failed <n>` or `0 invalid result`.
 6. Re-reads the local objects and fingerprints. Any difference, a new object, or a write in
    progress gives `0 changed`.
+7. Checks that the local content is the content the archive committed: for every local object
+   there must be a COMMITTED `SCObject` row of that AE with a non-empty `FileStamp` equal to the
+   stamp of the local file as read in step 1. Otherwise `0 changed since send`: no COMMITTED row
+   (never sent there, rewritten through dgate so the row is CHANGED, sent again but not yet
+   committed, or purged after `OutgoingSCKeepDays`), another stamp (rewritten on disk after the
+   committed send), or no stamp (a system without nanosecond file times, a send path that records
+   none). This step only reads the table.
 
-The answer is `1` only after all six steps pass.
+The answer is `1` only after all seven steps pass.
+
+Step 7 makes the verification depend on the advisory `SCObject` table for one question only, "is
+the archived content the current local content", and only in one direction: it can turn a `1` into
+`0`, never a `0` into `1`; every condition of steps 1 to 6 applies unchanged. In practice: verify
+(and delete) within `OutgoingSCKeepDays` of the commit, and send a study again through a forward or
+C-MOVE when it was rewritten locally or sent by a path without a stamp.
 
 **Properties**
 - Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel is neither read nor
@@ -447,7 +518,8 @@ The answer is `1` only after all six steps pass.
 | `0 disabled` | `OutgoingStorageCommitment=0`; nothing is sent |
 | `0 usage` | StudyUID or AE not valid, timeout not a number in 1..600 |
 | `0 busy` | `OutgoingSCVerifyMax` verifications already running |
-| `0 database error` | the local objects could not be read, including a fetch error (5) |
+| `0 database error` | the local objects or the committed rows could not be read, including a fetch error (5) |
+| `0 changed since send` | step 7: a local file is not the content last sent to that AE and committed |
 | `0 no local file` / `0 invalid local object` | an object of the study has no readable file, or a bad or repeated UID |
 | `0 TLS not available for this node` | the entry has `T` and this build has no TLS: nothing is sent in plain text |
 | `0 no connection` | no association to the node (also a failed TLS handshake or certificate check) |
@@ -457,8 +529,8 @@ The answer is `1` only after all six steps pass.
 
 - Timeout: default 60 s, 1..600. It covers all chunks.
 - One console line per verification (3.7), plus one per request and per result.
-- What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). Content is
-  not compared.
+- What the archive confirms is its custody of these SOP Instance UIDs (PS3.4 Annex J). The archive
+  does not compare content; step 7 compares the local file with the one last sent and committed.
 - An object stored after the answer is not covered, so delete right after the answer.
 
 Example (not enabled anywhere): `lua/sc_delete_if_verified.lua` defines
@@ -625,7 +697,8 @@ SC worker opens its own `Database` connection.
 
 - Every UID that goes into SQL is checked to be digits and dots, ≤ 64 characters. AE titles are
   checked to be printable, ≤ 16 characters, with no quote or backslash.
-- Tables from earlier development builds get the `Gen` column added (`ALTER TABLE … ADD`).
+- Tables from earlier development builds get the `Gen` and `FileStamp` columns added
+  (`ALTER TABLE … ADD`).
 - A fetch error (`Database::FetchError`) is told apart from the end of the rows wherever the
   reconciliation, `sc_unsafe_clear:`, `sc_verify_now:` and the confirmed check read rows: the clear
   is refused, and the verification answers `0 database error`.
@@ -649,7 +722,8 @@ containers. Every commit keeps the compile warning count at the baseline.
 | Confirmed | all committed → 1; one not → 0; object added → 0; two AEs; AE case on MariaDB; switch 0; hook fires once |
 | Fail-closed | local overwrite after COMMITTED; queue not drained; overflow; DB failure during overwrite; unclean kill → sentinel; clean run → no sentinel; regen keeps COMMITTED; `sc_unsafe_clear:` reconciliation |
 | TLS | outgoing and incoming with and without client certificate; wrong CA; node certificate match / mismatch / damaged file; hostname check; self-signed on/off; T node on the plain port rejected; `TLSPort`=`TCPPort`; never plain fallback; build without OpenSSL; connect timeout to a black-hole address; ini cache concurrency stress |
-| Verify | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; TLS path; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged; Lua in the server and from a client; reconciliation of every state; simulated fetch error |
+| Verify | archive holds all → 1; missing → `0 failed`; silent → `0 no result`; new association; wrong AE/IP; local change during the verify → `0 changed`; never sent, rewritten after the commit (through dgate and on disk) and no file stamps → `0 changed since send`, after a new send and its commit → 1; TLS path, also the legacy profile; multiple chunks; `0 busy`; `0 disabled`; advisory tables unchanged; Lua in the server and from a client; reconciliation of every state; simulated fetch error |
+| Worker limits | a destination whose packets are dropped: connect timeout with attempt line, the other destinations commit meanwhile; an archive that freezes after the N-ACTION: release aborted after the limit, others go on; file stamps recorded per send and compared by the reconciliation (untouched objects stay COMMITTED, rewritten ones and the whole-second fallback CHANGED, column added to an old table); log lines with attempts and `***`; `T` ↔ `TL` switch → HELD |
 | Legacy TLS | legacy client on `TLSLegacyPort` accepted and on `TLSPort` refused; NULL/RC4/EXPORT/DES/3DES/anonymous offers refused on both ports; `TL` to a legacy-only receiver; `T` without L to it refused, never plain; node certificate mismatch and weak key refused; modern T node on the legacy port rejected; `L` without `T` warning; `TLSLegacyPort` = `TCPPort` / `TLSPort`; `TLSLegacyPort` alone; build without OpenSSL; map option parse/format unit test |
 
 ---
@@ -675,8 +749,17 @@ containers. Every commit keeps the compile warning count at the baseline.
    - Because the signatures differ, this hides the virtual function instead of overriding it.
      `flpdu.cxx` calls the base version, which always accepts, so the keys have no effect.
    - This change does not alter it. The new `ShouldIAcceptRemoteTransport` hook uses a matching
-     signature. Commit `edadb73` assumed these keys were active.
-2. **gpps ini cache (`gpps.cpp`): fixed here** (`0a4e2fb`, `f72b9ce`, `5d0b365`).
+     signature.
+   - The N-ACTION refusal of commit `edadb73` does not rely on these keys. `StorageCommitmentSupport`
+     looks up the calling AE with `GetACRNema` for every N-ACTION it reads (only with
+     `EnableStorageCommitment=1`), whatever the keys say, and answers 0x0124 when no entry matches.
+     It follows `GetACRNema` matching (an entry whose name ends in `*` matches by prefix, then exact,
+     then case-insensitive), so a catch-all wildcard entry admits every calling AE, and it does not
+     compare the source address. That commit's message describes `AllowOnlyMappedRemoteAE` as
+     rejecting such an association earlier; with the keys inactive that never happens, and this
+     check is the only acrnema.map check of the calling AE of an N-ACTION (on the TLS ports the TLS
+     checks of section 4 come on top).
+2. **gpps ini cache (`gpps.cpp`): fixed here** (`3bba371`, `b094da6`, `9074846`).
    - A cache hit was copied with an unbounded `strcpy` (up to 1023 characters, whatever the caller's
      buffer length was). It is now copied bounded, under the lock.
    - Entries that do not fit the 64/64/1024 arrays are not cached.
@@ -692,7 +775,7 @@ containers. Every commit keeps the compile warning count at the baseline.
 
 ---
 
-## 8. Commit map (`f8c0057..sc-outgoing-tls`)
+## 8. Commit map (`f8c0057` to the end of this series)
 
 **Incoming storage commitment (variant A)**
 - `3183c6e` Storage commitment SCP behind dicom.ini EnableStorageCommitment (default 0)
@@ -704,67 +787,77 @@ containers. Every commit keeps the compile warning count at the baseline.
 
 **Outgoing storage commitment**
 - `6fe440c` Outgoing storage commitment, part 1: state tables and N-EVENT-REPORT handling
-- `5e99a59` Outgoing storage commitment, part 2a: note successful sends to SC nodes
-- `316a773` Outgoing storage commitment, part 2: worker thread, N-ACTION, retries
-- `0fe1875` Outgoing storage commitment, part 3c: "study confirmed" check, commands, Lua function and hook
-- `5b286db` Outgoing storage commitment, part 3b: re-send of missing objects (R, Rn, RI)
-- `5efcec4` Outgoing storage commitment: never re-send an object whose sent copy may differ
+- `747b65f` Outgoing storage commitment, part 2a: note successful sends to SC nodes
+- `111680b` Outgoing storage commitment, part 2: worker thread, N-ACTION, retries
+- `3c34620` Outgoing storage commitment, part 3c: "study confirmed" check, commands, Lua function and hook
+- `903a4f5` Outgoing storage commitment, part 3b: re-send of missing objects (R, Rn, RI)
+- `6f9aaca` Outgoing storage commitment: never re-send an object whose sent copy may differ
 
 **DICOM TLS**
-- `df67f65` Outgoing DICOM TLS to nodes with T in acrnema.map
-- `21b4911` Incoming DICOM TLS on a separate, configurable port (TLSPort)
-- `4e9b825` TLS: dicom.ini TLSAcceptSelfSigned (default 0) for self-signed peer certificates
-- `01a1266` TLS: node certificates in a separate file (TLSNodeCertsFile, read_tlscerts:)
+- `9677647` Outgoing DICOM TLS to nodes with T in acrnema.map
+- `c506233` Incoming DICOM TLS on a separate, configurable port (TLSPort)
+- `e4871c3` TLS: dicom.ini TLSAcceptSelfSigned (default 0) for self-signed peer certificates
+- `a896f77` TLS: node certificates in a separate file (TLSNodeCertsFile, read_tlscerts:)
 
 **Fixes after review: storage commitment**
-- `0363f00` Outgoing storage commitment: content generation, local overwrite, queue window
-- `4bad5f8` Outgoing storage commitment: record the destination actually used by each send
-- `2f95ed0` Outgoing storage commitment: NoResend for every way the sent copy can differ
-- `0b4c533` Outgoing storage commitment: RI nodes keep cycling in re-send mode 1 too
-- `7c29740` Outgoing storage commitment: deadline also ends objects waiting in REQUESTED
-- `7acdb70` Outgoing storage commitment: bound the reads of the same-association wait
-- `4c2a0d1` Outgoing storage commitment: build the TransactionUID with bounded buffers
-- `9e633a0` Outgoing storage commitment: no recorded send outlives a later local write
-- `c1f50bc` Outgoing storage commitment: the watchdog shuts down only its own descriptor
-- `0bb265e` Outgoing storage commitment: no noted send is lost silently
-- `66518b7` Outgoing storage commitment: regen keeps commitment rows; Gen never wraps
-- `a506ef6` Outgoing storage commitment: C-MOVE send sequence taken per object
-- `c98dd03` Outgoing storage commitment: durable "commitment unsafe" sentinel file
-- `3ab01a9` Outgoing storage commitment: a positive confirmation is checked again before it is given
-- `c2e5eab` Outgoing storage commitment: the watchdog's duplicate is never descriptor 0
+- `d5e780f` Outgoing storage commitment: content generation, local overwrite, queue window
+- `fa33421` Outgoing storage commitment: record the destination actually used by each send
+- `a005869` Outgoing storage commitment: NoResend for every way the sent copy can differ
+- `9449442` Outgoing storage commitment: RI nodes keep cycling in re-send mode 1 too
+- `1c160ab` Outgoing storage commitment: deadline also ends objects waiting in REQUESTED
+- `5315224` Outgoing storage commitment: bound the reads of the same-association wait
+- `dd8a528` Outgoing storage commitment: build the TransactionUID with bounded buffers
+- `07017d7` Outgoing storage commitment: no recorded send outlives a later local write
+- `0489851` Outgoing storage commitment: the watchdog shuts down only its own descriptor
+- `51882d8` Outgoing storage commitment: no noted send is lost silently
+- `97e1ba3` Outgoing storage commitment: regen keeps commitment rows; Gen never wraps
+- `523ecfd` Outgoing storage commitment: C-MOVE send sequence taken per object
+- `c8f9552` Outgoing storage commitment: durable "commitment unsafe" sentinel file
+- `f013037` Outgoing storage commitment: a positive confirmation is checked again before it is given
+- `c63988a` Outgoing storage commitment: the watchdog's duplicate is never descriptor 0
 
 **Fixes after review: TLS and transport**
-- `b1fa74f` Outgoing TLS: one acrnema.map lookup per connection (address and transport together)
-- `a2c117a` Outgoing TLS: bounded TCP connect (TLS mode only)
-- `8911a0e` Outgoing TLS: unbound-node warning list under a lock
-- `8d1b228` TLS: verify mode per connection, server context made under the context lock
-- `de3efa4` TLS: own review of the socket layer (plain paths, SAN check, OpenSSL versions)
-- `8c0fba2` Incoming TLS: one canonical calling AE form on both ports; cache-safe TLS ini reads
-- `f3c78a5` TLS: a damaged node certificate file never removes certificates
-- `6e05c45` TLS: fail the connection when the socket cannot be made non-blocking
-- `d914fe9` C-MOVE: the sub-association transport only from the QualifyOn entry
+- `bad909e` Outgoing TLS: one acrnema.map lookup per connection (address and transport together)
+- `589f1ec` Outgoing TLS: bounded TCP connect (TLS mode only)
+- `d706b0f` Outgoing TLS: unbound-node warning list under a lock
+- `3a145ee` TLS: verify mode per connection, server context made under the context lock
+- `b6b4e08` TLS: own review of the socket layer (plain paths, SAN check, OpenSSL versions)
+- `e344ec7` Incoming TLS: one canonical calling AE form on both ports; cache-safe TLS ini reads
+- `1c88a14` TLS: a damaged node certificate file never removes certificates
+- `7319011` TLS: fail the connection when the socket cannot be made non-blocking
+- `5c2f563` C-MOVE: the sub-association transport only from the QualifyOn entry
 
 **Ini cache (upstream issue)**
-- `0a4e2fb` Ini cache: bounded copies in gpps.cpp; TLSIni reads the section name with 64 bytes
-- `f72b9ce` Ini cache: one lock made once; cache state and statistics under it
-- `5d0b365` Ini cache: the status display reads the gpps statistics under the cache lock
+- `3bba371` Ini cache: bounded copies in gpps.cpp; TLSIni reads the section name with 64 bytes
+- `b094da6` Ini cache: one lock made once; cache state and statistics under it
+- `9074846` Ini cache: the status display reads the gpps statistics under the cache lock
 
 **Build identification**
-- `0b2eef5` Build variant line at startup (SC-in SC-out [TLS]); on the variant A branch, `c81c14d`
+- `f5ba9e8` Build variant line at startup (SC-in SC-out [TLS]); on the variant A branch, `c81c14d`
   Build variant line at startup (SC-in)
 
-**Verify before delete** (from `sco-verify`)
-- `45972cb` Outgoing storage commitment: sc_verify_now: and Lua scverifynow, a fresh check before a local delete
-- `4df40ae` Outgoing storage commitment: the reconciliation of sc_unsafe_clear: covers every state
-- `0b95df0` Outgoing storage commitment: a fetch error is told from the end of the rows
+**Verify before delete**
+- `68fc2f4` Outgoing storage commitment: sc_verify_now: and Lua scverifynow, a fresh check before a local delete
+- `89e4ba8` Outgoing storage commitment: the reconciliation of sc_unsafe_clear: covers every state
+- `cf41be8` Outgoing storage commitment: a fetch error is told from the end of the rows
 
-**Legacy TLS profile** (from `sco-tls-legacy`)
-- `d9f3805` Outgoing TLS legacy profile: map option L (TL) for OsiriX-class nodes
-- `e444925` Incoming TLS legacy profile: TLSLegacyPort listener for OsiriX-class callers
-- `a54b812` TLS legacy profile: certificate checks at level 1 and a post-handshake key/signature policy
-- `cb5716e` TLS log: one operator console line per TLS connection, strict and legacy
-- `d169a42` acrnema.map header: describe the 5th-column options (T, L, SC, R, Rn, RI)
+**Legacy TLS profile**
+- `91f1507` Outgoing TLS legacy profile: map option L (TL) for OsiriX-class nodes
+- `8712265` Incoming TLS legacy profile: TLSLegacyPort listener for OsiriX-class callers
+- `a80ef64` TLS legacy profile: certificate checks at level 1 and a post-handshake key/signature policy
+- `695d43e` TLS log: one operator console line per TLS connection, strict and legacy
+- `30c7444` acrnema.map header: describe the 5th-column options (T, L, SC, R, Rn, RI)
 
 **Documentation**
-- `84404a9` Docs: storage commitment (incoming/outgoing) and DICOM TLS, and the commit that resolves
-  its pending items after the merge
+- `627fe7c` Docs: storage commitment (incoming/outgoing) and DICOM TLS
+- `cca3b99` Docs: resolve pending items after merge
+
+**Worker limits and file stamps**
+- `f2c6806` Outgoing storage commitment: connect time limit for the worker
+- `14910e4` Outgoing storage commitment: the worker releases its associations with a time limit
+- `5e9301d` Outgoing storage commitment: file stamp per send, compared by the reconciliation
+- `f8b0a32` Outgoing storage commitment: log lines with *** on failures and attempt numbers
+- `2494f20` Outgoing storage commitment: sc_verify_now: also checks that the local content is the content committed
+- `bdbee38` Outgoing storage commitment: DestTLS 2 for sends with the TLS legacy profile
+- `2d4ff41` Comments: remove development-process markers
+- this commit: Docs: worker limits, file stamps, verify step 7, upstream AE options

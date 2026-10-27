@@ -52,6 +52,7 @@
 20261008    mvh    Log AE title if rejected
 20261019    mmd    Connect keeps SCPSCURoles proposed by caller (for storage commitment event)
 20261026    mmd    Connect records ConnectedAE/Host/Port/TLS (destination actually used)
+20261027    mmd    ConnectedTLS is the TLS mode used: 0 plain, 1 TLS, 2 TLS with the legacy profile
 */
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -1072,7 +1073,7 @@ BOOL	PDU_Service	::	Connect ( BYTE *ip, BYTE *port )
 		memcpy(ConnectedAE, AAssociateRQ :: CalledApTitle, 16);
 		strcpy(ConnectedHost, (char *)ip);
 		strcpy(ConnectedPort, (char *)port);
-		ConnectedTLS = Link.TLSMode ? 1 : 0;
+		ConnectedTLS = Link.TLSMode;	// 0 plain, 1 TLS, 2 TLS legacy profile
 		}
 
 	AAssociateRQ :: Size();

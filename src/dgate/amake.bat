@@ -51,6 +51,14 @@ call amake
 del *.obj *.exe *.lib
 cd ..
 
+rem optional: 64-bit DICOM TLS build dgate64tls.exe, only when OPENSSLDIR is set (src\amaketls.bat)
+if not "%OPENSSLDIR%"=="" (
+cd src
+call amaketls
+del *.obj *.exe *.lib
+cd ..
+)
+
 del build32\*.*
 del build64\*.*
 rmdir build32

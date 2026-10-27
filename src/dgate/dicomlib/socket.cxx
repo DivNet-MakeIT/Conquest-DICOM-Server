@@ -48,6 +48,9 @@
 			handshake, reads (plain and TLS) and writes; past it they fail at once
 20261027	mmd	TLS: a resumed session is refused after the handshake, outgoing and incoming
 			(every association must be a full handshake with its own certificate checks)
+20261027	mmd	Unix: the TLS waits, the TLS connect and the ConnectTimeOut connect wait with poll()
+			(no FD_SETSIZE limit); Poll and the plain ReadBinary never put a descriptor >=
+			FD_SETSIZE in an fd_set (Poll: poll(); plain ReadBinary: console line, closed)
 
 */
 
@@ -94,6 +97,9 @@
 #endif
 
 #	include	<stdarg.h>
+#ifndef	WINDOWS
+#	include	<poll.h>
+#endif
 #ifdef	HAVE_OPENSSL
 #	include	<openssl/ssl.h>
 #	include	<openssl/err.h>
@@ -128,6 +134,48 @@ static	void	SocketTLSPrint(int level, const char *fmt, ...)
 		SocketTLS.Log(level, text);
 	else if (level==0)
 		fprintf(stderr, "%s\n", text);
+	}
+
+// Wait at most Seconds for fd: readable (ForWrite=0), or writable or failed (ForWrite=1, e.g. a
+// non-blocking connect). Unix: poll(), which has no limit on the descriptor number (select()
+// with an fd_set cannot take a descriptor >= FD_SETSIZE); Windows: select() (its fd_set is a
+// list of sockets, not a bitmap). Returns 1 ready, 0 timeout, -1 error (errno / WSA error).
+static	int	SocketWaitFd(int fd, int ForWrite, int Seconds)
+	{
+	if (Seconds < 0) Seconds = 0;
+	if (Seconds > 2000000) Seconds = 2000000;
+#ifdef	WINDOWS
+	fd_set		fds, efds;
+	struct	timeval	tv;
+	int		r;
+	tv.tv_sec = Seconds;
+	tv.tv_usec = 0;
+	FD_ZERO(&fds);
+	FD_SET(fd, &fds);
+	FD_ZERO(&efds);
+	FD_SET(fd, &efds);		// Windows reports a failed connect here
+	r = select(fd + 1, ForWrite ? NULL : &fds, ForWrite ? &fds : NULL, ForWrite ? &efds : NULL, &tv);
+	return r > 0 ? 1 : r;
+#else
+	struct	pollfd	p;
+	int		r;
+	p.fd = fd;
+	p.events = ForWrite ? POLLOUT : POLLIN;
+	p.revents = 0;
+	r = poll(&p, 1, Seconds * 1000);
+	return r > 0 ? 1 : r;		// POLLERR/POLLHUP count as ready: the next call reports them
+#endif
+	}
+
+// Upstream select() paths: TRUE when fd cannot be put in an fd_set (Unix, fd >= FD_SETSIZE;
+// FD_SET would write outside the set)
+static	BOOL	SocketBeyondFdSet(int fd)
+	{
+#ifdef	WINDOWS
+	return ( FALSE );
+#else
+	return ( fd < 0 || fd >= FD_SETSIZE );
+#endif
 	}
 
 
@@ -459,8 +507,6 @@ DicomError(DCM_ERROR_DEBUG, "Connected by address: %08x", sa.sin_addr.s_addr);
 // caller may retry), 2 timed out.
 static	int	SocketConnectBefore(int fd, struct sockaddr_in *sa, long end)
 	{
-	fd_set		wfds, efds;
-	struct	timeval	tv;
 	int		r, err, left, result;
 #ifdef	WINDOWS
 	int		len = sizeof(err);
@@ -487,13 +533,7 @@ static	int	SocketConnectBefore(int fd, struct sockaddr_in *sa, long end)
 		left = (int)(end - (long) time(NULL));
 		if (left <= 0)
 			{ result = 2; break; }
-		tv.tv_sec = left;
-		tv.tv_usec = 0;
-		FD_ZERO(&wfds);
-		FD_SET(fd, &wfds);
-		FD_ZERO(&efds);
-		FD_SET(fd, &efds);		// Windows reports a failed connect here
-		r = select(fd + 1, NULL, &wfds, &efds, &tv);
+		r = SocketWaitFd(fd, 1, left);
 		if (r == 0)
 			{ result = 2; break; }
 		if (r < 0)
@@ -709,7 +749,11 @@ BOOL	Socket	::	Poll(void)
 #ifdef	HAVE_OPENSSL
 	if ( TLSHandle && SSL_pending((SSL *)TLSHandle) > 0 )
 		return ( TRUE );	// decrypted data waiting inside OpenSSL
+	if ( TLSHandle )
+		return ( SocketWaitFd(Socketfd, 0, 0) > 0 );
 #endif
+	if ( SocketBeyondFdSet(Socketfd) )
+		return ( Socketfd >= 0 && SocketWaitFd(Socketfd, 0, 0) > 0 );	// cannot be in an fd_set
 #ifdef	MAC
 	memset((void*)&fds, 0, sizeof(struct fd_set));
 #else
@@ -789,6 +833,12 @@ INT	Socket	::	ReadBinary(BYTE *s, UINT	count)
 	if ( TLSHandle )
 		return ( TLSRead(s, count) );
 #endif
+	if ( SocketBeyondFdSet(Socketfd) )
+		{
+		SocketTLSPrint(0, "*** socket descriptor %d is not below FD_SETSIZE (%d): connection closed", Socketfd, (int) FD_SETSIZE);
+		Close ();
+		return ( -1 );
+		}
 	if ( Deadline > 0 && TimeOut )
 		{
 		long left = Deadline - (long) time(NULL);
@@ -990,8 +1040,6 @@ static	BOOL	SocketSetNonBlocking(int fd)
 // Returns 1 when ready, 0 on timeout, -1 on error.
 int	Socket	::	TLSWait(int ForWrite, int Seconds)
 	{
-	fd_set		fds;
-	struct	timeval	tv;
 	time_t		end = time(NULL) + Seconds;
 	int		left, r;
 
@@ -999,11 +1047,7 @@ int	Socket	::	TLSWait(int ForWrite, int Seconds)
 		{
 		left = (int)(end - time(NULL));
 		if (left < 0) left = 0;
-		tv.tv_sec = left;
-		tv.tv_usec = 0;
-		FD_ZERO(&fds);
-		FD_SET(Socketfd, &fds);
-		r = select(Socketfd + 1, ForWrite ? NULL : &fds, ForWrite ? &fds : NULL, NULL, &tv);
+		r = SocketWaitFd(Socketfd, ForWrite, left);
 		if (r > 0) return 1;
 		if (r == 0) return 0;
 #ifndef	WINDOWS
@@ -1035,8 +1079,6 @@ static	void	SocketTLSErrorText(SSL *ssl, int e, char *buf, int len)
 // stays non-blocking (TLSOpen needs that anyway).
 int	Socket	::	TLSConnect(long end)
 	{
-	fd_set		wfds, efds;
-	struct	timeval	tv;
 	int		r, err, left;
 #ifdef	WINDOWS
 	int		len = sizeof(err);
@@ -1061,13 +1103,7 @@ int	Socket	::	TLSConnect(long end)
 		left = (int)(end - (long) time(NULL));
 		if (left <= 0)
 			return 2;
-		tv.tv_sec = left;
-		tv.tv_usec = 0;
-		FD_ZERO(&wfds);
-		FD_SET(Socketfd, &wfds);
-		FD_ZERO(&efds);
-		FD_SET(Socketfd, &efds);		// Windows reports a failed connect here
-		r = select(Socketfd + 1, NULL, &wfds, &efds, &tv);
+		r = SocketWaitFd(Socketfd, 1, left);
 		if (r == 0)
 			return 2;
 		if (r < 0)

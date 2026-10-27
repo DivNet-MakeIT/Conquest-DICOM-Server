@@ -643,6 +643,8 @@ sockets keep their old code paths exactly. TLS is built only with `-DHAVE_OPENSS
   Plain to plain is compared as before (association level and SOP class only).
 - A failed handshake or certificate check is a failed connection. **There is never a plain
   fallback.**
+- Every TLS connection, both directions and both profiles, is a full handshake: no session
+  cache, no session tickets (TLS 1.2 and 1.3), and a resumed session is refused.
 
 **Incoming**
 - A second listener runs on `TLSPort`. Each connection gets its own context (socket, peer IP,

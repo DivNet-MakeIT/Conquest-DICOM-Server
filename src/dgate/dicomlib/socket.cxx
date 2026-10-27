@@ -46,6 +46,8 @@
 			the TLS handshake is limited to it, and ConnectTimedOut tells a timeout
 20261027	mmd	Deadline (0 = as before): an absolute end for the connect attempts, the TLS
 			handshake, reads (plain and TLS) and writes; past it they fail at once
+20261027	mmd	TLS: a resumed session is refused after the handshake, outgoing and incoming
+			(every association must be a full handshake with its own certificate checks)
 
 */
 
@@ -1168,6 +1170,14 @@ BOOL	Socket	::	TLSOpen(char *host)
 			}
 		}
 
+	// dgate never offers a session, so a resumed one is not expected: refuse it
+	if (SSL_session_reused(ssl))
+		{
+		SocketTLSPrint(0, "*** TLS: connection to %s (%s) refused: the TLS session was resumed (a full handshake is required)", TLSPeerAE, host);
+		TLSFree(TRUE);
+		return ( FALSE );
+		}
+
 	if (SocketTLS.AfterHandshake && !SocketTLS.AfterHandshake(ssl, TLSPeerAE, host))
 		{
 		TLSFree(TRUE);
@@ -1259,6 +1269,16 @@ BOOL	Socket	::	TLSAccept(int fd, const char *peer, int Legacy)
 			Socketfd = 0;
 			return ( FALSE );
 			}
+		}
+
+	// no session cache and no tickets: a resumed session is not expected, refuse it
+	if (SSL_session_reused(ssl))
+		{
+		SocketTLSPrint(0, "*** TLS: incoming connection from %s refused: the TLS session was resumed (a full handshake is required)", peer);
+		TLSFree(TRUE);
+		closesocket(fd);
+		Socketfd = 0;
+		return ( FALSE );
 		}
 
 	SocketTLSPrint(1, "TLS: incoming connection from %s with %s %s", peer, SSL_get_version(ssl), SSL_get_cipher_name(ssl));

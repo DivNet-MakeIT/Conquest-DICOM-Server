@@ -1375,6 +1375,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261027	mmd	TLSCipherList with an @ directive (e.g. @SECLEVEL=0) is ignored with a console line (the
 			built-in list is used); strict contexts keep at least the library's default security
 			level, and certificates are checked at that level (auth level)
+20261027	mmd	TLS: no session resumption on any context, client and server, strict and legacy: no TLS
+			1.2 session tickets (SSL_OP_NO_TICKET), no session cache, no TLS 1.3 tickets; a resumed
+			session is refused on both sides (socket.cxx)
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -21155,6 +21158,12 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 		return NULL;
 		}
 	SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+	// every association is a full handshake, both sides, both profiles: no session cache,
+	// no TLS 1.2 stateless session tickets, no TLS 1.3 tickets (a resumed session would skip
+	// the certificate checks of the new connection; socket.cxx also refuses one)
+	SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+	SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+	SSL_CTX_set_num_tickets(ctx, 0);
 	if (legacy ? !TLSSetLegacyCiphers(ctx) : !TLSSetCiphers(ctx, ciphers, minversion))
 		{
 		SSL_CTX_free(ctx);
@@ -21239,12 +21248,9 @@ static	SSL_CTX	*TLSMakeContext(BOOL server, BOOL legacy = FALSE)
 		// client certificate: require = must be sent and valid, verify = valid when sent
 		SSL_CTX_set_verify(ctx, TLSVerifyMode==2 ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT :
 					TLSVerifyMode==1 ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, TLSVerifyCallback);
-		// every association is a full handshake: no session cache, no TLS 1.3 tickets
-		SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+		// no session cache and no tickets (set above for every context); the session id
+		// context is still needed by OpenSSL when client certificates are verified
 		SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"dgate", 5);
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-		SSL_CTX_set_num_tickets(ctx, 0);
-#endif
 		if (!TLSVerifyMode)
 			OperatorConsole.printf("TLS: TLSVerifyPeer = ignore: client certificates are not asked for\n");
 		}

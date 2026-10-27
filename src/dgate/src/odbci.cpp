@@ -192,6 +192,10 @@
 20260702   mvh    Made it compile without sqlite
 20260809   mvh    Catch errors of dbase_create (crashed server browser for mixed users)
 20260914   mvh    Also try to load libmariadb
+20261026   mmd    FetchError/FetchEnded set by NextRecord (sqlite, MySQL/MariaDB, PostgreSQL, ODBC):
+                  a fetch error is told from the end of the rows; return values unchanged
+20261027   mmd    dbase open error: errno read directly; no #define _errno errno (with the Microsoft
+                  CRT and mingw-w64 errno is (*_errno()), the macro broke every later errno)
 */
 
 /*
@@ -316,9 +320,6 @@ TcpTimedWaitDelay = 30
 #   		define _LK_NBLCK LK_NBLCK
 #   		define _LK_UNLCK LK_UNLCK
 # 	endif
-#	if !defined(_errno)
-# 		define _errno errno
-#	endif
 
 #	define open_retry_count 4
 #	define open_retry_delay 50
@@ -723,7 +724,7 @@ int dbase_open(char *filename, struct dbase_header **th)
   }
 
   if (h == -1)
-  { switch (_errno)                     /* return failure */
+  { switch (errno)                      /* return failure */
     { case ENOENT : return -ER_NOSUCHFILE;
       case EMFILE : return -ER_TOOMANYFILES;
       case EACCES : return -ER_NOACCESS;
@@ -2832,6 +2833,8 @@ SQLStatement(NULL)
 	Connected = FALSE;
 #endif
         SQLStatement = (char *)malloc(MAXQUERYLENGTH);
+	FetchError = FALSE;
+	FetchEnded = FALSE;
 
 	// built-in dbase support (when datasource is a directory, must end with \)
 	for (int i=0; i<20; i++) dbase_handles[i]=NULL;
@@ -2950,6 +2953,8 @@ Database :: Database(enum DBTYPE dbtype)
 	Connected = FALSE;
 #endif
         SQLStatement = (char *)malloc(MAXQUERYLENGTH);
+	FetchError = FALSE;
+	FetchEnded = FALSE;
 
 	// built-in dbase support (when datasource is a directory, must end with \)
 	for (int i=0; i<20; i++) dbase_handles[i]=NULL;
@@ -3758,6 +3763,7 @@ BOOL Database :: QueryTables (
 int	Database :: PGSQLExec(char *StatementText)
 	{
 	if (!Postgres) return -1;
+	FetchError = FetchEnded = FALSE;
 
 	if (pgres != NULL)
 		{
@@ -3804,6 +3810,7 @@ int	Database :: PGSQLExec(char *StatementText)
 #ifdef USEMYSQL
 int	Database :: MYSQLExec(char *StatementText, BOOL q)
 	{
+	FetchError = FetchEnded = FALSE;
 //SystemDebug.printf ( "MysqlExec %.1000s\n", StatementText);
 	if (res != NULL)
 		{
@@ -3850,6 +3857,7 @@ int	Database :: SQLITEExec(char *StatementText, BOOL q)
 	{
 	int i, rc;
 	char *err=NULL;
+	FetchError = FetchEnded = FALSE;
 
 	if (resultp)
 		{ 
@@ -3918,6 +3926,7 @@ int	Database :: SQLITEExec(char *StatementText, BOOL q)
 int	Database :: SQLExecDirectWithRetry(SQLHSTMT StatementHandle, SQLCHAR *StatementText, SQLINTEGER TextLength)
 	{
 	int RetCode, i;
+	FetchError = FetchEnded = FALSE;
 
 	RetCode = SQLExecDirect ( StatementHandle, StatementText, TextLength );
 	if ( (RetCode == SQL_SUCCESS) ||
@@ -5085,9 +5094,15 @@ BOOL	Database	::	NextRecord ()
 	{
 		int i;
 		if ((pgres == NULL) || (PQresultStatus(pgres)!=PGRES_TUPLES_OK))
+			{
+			FetchError = TRUE;	// no result set (the statement failed or returned none)
 			return FALSE;
+			}
 		if (current_tuple >= ntuples) //already processed last record
+			{
+			FetchEnded = TRUE;
 			return FALSE;
+			}
 		for(i=0;i<ncolumns;i++)
 		{
 			switch (CTypeCodes[i])
@@ -5117,12 +5132,21 @@ BOOL	Database	::	NextRecord ()
 		unsigned long *lengths;
 
 		if ((res == NULL))
+			{
+			FetchError = TRUE;	// no result set: the query or mysql_store_result failed
 			return FALSE;
+			}
 		if (current_tuple >= ntuples) //already processed last record
+			{
+			FetchEnded = TRUE;
 			return FALSE;
+			}
 		row = mysql_fetch_row( res );
 		if (!row)
+			{
+			FetchError = TRUE;	// fewer rows than counted
 			return FALSE;
+			}
 
 		lengths = mysql_fetch_lengths(res);
 
@@ -5169,11 +5193,15 @@ BOOL	Database	::	NextRecord ()
 		unsigned long *lengths;
 
 		if ((resultp == NULL))
+			{
+			if (!FetchEnded) FetchError = TRUE;	// no result (not: read to the end and freed)
 			return FALSE;
+			}
 		if (current_tuple >= ntuples) //already processed last record
 			{
 			if (resultp) sqlite3_free_table(resultp);
 			resultp = NULL;
+			FetchEnded = TRUE;
 			return FALSE;
 			}
 
@@ -5207,12 +5235,17 @@ BOOL	Database	::	NextRecord ()
 
 #ifdef WIN32
 	if ( ! hStmt )
+		{
+		FetchError = TRUE;
 		return ( FALSE );
+		}
 	RetCode = SQLFetch ( hStmt );
 	
 	if ((RetCode != SQL_SUCCESS ) &&
 		(RetCode != SQL_SUCCESS_WITH_INFO ) )
 		{
+		if (RetCode == 100) FetchEnded = TRUE;		// SQL_NO_DATA: end of the rows
+		else                FetchError = TRUE;
 		SQLError (hEnv, hDbc, hStmt, (BYTE*)State, &NativeError,
 			(BYTE*)Msg, 512, &MsgL);
 #ifdef	DB_DEBUG

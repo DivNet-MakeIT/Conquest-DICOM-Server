@@ -1361,6 +1361,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261026	mmd	Node certificates (SHA-256) in a separate file TLSNodeCertsFile (default empty = none)
 			instead of TLSPin_<AE> keys; server command read_tlscerts:; unreadable lines and duplicate AEs
 			make that AE refused (fail closed)
+20261027	mmd	Converter forwards: the destination is resolved into a local value (ForwardResolve); the
+			transport is set on the shared forward PDU only under its lock, right before Connect
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -6219,6 +6221,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
         int			offset = 11, level;
 	BYTE			org[512], dest[512];
 	char			script[512];
+	ForwardTarget		FT;		// transport, set on the PDU right before Connect
         
         // fallback if none passed: forces one association per image
         if (!PDU) PDU = &PDU2;
@@ -6270,7 +6273,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
 	q = strchr(line+offset, ' '); if (q) *q=0;
 	c=compress; 
 	if (compress[0]) c=dummy;
-	if(!GetACRNemaForConnect(PDU[part], line+offset, (char *)host, (char *)port, (char *)c))
+	if(!ForwardResolve(line+offset, (char *)host, (char *)port, (char *)c, &FT))
         { // it does not exist: get host:port
 	  strcpy(host, line+offset);
           p = strchr(host, ':');
@@ -6358,6 +6361,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
           uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
           PDU[part].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
     
+          ForwardApplyTLS(PDU[part], &FT);
           if (!PDU[part].Connect((unsigned char *)&host, (unsigned char *)&port))
           { OperatorConsole.printf("*** ExportConverter%d.%d: Forward failed to connect to host %s\n", N, part, line+offset);
             delete DDO;
@@ -10703,6 +10707,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
       BYTE			org[512], dest[512];
       char			script[512];
       ExtendedPDU_Service	*PDU;
+      ForwardTarget		FT;	// transport: set on the shared PDU under its lock, before Connect
 
       if (N<0 || N>=MAXExportConverters) N = MAXExportConverters-1;  // typically from lua
       PDU = &import_forward_PDU[N*MAXExportConverters];
@@ -10765,7 +10770,8 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
       q = strchr(line+offset, ' '); if (q) *q=0;
       c=compress; 
       if (compress[0]) c=dummy;
-      if(!GetACRNemaForConnect(PDU[channel], line+offset, (char *)host, (char *)port, (char *)c))
+      // resolved into FT: PDU[channel] is shared and only changed under import_critical below
+      if(!ForwardResolve(line+offset, (char *)host, (char *)port, (char *)c, &FT))
       { strcpy(host, line+offset);
         p = strchr(host, ':');
         if (p) 
@@ -10851,6 +10857,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
         uid.Set("1.2.840.10008.1.1");		// This one should always accept: verification
         PDU[channel].AddAbstractSyntax(uid);		// assures connect will not return FALSE because image is not accepted
   
+        ForwardApplyTLS(PDU[channel], &FT);		// under import_critical, held through connect and send
         if (!PDU[channel].Connect((unsigned char *)&host, (unsigned char *)&port))
         { if (N >= -2) OperatorConsole.printf("*** %sConverter%d.%d: Forward failed to connect to host %s\n", ininame, N, channel, line+offset);
         }
@@ -20654,6 +20661,48 @@ BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE
 		ae[strlen(ae)-1] = 0;
 	strcpy(EE.Name, ae);
 	return SCPrepareTLS(PDU, EE);
+	}
+
+// AE title text as SCPrepareTLSForCalledAE takes it: at most 19 characters, trailing blanks removed
+static	void	ForwardTrimAE(const char *AE, char *ae)
+	{
+	memset(ae, 0, 20);
+	if (AE)
+		strncpy(ae, AE, 19);
+	while (ae[0] && (ae[strlen(ae)-1]==' ' || ae[strlen(ae)-1]=='\t' || ae[strlen(ae)-1]=='\r' || ae[strlen(ae)-1]=='\n'))
+		ae[strlen(ae)-1] = 0;
+	}
+
+// Converter forwards ("forward to X"): X is resolved ONCE into ip, port, compress and T
+// (transport from the same map entry, as GetACRNemaForConnect) without touching a PDU. The
+// forward PDUs of the import converters are shared by all threads (one per converter and
+// channel), so the transport is set on a PDU only under the lock of that PDU, right before
+// its Connect (ForwardApplyTLS): no other thread can change the transport, or the AE whose
+// certificate is checked, of a connection being made. Returns FALSE when X is not in the map
+// (T->Mode 0: the caller's host:port fallback stays plain, as before). compress may be NULL.
+BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarget *T)
+	{
+	ACRNemaAddress	E;
+
+	memset(T, 0, sizeof(*T));
+	if (!to || !GetACRNemaEntryByAE(to, &E))
+		return FALSE;
+	strcpy(ip, E.IP);
+	strcpy(port, E.Port);
+	if (compress)
+		strcpy(compress, E.Compress);
+	if (E.Flags & ACR_TLS)
+		{
+		T->Mode = (E.Flags & ACR_TLSLEGACY) ? 2 : 1;
+		ForwardTrimAE(to, T->CertAE);
+		}
+	return TRUE;
+	}
+
+// The transport of T on PDU for its next Connect (call it under the PDU's lock)
+BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T)
+	{
+	return PDU.SetTLS(T->Mode, T->Mode ? T->CertAE : NULL);
 	}
 
 // A TLS key from the dicom.ini server section, read into a buffer as large as an ini

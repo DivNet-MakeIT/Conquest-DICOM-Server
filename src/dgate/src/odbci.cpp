@@ -194,6 +194,8 @@
 20260914   mvh    Also try to load libmariadb
 20261026   mmd    FetchError/FetchEnded set by NextRecord (sqlite, MySQL/MariaDB, PostgreSQL, ODBC):
                   a fetch error is told from the end of the rows; return values unchanged
+20261027   mmd    dbase open error: errno read directly; no #define _errno errno (with the Microsoft
+                  CRT and mingw-w64 errno is (*_errno()), the macro broke every later errno)
 */
 
 /*
@@ -318,9 +320,6 @@ TcpTimedWaitDelay = 30
 #   		define _LK_NBLCK LK_NBLCK
 #   		define _LK_UNLCK LK_UNLCK
 # 	endif
-#	if !defined(_errno)
-# 		define _errno errno
-#	endif
 
 #	define open_retry_count 4
 #	define open_retry_delay 50
@@ -725,7 +724,7 @@ int dbase_open(char *filename, struct dbase_header **th)
   }
 
   if (h == -1)
-  { switch (_errno)                     /* return failure */
+  { switch (errno)                      /* return failure */
     { case ENOENT : return -ER_NOSUCHFILE;
       case EMFILE : return -ER_TOOMANYFILES;
       case EACCES : return -ER_NOACCESS;

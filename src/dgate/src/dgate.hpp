@@ -212,6 +212,15 @@ BOOL	GetACRNema(char *, char *, char *, char*);
 BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// TLS for nodes with T in acrnema.map
 BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE);	// from an entry, pin of called AE
 BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char *compress);	// one lookup: address + transport
+// converter forwards: destination resolved without touching the (shared) PDU; the transport is
+// set on the PDU with ForwardApplyTLS under the PDU's lock, right before Connect
+typedef	struct	_ForwardTarget
+	{
+	int	Mode;		// 0 plain, 1 TLS, 2 TLS with the legacy profile
+	char	CertAE[20];	// AE whose line in TLSNodeCertsFile binds the peer certificate
+	}	ForwardTarget;
+BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarget *T);
+BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T);
 BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE);	// incoming: calling AE against plain/TLS transport
 void	StartTLSNodeCerts(void);	// load TLSNodeCertsFile at server start (nothing when not set)
 BOOL	ReadTLSNodeCerts(void);	// server command read_tlscerts:

@@ -183,7 +183,7 @@ default, with a console warning (printed only while the feature is on).
 | `OutgoingSCResendDelay` | `300` | 0.. | delay before a re-send; after failed re-sends it doubles up to the last `OutgoingSCRetryInterval` value |
 | `SCUnsafeFile` | `sc_unsafe.flag` | name | sentinel file (3.6); a name without a path is in the dgate directory |
 | `OutgoingSCVerifyMax` | `4` | 1..64 | concurrent `sc_verify_now` verifications; one more answers `0 busy` |
-| `OutgoingSCConnectTimeout` | `30` | 1..`TCPIPTimeOut` | worker only (N-ACTION requests and re-sends): TCP connect, TLS handshake and association setup end within it; a default above `TCPIPTimeOut` is lowered to it. All other connections keep `TCPIPTimeOut`. |
+| `OutgoingSCConnectTimeout` | `30` | 1..`TCPIPTimeOut` | worker only (N-ACTION requests and re-sends): one deadline from the start of the connect; TCP connect, TLS handshake and association setup (A-ASSOCIATE-RQ, A-ASSOCIATE-AC read) together end within it; a default above `TCPIPTimeOut` is lowered to it. All other connections keep `TCPIPTimeOut`. |
 
 In `[lua]`:
 
@@ -231,7 +231,11 @@ objects end in TIMEOUT and raise an alarm.
 
    **Time limits of the worker's own connections.** The request and re-send connections end their
    TCP connect, TLS handshake and association setup within `OutgoingSCConnectTimeout` (also for
-   plain sockets; other dgate connections are unchanged). Their release waits at most
+   plain sockets; other dgate connections are unchanged). It is one absolute deadline from the
+   start of the connect, not a limit per step or per read: every wait is cut to it, and once it has
+   passed every read and write of that connection fails at once, so a destination that accepts the
+   TCP connection but never sends A-ASSOCIATE-AC, or sends it byte by byte, is cut off at the
+   deadline. Their release waits at most
    `OutgoingSCSameAssocWait` seconds, clamped to 2..10 s, for A-RELEASE-RP; without a reply the
    association is aborted (`*** Storage commitment: no release reply from <AE> within <n> s
    (<association>): association aborted`). A destination that could not be reached in a pass

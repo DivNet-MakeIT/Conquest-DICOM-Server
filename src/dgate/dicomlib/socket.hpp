@@ -10,6 +10,7 @@
 // 20261026 mmd     TLSMode 2 (legacy profile) and the ClientContextLegacy hook
 // 20261026 mmd     TLSAccept with the legacy server context (ServerContextLegacy hook)
 // 20261026 mmd     ConnectTimeOut / ConnectTimedOut (connect time limit, 0 = as before)
+// 20261027 mmd     Deadline (absolute end of connect, handshake, reads and writes; 0 = none)
 
 /****************************************************************************
           Copyright (C) 1995, University of California, Davis
@@ -93,6 +94,13 @@ class	Socket
 		// ran out (a node that does not answer).
 		int	ConnectTimeOut;
 		BOOL	ConnectTimedOut;
+		// Overall deadline (20261027 mmd). 0 (the default) = none, as before. Otherwise an
+		// absolute time (seconds, time()): the connect attempts of Open, the TLS handshake and
+		// every read and write end by then, and once it has passed every read and write fails at
+		// once (so a peer that sends a message slowly, byte by byte, cannot hold a reader that
+		// ignores single failed reads). Set only by the outgoing storage commitment code around a
+		// connect and its association setup.
+		long	Deadline;
 		
 		// UDP Extensions
 		BOOL	BindUDPServer(char *port);

@@ -964,4 +964,16 @@ containers. Every commit keeps the compile warning count at the baseline.
 - `53e6874` Outgoing storage commitment: check again after step 7; sc_verify_and_delete: with local writes excluded
 - `0bfb7b5` Outgoing storage commitment: file stamp v2 with the change time
 - `cfa5d22` Outgoing storage commitment: one deadline for the worker's connect and association setup
-- this commit: Outgoing storage commitment: sc_verify_now: keeps its timeout when the archive stops answering
+- `0d290fe` Outgoing storage commitment: sc_verify_now: keeps its timeout when the archive stops answering
+
+**TLS and converter forward fixes**
+- `fb167a9` Converter forwards: resolve the destination locally, set TLS under the PDU lock
+- `cb8c648` Converter forwards: do not reuse a kept association that no longer matches the map
+- `8b385ab` Converter forwards with dest: TLS and certificate from the called AE too
+- `15552bd` TLS: refuse every TLS association while TLSNodeCertsFile is set but not loaded
+- `c7f128d` TLS: no @ directives in TLSCipherList, strict contexts keep the default security level
+- `bbffdce` TLS: no session resumption on any context; a resumed session is refused
+- `af58520` TLS: no renegotiation on any context
+- `db14544` Sockets: poll() for the TLS and bounded-connect waits, FD_SETSIZE guard
+- `9ecb6df` Outgoing storage commitment: bound the release and abort writes of the worker
+- this commit: Docs: commit map

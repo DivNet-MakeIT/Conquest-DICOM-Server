@@ -20,12 +20,14 @@
 --   dofile('lua/sc_delete_if_verified.lua')
 --   sc_delete_if_verified('PATID', '1.2.3.4', 'ARCHIVE')
 
+-- scverifyanddelete() verifies and deletes in one call: new local writes of the study wait while it is
+-- deleted, and nothing is deleted when one started during the verification (a separate scverifynow()
+-- followed by deletestudy: would delete an object stored in between without verifying it).
+-- patid is not needed any more (the study is deleted by its StudyInstanceUID); kept for callers.
 function sc_delete_if_verified(patid, study, ae, timeout)
-  -- verify immediately before deleting; delete only on true
-  local ok, why = scverifynow(study, ae, timeout or 120)
+  local ok, why = scverifyanddelete(study, ae, timeout or 120)
   if ok == true then
-    print('sc_delete_if_verified: archive ' .. ae .. ' committed study ' .. study .. ' now: deleting it locally')
-    servercommand('deletestudy:' .. patid .. ':' .. study)
+    print('sc_delete_if_verified: archive ' .. ae .. ' committed study ' .. study .. ' now: deleted locally')
     return true
   end
   print('sc_delete_if_verified: study ' .. study .. ' NOT deleted (' .. tostring(why) .. ')')

@@ -1449,6 +1449,13 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			is not on the read-only list: lua, call, save frame/image, the patient/study/... commands)
 			records no FileStamp; sc_verify_now: step 7 needs NoResend 0 on the COMMITTED row and answers
 			0 content transformed at send when the committed send may have had other content
+20261027	mmd	Outgoing storage commitment: sc_verify_now: checks the local side again after step 7 (step 8,
+			as step 6: writes, objects, fingerprints, registered changes). sc_verify_and_delete:<StudyUID>,
+			<AE>[,<timeout>] and Lua scverifyanddelete(): verify, then delete the study locally
+			(DeleteStudy) only when no local write of the study started since before the verification;
+			writes of the study that start during the delete wait for it (at most 60 s); a write whose
+			SOP instance UID cannot be tracked (missing, longer than 64) counts as a write of every study
+			for the deletes. Test-only keys SCTestDelayVerifyStep, SCTestDelayBeforeDelete
 
 ENDOFUPDATEHISTORY
 */
@@ -1640,6 +1647,8 @@ int	SCTestFailDemote=0;				// TEST ONLY: 1 = the invalidation after a local over
 int	SCTestFailFetch=0;				// TEST ONLY: 1 = reconciliation, sc_unsafe_clear: and sc_verify_now: see a fetch error
 int	SCTestDelayBeforeRecord=0;			// TEST ONLY: ms the worker waits between taking noted sends and recording them (0 = none)
 int	SCTestNoFileStamp=0;				// TEST ONLY: 1 = no file has a file stamp (as on a system without nanosecond times)
+int	SCTestDelayVerifyStep=0;			// TEST ONLY: ms sc_verify_now: waits after step 7, before its last check (0 = none)
+int	SCTestDelayBeforeDelete=0;			// TEST ONLY: ms sc_verify_and_delete: waits before the delete, writes blocked (0 = none)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -7526,12 +7535,15 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
     return 1;
   }
   int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size);
+  int SCVerifyAndDelete(const char *StudyUID, const char *AE, int timeout, char *reason, int size);
   int SCVerifyInServer(void);
 
   // scverifynow(studyuid, ae [, timeout]): true when the archive committed every local object of the
   // study in this call (sc_verify_now:), else false and the reason. Outside the server process
   // (e.g. dgate --dolua:) it is asked of the server, where results on new associations arrive.
-  static int luascverifynow(lua_State *L)
+  // scverifyanddelete(studyuid, ae [, timeout]): the same, then the study is deleted locally
+  // (sc_verify_and_delete:): true only when it was verified and deleted.
+  static int luascverify(lua_State *L, BOOL del)
   { int n = lua_gettop(L), t = 60, r;
     char reason[256];
     if (n<2 || !lua_isstring(L, 1) || !lua_isstring(L, 2) || (n>2 && !lua_isnumber(L, 3)) ||
@@ -7542,11 +7554,12 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
     }
     if (n>2) t = (int)lua_tointeger(L, 3);
     if (SCVerifyInServer())
-      r = SCVerifyNow(lua_tostring(L, 1), lua_tostring(L, 2), t, reason, sizeof(reason));
+      r = del ? SCVerifyAndDelete(lua_tostring(L, 1), lua_tostring(L, 2), t, reason, sizeof(reason))
+              : SCVerifyNow(lua_tostring(L, 1), lua_tostring(L, 2), t, reason, sizeof(reason));
     else
     { char cmd[256], buf[1024];
       int len;
-      sprintf(cmd, "sc_verify_now:%s,%s,%d", lua_tostring(L, 1), lua_tostring(L, 2), t);
+      sprintf(cmd, "%s:%s,%s,%d", del ? "sc_verify_and_delete" : "sc_verify_now", lua_tostring(L, 1), lua_tostring(L, 2), t);
       buf[0] = 0;
       SendServerCommand("", cmd, 0, buf, FALSE, FALSE, NULL);
       len = strlen(buf);
@@ -7561,6 +7574,8 @@ static ExtendedPDU_Service ScriptForwardPDU[1][MAXExportConverters];	// max 20*2
     lua_pushstring(L, reason);
     return 2;
   }
+  static int luascverifynow(lua_State *L)     { return luascverify(L, FALSE); }
+  static int luascverifyanddelete(lua_State *L) { return luascverify(L, TRUE); }
   static int luaget_amap(lua_State *L)
   { int r = lua_tointeger(L, 1);
     ACRNemaAddress	AAEntry, *AAPtr = &AAEntry;
@@ -9911,6 +9926,7 @@ const char *do_lua(lua_State **L, char *cmd, struct scriptdata *sd)
     lua_register      (*L, "get_amap",      luaget_amap);
     lua_register      (*L, "scconfirmed",   luascconfirmed);
     lua_register      (*L, "scverifynow",   luascverifynow);
+    lua_register      (*L, "scverifyanddelete", luascverifyanddelete);
     lua_register      (*L, "get_sqldef",    luaget_sqldef);
     lua_register      (*L, "dbquery",       luadbquery);
     lua_register      (*L, "sql",           luasql);
@@ -24621,6 +24637,38 @@ static unsigned int	SCChangeSeq = 0;		// number of changes so far (= sequence of
 struct SCWriting { char inst[65]; char study[65]; int used; int relevant; };
 static SCWriting	SCWrites[SC_WRITEMAX];
 static int		SCWritesUnknown = 0;		// writes in progress without a slot
+static int		SCWritesUntracked = 0;		// writes in progress whose SOP instance UID cannot be tracked (-3)
+
+// Verified deletes (sc_verify_and_delete:, Lua scverifyanddelete): one guard per delete, set before
+// the verification reads the study and removed when the delete is done. Every local write that
+// starts (SCWriteBegin) counts on the guards of its study ("seen"; a write whose study is not known
+// counts on every guard). The delete only starts when no write of the study started since the guard
+// was set and none is in progress; from then on the guard blocks: a write of the study that starts
+// waits in SCWriteBegin until the delete is done, at most SC_DELWAITMAX seconds (then it goes on,
+// counts as "raced", and the delete answers 0 with an alarm). All under SCNotedCritical.
+#define SC_DELGUARDMAX	64
+#define SC_DELWAITMAX	60
+struct SCDelGuard { int used; int block; unsigned int seen; unsigned int raced; char study[65]; };
+static SCDelGuard	SCDelGuards[SC_DELGUARDMAX];
+
+// under SCNotedCritical: does a delete in progress block a write of study ("" = not known: any)?
+static BOOL SCDelBlocking(const char *study)
+	{
+	for (int i=0; i<SC_DELGUARDMAX; i++)
+		if (SCDelGuards[i].used && SCDelGuards[i].block && (!study[0] || strcmp(SCDelGuards[i].study, study)==0)) return TRUE;
+	return FALSE;
+	}
+
+// under SCNotedCritical: a write of study ("" = not known) starts
+static void SCDelNoteWrite(const char *study)
+	{
+	for (int i=0; i<SC_DELGUARDMAX; i++)
+		if (SCDelGuards[i].used && (!study[0] || strcmp(SCDelGuards[i].study, study)==0))
+			{
+			SCDelGuards[i].seen++;
+			if (SCDelGuards[i].block) SCDelGuards[i].raced++;
+			}
+	}
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // Commitment unsafe: a durable sentinel file (dicom.ini SCUnsafeFile, default sc_unsafe.flag in
@@ -24854,13 +24902,39 @@ static BOOL SCWriteInProgressLocked(const char *inst)
 	}
 
 // a write of inst starts; returns its slot, -1 when no slot was free (counted as unknown), -2 when
-// nothing is tracked (outgoing storage commitment off, or not a usable UID). study: its study
-// ("" or NULL when not known: then sc_verify_now: counts it as a write of every study)
+// nothing is tracked (outgoing storage commitment off), -3 for a write whose SOP instance UID cannot
+// be tracked (missing or longer than 64): it is not a write mark of any object, but for the verified
+// deletes it counts as a write of every study (it waits while one deletes, and no delete starts while
+// it is in progress; SCWritesUntracked until SCWriteEnd). study: its study ("" or NULL when not
+// known: then sc_verify_now: counts it as a write of every study). While a verified delete of the
+// study is deleting (sc_verify_and_delete:), the write waits for it first.
 int SCWriteBegin(const char *inst, const char *study)
 	{
-	int i, r = -1;
-	if (!OutgoingStorageCommitment || !inst || strlen(inst)>64) return -2;
-	EnterCriticalSection(&SCNotedCritical);
+	int i, r = -1, waited = 0;
+	char st[65];
+	time_t until = 0;
+	BOOL untracked;
+	if (!OutgoingStorageCommitment) return -2;
+	untracked = !inst || strlen(inst)>64;
+	st[0] = 0;
+	if (!untracked && study && strlen(study)<=64) { strcpy(st, study); SCTrim(st); }
+	for (;;)
+		{
+		EnterCriticalSection(&SCNotedCritical);	// held from the last check until the slot is taken
+		if (!SCDelBlocking(st) || (until && time(NULL) >= until)) break;
+		LeaveCriticalSection(&SCNotedCritical);
+		if (!until) until = time(NULL) + SC_DELWAITMAX;
+		waited = 1;
+		Sleep(50);
+		}
+	SCDelNoteWrite(st);
+	if (untracked)
+		{
+		SCWritesUntracked++;
+		LeaveCriticalSection(&SCNotedCritical);
+		if (waited) OperatorConsole.printf("Storage commitment: write of an object without a usable SOP instance UID waited for a verified delete\n");
+		return -3;
+		}
 	for (i=0; i<SC_WRITEMAX; i++)
 		if (!SCWrites[i].used)
 			{
@@ -24876,6 +24950,8 @@ int SCWriteBegin(const char *inst, const char *study)
 	if (r<0) SCWritesUnknown++;
 	SCInvalGen++;
 	LeaveCriticalSection(&SCNotedCritical);
+	if (waited)
+		OperatorConsole.printf("Storage commitment: write of %s (study %s) waited for the verified delete of its study\n", inst, st[0] ? st : "-");
 	return r;
 	}
 
@@ -25298,6 +25374,13 @@ void SCWriteEnd(Database *DB, int slot, const char *inst, BOOL written)
 	int relevant = 1;
 
 	if (slot==-2) return;
+	if (slot==-3)					// untracked (SCWriteBegin): only the counter
+		{
+		EnterCriticalSection(&SCNotedCritical);
+		if (SCWritesUntracked>0) SCWritesUntracked--;
+		LeaveCriticalSection(&SCNotedCritical);
+		return;
+		}
 	uid[0] = 0;
 	if (inst && strlen(inst)<=64) { strcpy(uid, inst); SCTrim(uid); }
 
@@ -25564,6 +25647,8 @@ void SCReadWorkerConfig(const char *root)
 	SCTestFailFetch         = SCIniInt(root, "SCTestFailFetch",         0,     0, 1);
 	SCTestDelayBeforeRecord = SCIniInt(root, "SCTestDelayBeforeRecord", 0,     0, 60000);
 	SCTestNoFileStamp       = SCIniInt(root, "SCTestNoFileStamp",       0,     0, 1);
+	SCTestDelayVerifyStep   = SCIniInt(root, "SCTestDelayVerifyStep",   0,     0, 60000);
+	SCTestDelayBeforeDelete = SCIniInt(root, "SCTestDelayBeforeDelete", 0,     0, 60000);
 	SCReadRetryInterval(root);
 	SCUnsafeFileConfig(root);
 	}
@@ -26585,14 +26670,16 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 //     stamp either): "0 content transformed at send"; otherwise "0 changed since send" (also when
 //     the file or the row has no stamp: a system without nanosecond times, a send path that
 //     records none, or the row was purged after OutgoingSCKeepDays). The archive confirms custody
-//     of UIDs, not content; this check only makes the answer stricter (1 -> 0, never 0 -> 1).
+//     of UIDs, not content; this check only makes the answer stricter (1 -> 0, never 0 -> 1);
+//  8. the checks of step 6 once more (writes during step 7), else "0 changed".
 // Nothing is written to SCObject, SCTransaction or SCTxMember, and the sentinel file is neither
 // read nor set. Any other doubt (database, connection, refusal of the request) answers 0 with a
 // reason. At most OutgoingSCVerifyMax (default 4) at a time ("0 busy"); timeout 1..600 s, default
 // 60. One console line per verification. What the archive confirms is its custody of these SOP
 // instance UIDs (PS3.4 annex J); content is not compared by the archive (step 7 compares the
 // local file with the one last sent and committed). An object of the study stored after the
-// answer is not covered: the caller deletes right after the answer (lua/sc_delete_if_verified.lua).
+// answer is not covered by sc_verify_now:; sc_verify_and_delete: (Lua scverifyanddelete) verifies
+// and deletes with the local writes of the study excluded (see SCVerifyDelete).
 //////////////////////////////////////////////////////////////////////////////////////////
 
 // one local object of the study and the fingerprint of its file
@@ -27016,17 +27103,40 @@ static const char *SCVerifyChunk(const char *ae, ACRNemaAddress *E, SCVerifyObj 
 	return NULL;
 	}
 
-// steps 1 to 6 (see part 2); NULL when the answer is 1, else the reason
+// steps 6 and 8: the local side again: no write of the study before or after the second read,
+// the same objects with the same fingerprints, no local change of them since seq0 (the start).
+// NULL when unchanged, else the reason.
+static const char *SCVerifyRecheck(const char *study, SCVerifyObj *o, int n, unsigned int seq0)
+	{
+	SCVerifyObj *o2 = NULL;
+	const char *why = NULL;
+	int n2, i;
+
+	if (SCVerifyWriting(study, o, n)) return "changed";
+	n2 = SCVerifyRead(study, &o2);
+	if (n2==SCV_DBERROR) return "database error";
+	if (n2!=n) why = "changed";
+	else
+		{
+		for (i=0; i<n && !why; i++) if (!SCVerifySame(o+i, o2+i)) why = "changed";
+		if (!why && SCVerifyWriting(study, o2, n2)) why = "changed";
+		for (i=0; i<n && !why; i++) if (SCChangedSince(o[i].inst, seq0)) why = "changed";
+		}
+	if (n2>0) SCVerifyFree(o2, n2);
+	return why;
+	}
+
+// steps 1 to 8 (see part 2); NULL when the answer is 1, else the reason
 static const char *SCVerifyRun(const char *study, const char *aearg, int timeout, int *nobj, char *fail,
 	int *chunks, char *txs, int txsize)
 	{
-	SCVerifyObj *o = NULL, *o2 = NULL;
+	SCVerifyObj *o = NULL;
 	ACRNemaAddress E;
 	char ae[20];
 	const char *why = NULL;
 	time_t deadline = time(NULL) + timeout;
 	unsigned int seq0 = SCSendSeq();		// local changes registered from now on
-	int n, n2 = 0, i, c;
+	int n, i, c;
 
 	*nobj = 0;
 	n = SCVerifyRead(study, &o);
@@ -27050,24 +27160,8 @@ static const char *SCVerifyRun(const char *study, const char *aearg, int timeout
 		why = SCVerifyChunk(ae, &E, o+c, n-c < OutgoingSCMaxBatch ? n-c : OutgoingSCMaxBatch, deadline, fail, txs, txsize-8);
 		}
 
-	if (!why)
-		{
-		// 6. the local side again: no write of the study before or after the second read, the
-		// same objects with the same fingerprints, no local change of them since the start
-		if (SCVerifyWriting(study, o, n)) why = "changed";
-		else
-			{
-			n2 = SCVerifyRead(study, &o2);
-			if (n2==SCV_DBERROR) why = "database error";
-			else if (n2!=n) why = "changed";
-			else
-				{
-				for (i=0; i<n && !why; i++) if (!SCVerifySame(o+i, o2+i)) why = "changed";
-				if (!why && SCVerifyWriting(study, o2, n2)) why = "changed";
-				for (i=0; i<n && !why; i++) if (SCChangedSince(o[i].inst, seq0)) why = "changed";
-				}
-			}
-		}
+	// 6. the local side again (the archive has answered)
+	if (!why) why = SCVerifyRecheck(study, o, n, seq0);
 	if (!why)
 		{
 		// 7. the local content (the files as read, unchanged until now) is the one last sent to
@@ -27077,9 +27171,99 @@ static const char *SCVerifyRun(const char *study, const char *aearg, int timeout
 		if (i<0)      why = "database error";
 		else if (i>0) why = transformed ? "content transformed at send" : "changed since send";
 		}
+	if (!why)
+		{
+		// 8. a write during step 7 (which reads the table, not the files): the checks of step 6 again
+		if (SCTestDelayVerifyStep>0) Sleep(SCTestDelayVerifyStep);	// test only
+		why = SCVerifyRecheck(study, o, n, seq0);
+		}
 	SCVerifyFree(o, n);
-	if (n2>0) SCVerifyFree(o2, n2);
 	return why;
+	}
+
+// under SCNotedCritical: a local write of study (or of an unknown or untracked object or study) in progress
+static BOOL SCStudyWritingLocked(const char *study)
+	{
+	if (SCWritesUnknown>0 || SCWritesUntracked>0) return TRUE;
+	for (int i=0; i<SC_WRITEMAX; i++)
+		if (SCWrites[i].used && (!SCWrites[i].study[0] || strcmp(SCWrites[i].study, study)==0)) return TRUE;
+	return FALSE;
+	}
+
+// a guard for a verified delete of study (see SCDelGuards); -1 when none is free
+static int SCDelGuardAdd(const char *study)
+	{
+	int g = -1;
+	EnterCriticalSection(&SCNotedCritical);
+	for (int i=0; i<SC_DELGUARDMAX; i++)
+		if (!SCDelGuards[i].used)
+			{
+			SCDelGuards[i].used = 1;
+			SCDelGuards[i].block = 0;
+			SCDelGuards[i].seen = SCDelGuards[i].raced = 0;
+			strcpy(SCDelGuards[i].study, study);
+			g = i;
+			break;
+			}
+	LeaveCriticalSection(&SCNotedCritical);
+	return g;
+	}
+
+static void SCDelGuardRemove(int g)
+	{
+	EnterCriticalSection(&SCNotedCritical);
+	SCDelGuards[g].used = SCDelGuards[g].block = 0;
+	LeaveCriticalSection(&SCNotedCritical);
+	}
+
+// The delete of a study that was just verified (sc_verify_and_delete:; guard g set before the
+// verification read the study). It starts only when no local write of the study started since then
+// and none is in progress (else "changed"); in the same locked step the guard starts to block, so a
+// write of the study that starts later waits until the delete is done. The study is deleted as
+// deletestudy: does (DeleteStudy: files and database records), then read again: no local object of
+// it may be left. NULL when deleted, else the reason (and an alarm line when the delete may be
+// incomplete). Residual: a change of a file that does not go through a local write (SaveToDisk),
+// e.g. on disk outside dgate, is only seen up to the last check of the verification.
+static const char *SCVerifyDelete(const char *study, const char *ae, int g, int nobj)
+	{
+	char id[80];
+	SCVerifyObj *o = NULL;
+	BOOL busy;
+	unsigned int raced;
+	int left;
+
+	EnterCriticalSection(&SCNotedCritical);
+	busy = SCDelGuards[g].seen>0 || SCStudyWritingLocked(study);
+	if (!busy) SCDelGuards[g].block = 1;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (busy)
+		{
+		OperatorConsole.printf("*** Storage commitment verify and delete: study %s, AE %s: a local write of the study started during the verification: not deleted\n", study, ae);
+		return "changed";
+		}
+	OperatorConsole.printf("Storage commitment verify and delete: study %s, AE %s: %d object(s) verified, deleting the study locally (its local writes wait)\n", study, ae, nobj);
+	if (SCTestDelayBeforeDelete>0) Sleep(SCTestDelayBeforeDelete);	// test only
+	strcpy(id, study);
+	DeleteStudy(id, FALSE, 0);
+	left = SCVerifyRead(study, &o);
+	if (left>0) SCVerifyFree(o, left);
+	EnterCriticalSection(&SCNotedCritical);
+	raced = SCDelGuards[g].raced;
+	LeaveCriticalSection(&SCNotedCritical);
+	if (raced)
+		{
+		OperatorConsole.printf("*** Storage commitment ALARM: verify and delete: study %s, AE %s: %u local write(s) of the study did not wait for the delete (limit %d s): check the study\n",
+			study, ae, raced, SC_DELWAITMAX);
+		return "write during delete";
+		}
+	if (left!=0)
+		{
+		if (left>0) OperatorConsole.printf("*** Storage commitment ALARM: verify and delete: study %s, AE %s: %d local object(s) left after the delete\n", study, ae, left);
+		else        OperatorConsole.printf("*** Storage commitment ALARM: verify and delete: study %s, AE %s: the study could not be read after the delete (objects may be left)\n", study, ae);
+		return "not deleted completely";
+		}
+	OperatorConsole.printf("Storage commitment verify and delete: study %s, AE %s: deleted locally (%d object(s))\n", study, ae, nobj);
+	return NULL;
 	}
 
 // milliseconds for durations in the log (wraps after 49 days; only differences are used)
@@ -27106,12 +27290,15 @@ int SCVerifyInServer(void)
 // Verify now: 1 when the archive committed every local object of the study in this call, else 0
 // with the reason in reason ("disabled", "busy", "empty", "writing", "not an SC node", "no result",
 // "failed <n>", "changed", "changed since send", "content transformed at send", "database error",
-// ...). timeout: 1..600 seconds.
-int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
+// ...). timeout: 1..600 seconds. del: then delete the study locally (SCVerifyDelete): 1 only when
+// it was verified and deleted ("write during delete", "not deleted completely": see there).
+static int SCVerifyNowEx(const char *StudyUID, const char *AE, int timeout, char *reason, int size, BOOL del)
 	{
 	char study[80], ae[80], fail[32], txs[1024];
 	const char *why = NULL;
-	int nobj = 0, chunks = 0;
+	const char *cmd = del ? "sc_verify_and_delete" : "sc_verify_now";
+	int nobj = 0, chunks = 0, g = -1;
+	BOOL slot = FALSE;
 	unsigned int t0 = SCNowMs(), ms;
 
 	txs[0] = 0;
@@ -27127,33 +27314,49 @@ int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason,
 	if (!SCIsUID(study) || !SCIsAE(ae) || timeout<1 || timeout>600)
 		{
 		snprintf(reason, size, "usage");
-		OperatorConsole.printf("*** Storage commitment verify: use sc_verify_now:StudyUID,AE[,timeout 1..600 s] (answer 0 usage)\n");
+		OperatorConsole.printf("*** Storage commitment verify: use %s:StudyUID,AE[,timeout 1..600 s] (answer 0 usage)\n", cmd);
 		return 0;
 		}
 
 	EnterCriticalSection(&SCVerifyCritical);
 	if (SCVerifyActive >= OutgoingSCVerifyMax) why = "busy";
-	else SCVerifyActive++;
+	else { SCVerifyActive++; slot = TRUE; }
 	LeaveCriticalSection(&SCVerifyCritical);
-	if (!why)
-		{
-		why = SCVerifyRun(study, ae, timeout, &nobj, fail, &chunks, txs, sizeof(txs));
-		EnterCriticalSection(&SCVerifyCritical);
-		SCVerifyActive--;
-		LeaveCriticalSection(&SCVerifyCritical);
-		}
+	if (!why && del && (g = SCDelGuardAdd(study))<0) why = "busy";	// before the study is read
+	if (!why) why = SCVerifyRun(study, ae, timeout, &nobj, fail, &chunks, txs, sizeof(txs));
 
-	if (why) snprintf(reason, size, "%s", why);
-	else     reason[0] = 0;
 	// one line per verification: study, AE, objects, chunks, TransactionUIDs, duration, result
 	ms = SCNowMs() - t0;
 	OperatorConsole.printf("Storage commitment verify: study %s, AE %s, %d object(s), %d chunk(s), transaction(s) %s, %u.%03u s: %s%s\n",
 		study, ae, nobj, chunks, txs[0] ? txs : "-", ms/1000, ms%1000, why ? "0 " : "1", why ? why : "");
+
+	if (!why && del) why = SCVerifyDelete(study, ae, g, nobj);
+	if (g>=0) SCDelGuardRemove(g);
+	if (slot)
+		{
+		EnterCriticalSection(&SCVerifyCritical);
+		SCVerifyActive--;
+		LeaveCriticalSection(&SCVerifyCritical);
+		}
+	if (why) snprintf(reason, size, "%s", why);
+	else     reason[0] = 0;
 	return why ? 0 : 1;
 	}
 
-// sc_verify_now:<StudyUID>,<AE>[,<timeout s>] -> "1" or "0 <reason>"
-static void SCVerifyNowCommand(char *args, char *Response)
+int SCVerifyNow(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
+	{
+	return SCVerifyNowEx(StudyUID, AE, timeout, reason, size, FALSE);
+	}
+
+// sc_verify_and_delete: / Lua scverifyanddelete: verify, then delete the study locally (1 = deleted)
+int SCVerifyAndDelete(const char *StudyUID, const char *AE, int timeout, char *reason, int size)
+	{
+	return SCVerifyNowEx(StudyUID, AE, timeout, reason, size, TRUE);
+	}
+
+// sc_verify_now:<StudyUID>,<AE>[,<timeout s>] -> "1" or "0 <reason>"; del: sc_verify_and_delete: (the
+// same arguments; "1" = verified and deleted locally)
+static void SCVerifyNowCommand(char *args, char *Response, BOOL del)
 	{
 	char *items[4], reason[128], *c;
 	int n, t = 60;
@@ -27171,7 +27374,7 @@ static void SCVerifyNowCommand(char *args, char *Response)
 		t = (*c || !items[2][0] || strlen(items[2])>4) ? 0 : atoi(items[2]);
 		}
 	if (n<2 || n>3) t = 0;
-	if (SCVerifyNow(n>=1 ? items[0] : "", n>=2 ? items[1] : "", t, reason, sizeof(reason))==1)
+	if (SCVerifyNowEx(n>=1 ? items[0] : "", n>=2 ? items[1] : "", t, reason, sizeof(reason), del)==1)
 		strcpy(Response, "1");
 	else
 		sprintf(Response, "0 %s", reason);
@@ -30037,7 +30240,15 @@ BOOL ServerTask(char *SilentText, ExtendedPDU_Service &PDU, DICOMCommandObject &
 	if (memcmp(SilentText, "sc_verify_now:", 14)==0)
 		{
                 if (!checkaccess(ca_script, ConnectedIP)) return false;
-		SCVerifyNowCommand(SilentText+14, Response);
+		SCVerifyNowCommand(SilentText+14, Response, FALSE);
+		return true;
+		}
+
+	// outgoing storage commitment: verify, then delete the study locally ("1" or "0 <reason>")
+	if (memcmp(SilentText, "sc_verify_and_delete:", 21)==0)
+		{
+                if (!checkaccess(ca_script, ConnectedIP)) return false;
+		SCVerifyNowCommand(SilentText+21, Response, TRUE);
 		return true;
 		}
 

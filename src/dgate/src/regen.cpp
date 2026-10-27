@@ -56,6 +56,13 @@ mvh 20120630: Regen now allows files without 3 letter extension
 mvh 20201224: Added regen and regenFail converter
 mvh 20220206: Allow regen of selected folders/files (pass own * wildcards to RegenDir)
 mvh 20250718: Added TestDICOM to avoid loading loads of invalid files
+mmd 20261026: Regen passes rebuild the database record only (SaveToDataBaseEx Rebuild): outgoing storage
+	      commitment rows are not invalidated; RegenFile (one file named by the operator) still invalidates
+mmd 20261027: Outgoing storage commitment: the record is entered under an admission of its study
+	      (SCStudyHoldBegin): refused while a verified delete of the study still runs after
+	      OutgoingSCDeleteWriteWait, skipped when the file was removed after it was read
+mmd 20261027: Outgoing storage commitment: the study of the file before the import converter (2500) is
+	      admitted too when the converter changed the StudyInstanceUID of the record
 */
 
 // #define MULTITHREAD
@@ -119,9 +126,23 @@ TestDICOM(char *Path)
 // This routine checks the file extension and only accepts v2=raw, dcm/img=chapter 10 (or other)
 
 extern "C" void lua_setvar(ExtendedPDU_Service *pdu, char *name, char *value);
+extern int OutgoingStorageCommitment;
+int  SCStudyHoldBegin(const char *study, const char *what);
+void SCStudyHoldEnd(int slot);
 
+// outgoing storage commitment: the StudyInstanceUID of pDDO into study (68 bytes; "" if none)
+static void RegenStudyOf(DICOMDataObject *pDDO, char *study)
+	{
+	VR *vr = pDDO->GetVR(0x0020, 0x000d);
+	study[0] = 0;
+	if (vr && vr->Data && vr->Length>0 && vr->Length<68)
+		{ memcpy(study, vr->Data, vr->Length); study[vr->Length] = 0; }
+	}
+
+// Rebuild: TRUE for a regen pass over the archive (metadata only, the file did not change);
+// FALSE for RegenFile, where the operator may have put a new file in place
 BOOL
-RegenToDatabase(Database *DB, char *basename, char *filename, const char *device)
+RegenToDatabase(Database *DB, char *basename, char *filename, const char *device, BOOL Rebuild=FALSE)
 	{
 	DICOMDataObject*	pDDO;
 	int			len;
@@ -164,16 +185,65 @@ RegenToDatabase(Database *DB, char *basename, char *filename, const char *device
 	else
 		return FALSE;
 
+	// outgoing storage commitment: the study of the file as read, before the import converter (which
+	// may change the StudyInstanceUID of the record; the file keeps it)
+	char scFileStudy[68];
+	scFileStudy[0] = 0;
+	if (OutgoingStorageCommitment) RegenStudyOf(pDDO, scFileStudy);
+
 	lua_setvar(&PDU, "Filename", filename);
 	int rc = CallImportConverterN(NULL, pDDO, 2500, NULL, NULL, NULL, NULL, &PDU, NULL, NULL);
         if (rc==2) return ( FALSE );
 
-	if(!SaveToDataBase(*DB, pDDO, basename, device, FALSE))
+	// outgoing storage commitment: the record is entered under an admission of the study of the file
+	// and of the study of the record (when the import converter changed it), so no verified delete of
+	// either runs meanwhile. Refused while one still runs after OutgoingSCDeleteWriteWait (*** line);
+	// skipped when the file is gone once admitted (a verified delete removed it after it was read
+	// here): no record for a deleted file
+	int scHold = -2, scHold2 = -2;
+	if (OutgoingStorageCommitment)
 		{
+		char study[68], what[1200];
+		RegenStudyOf(pDDO, study);
+		snprintf(what, sizeof(what), "regen of %s (record not entered)", filename);
+		scHold = SCStudyHoldBegin(scFileStudy, what);
+		if (scHold==-4)
+			{
+			delete pDDO;
+			return ( FALSE );
+			}
+		if (strcmp(study, scFileStudy)!=0)
+			{
+			scHold2 = SCStudyHoldBegin(study, what);
+			if (scHold2==-4)
+				{
+				SCStudyHoldEnd(scHold);
+				delete pDDO;
+				return ( FALSE );
+				}
+			}
+		FILE *f = fopen(filename, "rb");
+		if (f) fclose(f);
+		else
+			{
+			SCStudyHoldEnd(scHold2);
+			SCStudyHoldEnd(scHold);
+			delete pDDO;
+			OperatorConsole.printf("***[Regen] %s -SKIPPED: the file was removed (verified delete) after it was read: record not entered\n", filename);
+			return ( FALSE );
+			}
+		}
+
+	if(!SaveToDataBaseEx(*DB, pDDO, basename, device, FALSE, Rebuild))
+		{
+		SCStudyHoldEnd(scHold2);
+		SCStudyHoldEnd(scHold);
 		delete pDDO;
 		OperatorConsole.printf("***[Regen] %s -FAILED: Error SQL Add\n", filename);
 		return ( FALSE );
 		}
+	SCStudyHoldEnd(scHold2);
+	SCStudyHoldEnd(scHold);
 	delete pDDO;
 	OperatorConsole.printf("[Regen] %s -SUCCESS\n", filename);
 	return ( TRUE );
@@ -280,7 +350,7 @@ BOOL RegenDir(Database *DB, char *PathString, const char *Device)
 
 			strcat(TempPath, FileData.cFileName);
 
-			RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device);
+			RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device, TRUE);
 			}
 			
 		if(!FindNextFile(fdHandle, &FileData))
@@ -343,7 +413,7 @@ BOOL RegenDir(Database *DB, char *PathString, const char *Device)
 				}
 			else
 				{
-				RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device);
+				RegenToDatabase (DB, TempPath + strlen(Physical), TempPath, Device, TRUE);
 				}
 			}
 		else
@@ -767,7 +837,7 @@ static Database *DBs[NTHREADS];
 static void regenprocess(char *data)
 { Database *DB;
   memcpy(&DB, data, sizeof(Database *));
-  RegenToDatabase(DB, data+128, data+256, data+32);
+  RegenToDatabase(DB, data+128, data+256, data+32, TRUE);
 }
 
 static void regen_queue(char *basename, char *filename, char *device)

@@ -470,6 +470,49 @@ StandardRetrieveNKI::StandardRetrieveNKI()
 void
 IARQ (AAssociateRQ	&ARQ, BOOL showall);
 
+// outgoing storage commitment (dgate.cpp): note objects sent by C-MOVE
+extern	int	OutgoingStorageCommitment;
+void	SCNoteSent(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID);
+void	SCNoteSentEx(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer);
+void	SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+unsigned int	SCSendSeq(void);
+extern int	SCTestDelayAfterRead;
+void	SCTestSleep(int ms);
+unsigned int	SCRetrieveSeq(void *ExtraBytes, unsigned int fallback);
+void	SCNoteSentRetrieve(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, void *ExtraBytes, unsigned int fallback);
+void	SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
+int	SCModeMayDiffer(const char *mode);
+void	SCCaptureUIDs(DICOMDataObject *DDO, char *cls, char *inst, char *study);
+
+// A QualifyOn of a retrieve class must fill QualifiedEntry (every class in dgate.cpp
+// does). One that does not (a class added later) leaves the transport unknown, and
+// it is never taken from a second map lookup: that lookup could see another map
+// version than the address did, and a T node could get plain text. The move then
+// goes on plain only when the destination's entry in the map now is a plain one with
+// the very address QualifyOn returned; a T node, an entry that is gone or that has
+// another address is refused (fail closed) with a console line.
+static	BOOL	QualifiedEntryPlainOnly(ACRNemaAddress *Q, char *AE, const char *ip, const char *port)
+	{
+	ACRNemaAddress	E;
+	const char	*why = NULL;
+
+	if (!GetACRNemaEntryByAE(AE, &E))
+		why = "it is not in acrnema.map now";
+	else if (E.Flags & ACR_TLS)
+		why = "it has T in acrnema.map";
+	else if (strcmp(E.IP, ip) || strcmp(E.Port, port))
+		why = "its acrnema.map entry changed";
+	if (why)
+		{
+		OperatorConsole.printf("*** C-MOVE to %s refused: the retrieve class did not give the acrnema.map entry of the destination (QualifyOn), and %s\n", AE, why);
+		return FALSE;
+		}
+	*Q = E;
+	memset(Q->Name, 0, sizeof(Q->Name));
+	strncpy(Q->Name, AE, sizeof(Q->Name)-1);
+	return TRUE;
+	}
+
 BOOL	StandardRetrieveNKI	::	Read (
 	ExtendedPDU_Service		*PDU,
 	DICOMCommandObject		*DCO,
@@ -495,6 +538,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 	char		Called[20], Calling[20];
 	BOOL		StripGroup2, Cancelled;
 	int             splitinto=1, splitselect=0;
+	unsigned int	scSeq = OutgoingStorageCommitment ? SCSendSeq() : 0;	// outgoing SC: before any object is read
+									// (fallback; per object: SCRetrieveSeq)
 
 	GetUID(MyUID);
 
@@ -620,10 +665,17 @@ BOOL	StandardRetrieveNKI	::	Read (
 		if(ACRNema[vr->Length-1]==' ')
 			ACRNema[vr->Length-1] = '\0';
 
+		memset(&QualifiedEntry, 0, sizeof(QualifiedEntry));
 		if(!QualifyOn(ACRNema, MyACR, IP, lPort, Compress))
 			{
 			CMoveRSP :: Write (PDU, DCO, 0xc003, 0, 0, 0, 0, NULL );
 			SystemDebug.printf("Retrieve: move destination not allowed or known\n: %s", ACRNema);
+			return ( TRUE );
+			}
+		if (!QualifiedEntry.Name[0] &&
+		    !QualifiedEntryPlainOnly(&QualifiedEntry, (char *)ACRNema, (char *)IP, (char *)lPort))
+			{
+			CMoveRSP :: Write (PDU, DCO, 0xc003, 0, 0, 0, 0, NULL );
 			return ( TRUE );
 			}
 		}
@@ -730,6 +782,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 		NewPDU.SetTimeOut(TCPIPTimeOut);
 
+		// transport from the same lookup as IP/lPort (always filled, see above)
+		SCPrepareTLSForCalledAE(NewPDU, QualifiedEntry, QualifiedEntry.Name);
 		if (!NewPDU.Connect (IP, lPort))
 			{
 			CMoveRSP :: Write ( PDU, DCO, 0xc005 , 0, 0, 0, 0, NULL );
@@ -796,13 +850,41 @@ BOOL	StandardRetrieveNKI	::	Read (
 
 			StripGroup2 = memicmp(AcceptedCompress, "as", 2)!=0 && memicmp(AcceptedCompress, "is", 2)!=0;
 
+			// outgoing storage commitment: a script applied to the sent copy only means the
+			// sent object may differ from the archive copy: never re-sent automatically.
+			// Likewise the per-object processing of ProcessDDO (scrub 9999,0202, downsizing
+			// 9999,0200, frame extraction 9999,0201, RetrieveResultConverter0) and a compression
+			// that may change the pixel data (checked below with the mode actually used)
+			int scDiffer = 0;
+			if (OutgoingStorageCommitment && !cget)
+				{
+				char rc[64], root[64];
+				rc[0] = 0;	// RetrieveConverter0 in [lua] or in the main section
+				MyGetPrivateProfileString("lua", "RetrieveConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (!rc[0] && MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, root, 64, ConfigFile))
+					MyGetPrivateProfileString(root, "RetrieveConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (rc[0]) scDiffer = 1;
+				rc[0] = 0;	// RetrieveResultConverter0 (run per object in ProcessDDO)
+				MyGetPrivateProfileString("lua", "RetrieveResultConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (!rc[0] && MyGetPrivateProfileString(RootConfig, "MicroPACS", RootConfig, root, 64, ConfigFile))
+					MyGetPrivateProfileString(root, "RetrieveResultConverter0", "", rc, sizeof(rc), ConfigFile);
+				if (rc[0]) scDiffer = 1;
+				if (DCO && (DCO->GetVR(0x9999, 0x0200) || DCO->GetVR(0x9999, 0x0201) || DCO->GetVR(0x9999, 0x0202)))
+					scDiffer = 1;
+				}
+
 			if ( !RetrieveOn (ADDO.Get(Index), &iDDO, &SStorage, DCO, &ADDO, ExtraBytes))
 				++Failed;
 			else
 				{
+				// test only (default 0): widen the window between reading the object and its send
+				if (OutgoingStorageCommitment && SCTestDelayAfterRead>0 && !cget) SCTestSleep(SCTestDelayAfterRead);
 				// non NKI client
 			        if (DCO==NULL)
+					{
 					recompress(&iDDO, AcceptedCompress, "", StripGroup2, PDU);
+					if (SCModeMayDiffer(AcceptedCompress)) scDiffer = 1;
+					}
 
 				// NKI client has 2 vr's to control (re)compression
 				// 9999,0600=MaxSupportedCompression (old, nki only)
@@ -841,13 +923,23 @@ BOOL	StandardRetrieveNKI	::	Read (
 							mode[1] = MaxCompression + '0';
 
 					recompress(&iDDO, mode, "", StripGroup2, PDU);
+					if (SCModeMayDiffer(mode)) scDiffer = 1;	// e.g. lossy 9999,0700 or ~j5 override
 					if (script[0])
+						{
 						CallImportConverterN(DCO, iDDO, -1, NULL, NULL, NULL, NULL, PDU, NULL, script);
+						scDiffer = 1;
+						}
 					}
 
 // test code to simulate crash in c-move when canceled 20171009
 //if (Index==100) 
 //{ UsedPDU->Link.Close();return (FALSE);}
+
+				// outgoing storage commitment: C-MOVE only (C-GET sends back on the
+				// requesting association); UIDs as sent, Write empties the object
+				char scCls[68], scInst[68], scStudy[68];
+				int scOn = OutgoingStorageCommitment && !cget;
+				if (scOn) SCCaptureUIDs(iDDO, scCls, scInst, scStudy);
 
 				if(!SStorage->Write(UsedPDU, iDDO, DCO->GetVR(0x0000, 0x0110), (unsigned char *)Calling))
 					{
@@ -867,6 +959,8 @@ BOOL	StandardRetrieveNKI	::	Read (
 					delete iDDO;
 					break;
 					}
+				// send sequence of this object: taken just before it was read (read-ahead or direct)
+				if (scOn) SCNoteSentRetrieve(UsedPDU, scCls, scInst, scStudy, scDiffer, ExtraBytes, scSeq);	// move destination, address from QualifyOn; sequence and file stamp of this object
 				delete iDDO;
 				}
 			}

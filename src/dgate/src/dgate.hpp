@@ -100,7 +100,20 @@ typedef	struct	_ACRNemaAddress
 		char	IP[128];
 		char	Port[64];
 		char	Compress[32];
+		char	Options[128];	// text after the compression column, kept as read (may be empty)
+		int	Flags;		// ACR_* bits from the first token of Options
+		int	ResendLimit;	// R option: ACR_RESEND_INI, n (1..999) or ACR_RESEND_ALWAYS
 	}	ACRNemaAddress;
+
+// options in the 5th column of acrnema.map (T, L, SC, R, Rn, RI); none = as before.
+// T and L mark a node that needs DICOM TLS: this variant has no TLS and refuses every
+// association to such a node (never plain); they are kept so that the map is not changed.
+#define	ACR_TLS			1
+#define	ACR_SC			2
+#define	ACR_RESEND		4
+#define	ACR_TLSLEGACY		8	// L (only with T): legacy TLS profile (refused as T in this variant)
+#define	ACR_RESEND_INI		-1	// R without number: limit from dicom.ini
+#define	ACR_RESEND_ALWAYS	0x7fffffff	// RI: until committed
 
 enum
 	{
@@ -188,7 +201,28 @@ BOOL	GetFileName(VR	*, char *, char *, BOOL UpdateLRU = TRUE, char *patid=NULL, 
 BOOL	GetFileName(VR	*, char *, char *, Database &, BOOL UpdateLRU = TRUE, char *patid=NULL, char *study=NULL, char *series=NULL);
 BOOL	InitACRNemaAddressArray();
 BOOL	CloseACRNemaAddressArray();
+UINT	GetACRNemaCount(void);
+BOOL	GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry);
+BOOL	PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress, const char *Options=NULL);
+BOOL	GetACRNemaEntryByAE(char *ACRNema, ACRNemaAddress *Entry);
+int	ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn);
+void	FormatACRNemaOptions(const ACRNemaAddress *Entry, char *out, int outlen);	// 5th column for write_amap
+BOOL	DeleteACRNemaEntry(UINT Index);
 BOOL	GetACRNema(char *, char *, char *, char*);
+BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E);	// nodes with T in acrnema.map: refused (no TLS)
+BOOL	SCPrepareTLSForCalledAE(PDU_Service &PDU, ACRNemaAddress &E, const char *AE);	// the same, for the called AE
+BOOL	GetACRNemaForConnect(PDU_Service &PDU, char *AE, char *ip, char *port, char *compress);	// one lookup: address + transport
+// converter forwards: destination resolved without touching the (shared) PDU; the transport is
+// set on the PDU with ForwardApplyTLS under the PDU's lock, right before Connect (a node that
+// needs DICOM TLS is refused: this variant has no TLS)
+typedef	struct	_ForwardTarget
+	{
+	int	Mode;		// 0 plain, 1 or 2: the node needs TLS (T, TL in acrnema.map): refused
+	char	AE[20];		// with Mode: the AE that has T (dest when it has T, else to), for the console
+	}	ForwardTarget;
+BOOL	ForwardResolve(char *to, char *dest, char *ip, char *port, char *compress, ForwardTarget *T);
+BOOL	ForwardApplyTLS(PDU_Service &PDU, ForwardTarget *T);
+BOOL	ForwardReuseMismatch(PDU_Service &PDU, const char *ip, const char *port, const char *called, ForwardTarget *T, const char **why);
 BOOL	RemoveFromWorld(DICOMDataObject *, Database &);
 BOOL	RemoveFromPACS(DICOMDataObject *, BOOL KeepImages = FALSE);
 BOOL	BuildColumnString(DBENTRY	*DBE, char	*TableName, VR	*vr,	char	*TempString);

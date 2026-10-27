@@ -23,6 +23,23 @@
 // 20110407	mvh	Extended FlushPrivateProfileStringCache to reset timestamp
 //			Fixed that was reading beyond current section
 // 20191019	mvh     Attemp to fix buffer overrun when reading long entries
+// 20261026	mmd	Cache: a hit is copied with the caller's buffer length (cut and the same
+//			'trucated' line as a file read, instead of an unbounded strcpy) and inside
+//			the cache lock; a section, key or value that does not fit the cache arrays
+//			(64/64/1024) or a value cut to the caller's buffer is not cached (it is read
+//			from the file each time). Values that fit: results unchanged.
+// 20261026	mmd	Cache lock made once by a static object (it was initialised again on every
+//			emptied cache, possibly while another thread held it); the empty test, the
+//			ini file time check, the invalidation, FlushPrivateProfileStringCache and the
+//			gpps/gppstime statistics are done under it. A value read from the file is not
+//			cached when the cache was emptied while it was read (it may be the old one).
+//			Lookup order and the values returned are unchanged.
+// 20261026	mmd	GppsStatistics: gpps and gppstime read together under the cache lock
+// 20261027	mmd	The cache lock is made at its first use (IniLock), not by a static object: global
+//			PDU objects in dgate.cpp read dicom.ini in their constructors before the static
+//			objects of this file are made (a zeroed CRITICAL_SECTION crashes on Windows)
+// 20261027	mmd	IniLock makes the lock exactly once also under concurrent first use
+//			(pthread_once; on Windows an interlocked state)
 
 int      gpps=0, gppstime=0;
 
@@ -51,10 +68,66 @@ int			IniCheckSums[NINICACHE];
 CRITICAL_SECTION 	IniCritical;
 int			IniTop=0, IniBottom=0;
 time_t			IniTm=0, lasttime=0;
+static unsigned int	IniGeneration=0;	// + 1 whenever the cache is emptied or flushed
 
-int into_IniCache(const char *section, const char *in, char *value)
+// The lock is made at its first use, which comes before main() starts any thread: the global
+// ExtendedPDU_Service objects in dgate.cpp read dicom.ini in their constructors while the static
+// objects are made, before those of this file (included last in total.cpp). A lock made by a
+// static object here was entered there before it was made: harmless with a zeroed pthread
+// mutex, a crash with a zeroed Windows CRITICAL_SECTION.
+// The lock is made exactly once, also when two threads use it first at the same time:
+// pthread_once on Unix; on Windows an interlocked state (0 not made, 1 being made, 2 made),
+// which needs no Vista API and no thread-safe local statics (Visual Studio 2010).
+#ifdef WIN32
+static volatile LONG IniLockState = 0;
+
+static CRITICAL_SECTION *IniLock(void)
+	{
+	if (InterlockedCompareExchange(&IniLockState, 1, 0) == 0)
+		{
+		InitializeCriticalSection(&IniCritical);
+		InterlockedExchange(&IniLockState, 2);
+		}
+	else
+		{
+		while (InterlockedCompareExchange(&IniLockState, 2, 2) != 2)
+			Sleep(0);
+		}
+	return &IniCritical;
+	}
+#else
+static pthread_once_t IniLockOnce = PTHREAD_ONCE_INIT;
+
+static void IniLockInit(void)
+	{
+	InitializeCriticalSection(&IniCritical);
+	}
+
+static CRITICAL_SECTION *IniLock(void)
+	{
+	pthread_once(&IniLockOnce, IniLockInit);
+	return &IniCritical;
+	}
+#endif
+
+// statistics (gpps, gppstime) under the cache lock
+static void IniAddTime(int t)
+	{
+	EnterCriticalSection(IniLock());
+	gppstime += time(NULL)-t;
+	LeaveCriticalSection(&IniCritical);
+	}
+
+// gen: IniGeneration seen by the isin_IniCache call before the file was read; when the
+// cache was emptied since, the value may be from the old file and is not stored.
+int into_IniCache(const char *section, const char *in, char *value, unsigned int gen)
 	{ 
 	int i, sum, r;
+
+	// only what fits the fixed arrays is cached (else read from the file every time)
+	if (!section || !in || !value) return -1;
+	if (strlen(section) >= sizeof(IniSections[0]) || strlen(in) >= sizeof(IniCache[0]) ||
+	    strlen(value) >= sizeof(IniValues[0])) return -1;
 
 	const char *p = in;
 	sum = 0;
@@ -62,10 +135,13 @@ int into_IniCache(const char *section, const char *in, char *value)
 	p = section;
 	while(*p) sum+=*p++;
 
-	if (IniTop==0 && IniBottom==0)
-		InitializeCriticalSection(&IniCritical);
+	EnterCriticalSection(IniLock());
 
-	EnterCriticalSection(&IniCritical);
+	if (gen != IniGeneration)
+		{
+		LeaveCriticalSection(&IniCritical);
+		return -1;
+		}
 
 	/* clear cache if it is empty */
 	if (IniTop==0 && IniBottom==0)
@@ -88,20 +164,31 @@ int into_IniCache(const char *section, const char *in, char *value)
 	return r;
   	}
 
-int isin_IniCache(const char *section, const char *in, char *file)
+// On a hit the value is copied to out (at most outlen-1 characters, NUL ended) while
+// the cache is locked; *len = its length as returned to the caller. Counts the call
+// (gpps) and, on a hit, its time since t (gppstime); *gen = IniGeneration (for
+// into_IniCache after a miss). Everything under the cache lock.
+int isin_IniCache(const char *section, const char *in, char *file, char *out, size_t outlen, size_t *len, int t, unsigned int *gen)
 	{
 	int i, sum;
-	const char *p = in;
+	const char *p;
 	struct stat statbuf;
 
-	if (IniTop==0 && IniBottom==0) return -1;
+	EnterCriticalSection(IniLock());
+	gpps++;
+	*gen = IniGeneration;
+
+	if ((IniTop==0 && IniBottom==0) || !section || !in || !out || !outlen)
+		{
+		LeaveCriticalSection(&IniCritical);
+		return -1;
+		}
 
 	sum = 0;
+	p = in;
 	while(*p) sum+=*p++;
 	p = section;
 	while(*p) sum+=*p++;
-
-	EnterCriticalSection(&IniCritical);
 
 	// retest for changed ini file once per second
 	if (lasttime!=time(NULL))
@@ -112,6 +199,8 @@ int isin_IniCache(const char *section, const char *in, char *file)
 		{
 		IniTop=0;
 		IniBottom=0;
+		IniGeneration++;
+		*gen = IniGeneration;
 		IniTm = statbuf.st_mtime;
 		lasttime = time(NULL);
 	        LeaveCriticalSection(&IniCritical);
@@ -124,6 +213,16 @@ int isin_IniCache(const char *section, const char *in, char *file)
 		if (IniCheckSums[i] == sum)
 			if (strcmp(IniCache[i], in)==0 && strcmp(IniSections[i], section)==0)
 				{
+				size_t n = strlen(IniValues[i]);
+				if (n >= outlen)
+					{
+					n = outlen-1;
+					OperatorConsole.printf("***Ini file item '%s:%s' trucated\n", section, in);
+					}
+				memcpy(out, IniValues[i], n);
+				out[n] = 0;
+				*len = n;
+				gppstime += time(NULL)-t;
 				LeaveCriticalSection(&IniCritical);
 				return i;
 				}
@@ -142,13 +241,14 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 	char *theIniFileName)			// pathname of ini file to search
 {
 	int i, t = time(NULL);
-	gpps++;
+	size_t cachedlen = 0;
+	unsigned int gen = 0;
+	BOOL truncated = FALSE;
 
-	// try to find it in the cache
-	if ((i = isin_IniCache(theSection, theKey, theIniFileName))>=0)
-	{ strcpy(theReturnBuffer, IniValues[i]);
-  	  gppstime += time(NULL)-t;
-	  return strlen(theReturnBuffer);
+	// try to find it in the cache (copied with the caller's length); counts the call
+	if ((i = isin_IniCache(theSection, theKey, theIniFileName, theReturnBuffer, theReturnBufferLength, &cachedlen, t, &gen))>=0)
+	{
+	  return cachedlen;
 	}
 
 	FILE *aFile = theIniFileName ? fopen(theIniFileName, "r") : NULL;
@@ -322,6 +422,7 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 							aReturnLength += aLineLength;
 							if (aReturnLength >= theReturnBufferLength)
 							{
+								truncated = TRUE;	// not cached: a larger buffer must get it all
 								aReturnLength = theReturnBufferLength-1;
 								OperatorConsole.printf("***Ini file item '%s:%s' trucated\n", theSection, theKey);
 							}								
@@ -351,19 +452,32 @@ MyGetPrivateProfileString(const char *theSection,	// section name
 			theReturnBufferLength : aLength;
 		strncpy(theReturnBuffer, theDefault, aLength);
 		theReturnBuffer[aLength - 1] = '\0';
-		// store into cache
-		into_IniCache(theSection, theKey, theReturnBuffer);
-                gppstime += time(NULL)-t;
+		// store into cache (not a default that was cut to this buffer)
+		if (theDefault && strlen(theDefault) < theReturnBufferLength)
+			into_IniCache(theSection, theKey, theReturnBuffer, gen);
+		IniAddTime(t);
 		return aLength - 1;
 	}
 
-	// store into cache
-	into_IniCache(theSection, theKey, theReturnBuffer);
-	gppstime += time(NULL)-t;
+	// store into cache (not a value that was cut to this buffer)
+	if (!truncated)
+		into_IniCache(theSection, theKey, theReturnBuffer, gen);
+	IniAddTime(t);
 	return aReturnLength > 0 ? aReturnLength - 1 : 0;
 }
 
+// the statistics (number of reads, seconds spent) as one consistent pair, under the cache lock
+void GppsStatistics(int *count, int *seconds)
+{ EnterCriticalSection(IniLock());
+  if (count)   *count   = gpps;
+  if (seconds) *seconds = gppstime;
+  LeaveCriticalSection(&IniCritical);
+}
+
 void FlushPrivateProfileStringCache(void)
-{ lasttime = 0;
+{ EnterCriticalSection(IniLock());
+  lasttime = 0;
   IniTm    = 0;
+  IniGeneration++;	// a value being read now is not cached
+  LeaveCriticalSection(&IniCritical);
 }

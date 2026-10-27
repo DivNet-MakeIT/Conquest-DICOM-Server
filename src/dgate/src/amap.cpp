@@ -8,6 +8,14 @@
    ljz  20030711: Fixed trailing spaces in acrnema.map
    ljz  20031118: Fixed leak InitACRNemaAddressArray
    mvh  20261005: Protect against too long passed AEs; limit reading of amap fields to 32-128-64-32
+   mmd  20261025: Map access under a lock; the map is built aside and swapped in (same result as before);
+                  entry copy/put/delete functions so that other files do not touch the array
+   mmd  20261025: Optional 5th column (options T, SC, R, Rn, RI); the rest of the line after the
+                  compression column is kept and written back; GetACRNemaEntryByAE
+   mmd  20261026: Option L (only with T, e.g. TL, TLSC); L without T is ignored with a console
+                  line. T (and TL) mark a node that needs DICOM TLS: this variant has no TLS and
+                  refuses every association to it (console line when the map is read). FormatACRNemaOptions: the options token in the
+                  canonical order T L SC R... (write_amap), all letters kept
 */
    
 
@@ -16,15 +24,177 @@
 #else
 #	include	"master.h"
 #endif
+#include <ctype.h>
 
 
 BYTE	ACRNEMAMAP [ 256 ] = "acrnema.map";
-Array < ACRNemaAddress * >	ACRNemaAddressArray;
+static Array < ACRNemaAddress * >	ACRNemaAddressArray;
+
+#ifdef UNIX
+#ifndef EnterCriticalSection
+#	define EnterCriticalSection(a) pthread_mutex_lock(a)
+#endif
+#ifndef LeaveCriticalSection
+#	define LeaveCriticalSection(a) pthread_mutex_unlock(a)
+#endif
+#ifndef CRITICAL_SECTION
+#	define CRITICAL_SECTION pthread_mutex_t
+#endif
+#ifndef InitializeCriticalSection
+#	define InitializeCriticalSection(a) pthread_mutex_init(a, NULL);
+#endif
+#endif
+
+// One lock for every access to the map. It is initialised by a static object,
+// i.e. before main() starts any thread (the incoming-folder monitor thread can
+// run before the map is first loaded).
+static CRITICAL_SECTION	AMapCritical;
+static struct AMapCriticalInit
+	{
+	AMapCriticalInit() { InitializeCriticalSection(&AMapCritical); }
+	}	AMapCriticalInitObject;
+
+static void AMapLock(void)
+	{
+	EnterCriticalSection(&AMapCritical);
+	}
+
+static void AMapUnlock(void)
+	{
+	LeaveCriticalSection(&AMapCritical);
+	}
+
+static void AMapClear(Array < ACRNemaAddress * > &A)
+	{
+	while ( A.GetSize() )
+		{
+		delete A.Get(0);
+		A.RemoveAt(0);
+		}
+	}
+
+static void AMapCopyField(char *dest, const char *src, int size)
+	{
+	strncpy(dest, src, size-1);
+	dest[size-1] = 0;
+	}
 
 
 
-BOOL
-InitACRNemaAddressArray(void)
+// Parse the first token of the options column. Recognised (any case):
+//   -        no options
+//   T        needs DICOM TLS  SC   storage commitment for data sent to the node
+//   TSC/SCT  both             R    re-send missing objects, limit from dicom.ini
+//   Rn       limit n (1..999) RI   until committed            R0   no re-send
+//   L        legacy TLS profile, only together with T
+// This variant has no TLS: a node with T (or TL) is refused, never connected plain.
+// T, L and SC in any order, R last (e.g. SCR5, TSCRI, TLSC). Anything else gives no
+// options (the column may hold user data, e.g. lua/association.lua). L without T
+// is ignored (console line), the other options of the token stay.
+int
+ParseACRNemaOptions(const char *Options, const char *Name, int *ResendLimit, BOOL Warn)
+	{
+	char	tok[32];
+	int	i, flags = 0, n;
+	const char *p;
+
+	*ResendLimit = 0;
+	tok[0] = 0;
+	if (Options==NULL || sscanf(Options, "%31s", tok)!=1) return 0;
+	if (strcmp(tok, "-")==0) return 0;
+	for (i=0; tok[i]; i++) tok[i] = toupper((unsigned char)tok[i]);
+
+	p = tok;
+	while (*p)
+		{
+		if (p[0]=='S' && p[1]=='C' && !(flags & ACR_SC)) { flags |= ACR_SC; p += 2; continue; }
+		if (p[0]=='T' && !(flags & ACR_TLS)) { flags |= ACR_TLS; p += 1; continue; }
+		if (p[0]=='L' && !(flags & ACR_TLSLEGACY)) { flags |= ACR_TLSLEGACY; p += 1; continue; }
+		if (p[0]=='R')
+			{
+			if (p[1]==0) { flags |= ACR_RESEND; *ResendLimit = ACR_RESEND_INI; p += 1; continue; }
+			if (p[1]=='I' && p[2]==0) { flags |= ACR_RESEND; *ResendLimit = ACR_RESEND_ALWAYS; p += 2; continue; }
+			n = 0;
+			for (i=1; p[i]>='0' && p[i]<='9' && i<5; i++) n = n*10 + p[i]-'0';
+			if (i>1 && p[i]==0 && n<=999)
+				{
+				if (n>0) { flags |= ACR_RESEND; *ResendLimit = n; }
+				p += i;
+				continue;
+				}
+			}
+		// not an option token: no options for this line
+		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: 5th column '%s' is not an option (T, L, SC, R...), ignored\n", Name, tok);
+		*ResendLimit = 0;
+		return 0;
+		}
+
+	if ((flags & ACR_TLSLEGACY) && !(flags & ACR_TLS))
+		{
+		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: L needs T, L ignored\n", Name);
+		flags &= ~ACR_TLSLEGACY;
+		}
+	if ((flags & ACR_TLS) && Warn)
+		OperatorConsole.printf("*** acrnema.map: %s: T (DICOM TLS) but this dgate has no TLS: every association to %s is refused\n", Name, Name);
+	if ((flags & ACR_RESEND) && !(flags & ACR_SC))
+		{
+		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: R needs SC, R ignored\n", Name);
+		flags &= ~ACR_RESEND; *ResendLimit = 0;
+		}
+	if ((flags & ACR_RESEND) && strchr(Name, '*'))
+		{
+		if (Warn) OperatorConsole.printf("*** acrnema.map: %s: R is not allowed on a wildcard entry, R ignored\n", Name);
+		flags &= ~ACR_RESEND; *ResendLimit = 0;
+		}
+	return flags;
+	}
+
+// The options column for write_amap: when the first token holds options, its letters are
+// written upper case in the canonical order T, L, SC, R... (e.g. tlscr5 or SCTLR5 -> TLSCR5);
+// every letter of the token is kept, also one that is ignored (e.g. L without T, R0, R on a
+// wildcard entry), so nothing the user wrote is lost. The rest of the line follows unchanged.
+// A column that is not an option token is written as read.
+void
+FormatACRNemaOptions(const ACRNemaAddress *Entry, char *out, int outlen)
+	{
+	const char	*p = Entry->Options, *q;
+	char		tok[32], r[32];
+	int		t = 0, l = 0, sc = 0, n;
+
+	while (*p==' ' || *p=='\t') p++;
+	if (!Entry->Flags)
+		{
+		snprintf(out, outlen, "%s", Entry->Options);
+		return;
+		}
+	// the token parsed as options: T, L, SC once each in any order, then R... last
+	r[0] = 0;
+	for (q=p; *q && *q!=' ' && *q!='\t'; )
+		{
+		char c = toupper((unsigned char)*q);
+		if (c=='S') { sc = 1; q += 2; continue; }
+		if (c=='T') { t = 1; q++; continue; }
+		if (c=='L') { l = 1; q++; continue; }
+		for (n=0; *q && *q!=' ' && *q!='\t' && n<(int)sizeof(r)-1; q++) r[n++] = toupper((unsigned char)*q);
+		r[n] = 0;
+		}
+	snprintf(tok, sizeof(tok), "%s%s%s%s", t ? "T" : "", l ? "L" : "", sc ? "SC" : "", r);
+	snprintf(out, outlen, "%s%s", tok, q);
+	}
+
+static void
+SetACRNemaOptions(ACRNemaAddress *pACR, const char *Options, BOOL Warn)
+	{
+	while (*Options==' ') Options++;
+	if (strlen(Options) > sizeof(pACR->Options)-1 && Warn)
+		OperatorConsole.printf("*** acrnema.map: %s: text after the compression column cut to %d characters\n", pACR->Name, (int)sizeof(pACR->Options)-1);
+	strncpy(pACR->Options, Options, sizeof(pACR->Options)-1);
+	pACR->Options[sizeof(pACR->Options)-1] = 0;
+	pACR->Flags = ParseACRNemaOptions(pACR->Options, pACR->Name, &pACR->ResendLimit, Warn);
+	}
+
+static BOOL
+ParseACRNemaMap(Array < ACRNemaAddress * > &NewArray)
 { FILE*			f;
   char*			pBuffer;
   int			i, iSize;
@@ -169,16 +339,21 @@ InitACRNemaAddressArray(void)
     strcpy(pACR->IP, "");
     strcpy(pACR->Port, "");
     strcpy(pACR->Compress, "un");
+    pACR->Options[0] = 0;
+    pACR->Flags = 0;
+    pACR->ResendLimit = 0;
 
     /* Get a line */
     *strchr(pDest, '\r') = 0;
-    sscanf(pDest, "%31s %127s %63s %31s",
+    int nused = -1;
+    if (sscanf(pDest, "%31s %127s %63s %31s%n",
 	pACR->Name,
 	pACR->IP,
 	pACR->Port,
-	pACR->Compress);
+	pACR->Compress, &nused)==4 && nused>0)
+      SetACRNemaOptions(pACR, pDest+nused, TRUE);	// optional 5th column and the rest of the line
 
-    ACRNemaAddressArray.Add(pACR);
+    NewArray.Add(pACR);
     pDest = pDest + strlen(pDest) + 1;
   }
 
@@ -186,16 +361,112 @@ InitACRNemaAddressArray(void)
   return TRUE;
 }
 
+// Load (or reload) the map. The new map is built aside and swapped in under
+// the lock, so a thread looking up an AE never sees a half-built map. As
+// before, a file that cannot be read leaves an empty map.
+BOOL
+InitACRNemaAddressArray(void)
+	{
+	Array < ACRNemaAddress * >	NewArray;
+	BOOL				ok;
+
+	ok = ParseACRNemaMap(NewArray);
+	if (!ok) AMapClear(NewArray);
+
+	AMapLock();
+	AMapClear(ACRNemaAddressArray);
+	while ( NewArray.GetSize() )
+		{
+		ACRNemaAddressArray.Add(NewArray.Get(0));
+		NewArray.RemoveAt(0);
+		}
+	AMapUnlock();
+	return ok;
+	}
+
 
 BOOL
 CloseACRNemaAddressArray()
 	{
-	while ( ACRNemaAddressArray.GetSize() )
-		{
-		delete ACRNemaAddressArray.Get(0);
-		ACRNemaAddressArray.RemoveAt(0);
-		}
+	AMapLock();
+	AMapClear(ACRNemaAddressArray);
+	AMapUnlock();
 	return ( TRUE );
+	}
+
+// Number of entries in the map
+UINT
+GetACRNemaCount(void)
+	{
+	UINT	n;
+	AMapLock();
+	n = ACRNemaAddressArray.GetSize();
+	AMapUnlock();
+	return n;
+	}
+
+// Copy entry Index into *Entry; FALSE if there is no such entry
+BOOL
+GetACRNemaEntry(UINT Index, ACRNemaAddress *Entry)
+	{
+	BOOL	ok = FALSE;
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		{
+		*Entry = *ACRNemaAddressArray.Get(Index);
+		ok = TRUE;
+		}
+	AMapUnlock();
+	return ok;
+	}
+
+// Change entry Index, or append a new entry when Index is past the end.
+// A NULL field keeps its value (a new entry starts as "" "" "" "un").
+// Fields are cut to the size of the map structure.
+BOOL
+PutACRNemaEntry(UINT Index, const char *Name, const char *IP, const char *Port, const char *Compress, const char *Options)
+	{
+	ACRNemaAddress	*AAPtr;
+
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		AAPtr = ACRNemaAddressArray.Get(Index);
+	else
+		{
+		AAPtr = new ACRNemaAddress;
+		strcpy(AAPtr->Name, "");
+		strcpy(AAPtr->IP, "");
+		strcpy(AAPtr->Port, "");
+		strcpy(AAPtr->Compress, "un");
+		AAPtr->Options[0] = 0;
+		AAPtr->Flags = 0;
+		AAPtr->ResendLimit = 0;
+		ACRNemaAddressArray.Add(AAPtr);
+		}
+	if (Name)     AMapCopyField(AAPtr->Name,     Name,     sizeof(AAPtr->Name));
+	if (IP)       AMapCopyField(AAPtr->IP,       IP,       sizeof(AAPtr->IP));
+	if (Port)     AMapCopyField(AAPtr->Port,     Port,     sizeof(AAPtr->Port));
+	if (Compress) AMapCopyField(AAPtr->Compress, Compress, sizeof(AAPtr->Compress));
+	if (Options)  SetACRNemaOptions(AAPtr, Options, TRUE);
+	else if (Name) AAPtr->Flags = ParseACRNemaOptions(AAPtr->Options, AAPtr->Name, &AAPtr->ResendLimit, FALSE);
+	AMapUnlock();
+	return TRUE;
+	}
+
+// Remove entry Index; FALSE if there is no such entry
+BOOL
+DeleteACRNemaEntry(UINT Index)
+	{
+	BOOL	ok = FALSE;
+	AMapLock();
+	if (Index < ACRNemaAddressArray.GetSize())
+		{
+		delete ACRNemaAddressArray.Get(Index);
+		ACRNemaAddressArray.RemoveAt(Index);
+		ok = TRUE;
+		}
+	AMapUnlock();
+	return ok;
 	}
 
 
@@ -238,6 +509,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 		}
 
 
+	AMapLock();
 	Index = 0;
 	while ( Index < ACRNemaAddressArray.GetSize())
 		{
@@ -246,7 +518,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 		// try wildcard mapping, e.g., s=NG12, t=NG*, IP=101.11.11.*, Port=56*
 		if (t[strlen(t)-1] == '*')
 			{
-			if (!memicmp(t, s, strlen(t)-1))
+			if (strlen(t)-1 <= strlen(s) && !memicmp(t, s, strlen(t)-1))	// do not compare past the end of s
 				{
 				strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 				if (ip[strlen(ip)-1]=='*')
@@ -256,6 +528,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 				if (port[strlen(port)-1]=='*')
 					strcpy(port+strlen(port)-1, s+strlen(t)-1);
 				strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+				AMapUnlock();
 				return ( TRUE );
 				}
 			}
@@ -266,6 +539,7 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 			strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 			strcpy(port, ACRNemaAddressArray.Get(Index)->Port);
 			strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+			AMapUnlock();
 			return ( TRUE );
 			}
 		++Index;
@@ -282,12 +556,66 @@ GetACRNema(char* ACRNema, char* ip, char* port, char* compress)
 			strcpy(ip, ACRNemaAddressArray.Get(Index)->IP);
 			strcpy(port, ACRNemaAddressArray.Get(Index)->Port);
 			strcpy(compress, ACRNemaAddressArray.Get(Index)->Compress);
+			AMapUnlock();
 			return ( TRUE );
 			}
 		++Index;
 		}
 
+	AMapUnlock();
 	return ( FALSE );
 	}
 
+// Same matching as GetACRNema (wildcard entry, exact, then case insensitive)
+// but returns the whole entry from one map version: address, port,
+// compression and options together. IP and port wildcards are filled in
+// as in GetACRNema, cut to the field size.
+BOOL
+GetACRNemaEntryByAE(char* ACRNema, ACRNemaAddress *Entry)
+	{
+	UINT	Index;
+	char	s[20];
+	char	*t;
+	BOOL	found = FALSE;
 
+	memset(s, 0, 20);
+	strncpy(s, ACRNema, 19);
+	while (strlen(s) && __iswhitespacea(s[strlen(s)-1]))
+		s[strlen(s)-1] = '\0';
+	if (!strlen(s))
+		return ( FALSE );
+
+	AMapLock();
+	for (Index=0; Index < ACRNemaAddressArray.GetSize() && !found; Index++)
+		{
+		t = ACRNemaAddressArray.Get(Index)->Name;
+		if (t[0] && t[strlen(t)-1] == '*')
+			{
+			if (strlen(t)-1 <= strlen(s) && !memicmp(t, s, strlen(t)-1))
+				{
+				*Entry = *ACRNemaAddressArray.Get(Index);
+				if (Entry->IP[0] && Entry->IP[strlen(Entry->IP)-1]=='*')
+					snprintf(Entry->IP+strlen(Entry->IP)-1, sizeof(Entry->IP)-strlen(Entry->IP)+1, "%s", s+strlen(t)-1);
+				if (Entry->Port[0] && Entry->Port[strlen(Entry->Port)-1]=='*')
+					snprintf(Entry->Port+strlen(Entry->Port)-1, sizeof(Entry->Port)-strlen(Entry->Port)+1, "%s", s+strlen(t)-1);
+				found = TRUE;
+				break;
+				}
+			}
+		if (!strcmp(t, s))
+			{
+			*Entry = *ACRNemaAddressArray.Get(Index);
+			found = TRUE;
+			}
+		}
+	for (Index=0; Index < ACRNemaAddressArray.GetSize() && !found; Index++)
+		{
+		if (!stricmp(ACRNemaAddressArray.Get(Index)->Name, s))
+			{
+			*Entry = *ACRNemaAddressArray.Get(Index);
+			found = TRUE;
+			}
+		}
+	AMapUnlock();
+	return found;
+	}

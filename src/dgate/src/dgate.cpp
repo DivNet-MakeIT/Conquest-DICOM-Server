@@ -1425,6 +1425,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			TCP connect, TLS handshake and association setup of the worker's requests and re-sends
 			(other connections keep TCPIPTimeOut); a timeout is logged with the attempt; a destination
 			that could not be reached is skipped for the rest of the pass, also for re-sends
+20261026	mmd	Outgoing storage commitment: the worker releases its associations (request, re-send) with a
+			time limit (OutgoingSCSameAssocWait, 2..10 s): no A-RELEASE-RP in time -> A-ABORT, closed
 
 ENDOFUPDATEHISTORY
 */
@@ -26080,6 +26082,49 @@ static BOOL SCStopWatch(SCWatch *w)
 	return fired;
 	}
 
+// Release an association of the worker (request or re-send) with a time limit: A-RELEASE-RQ,
+// then the reply is awaited at most OutgoingSCSameAssocWait seconds (at least 2, at most 10).
+// No reply in time (a destination that stopped answering, e.g. frozen with the connection open):
+// A-ABORT is sent and the connection closed, with a console line. PDU_Service::Close would wait
+// TCPIPTimeOut for the reply and hold up the worker, and with it every other destination.
+// A reply that has started is read under the watchdog (as in the same-association wait), so it
+// cannot stall halfway either. buffered: data is already read into the PDU buffer (it is read at
+// once); what: the association, for the console line.
+static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const char *what)
+	{
+	int	limit = OutgoingSCSameAssocWait;
+	BOOL	ok, timedout = FALSE;
+	if (limit<2) limit = 2;
+	if (limit>10) limit = 10;
+	if (!PDU.Link.Connected) { PDU.Link.Close(); return; }
+	time_t until = time(NULL) + limit;
+	ok = PDU.AReleaseRQ::Write(PDU);
+	while (ok && !buffered && PDU.Link.Connected && !PDU.Link.Poll())
+		{
+		if (time(NULL)>=until) { ok = FALSE; timedout = TRUE; break; }
+		Sleep(100);
+		}
+	if (ok && PDU.Link.Connected)
+		{
+		if (until < time(NULL) + 1) until = time(NULL) + 1;
+		SCWatch *watch = SCStartWatch(PDU.Link.Socketfd, until);
+		if (!watch) ok = FALSE;		// no watchdog: do not read (fail closed), abort
+		else
+			{
+			PDU.SetTimeOut((int)(until - time(NULL)) > 0 ? (int)(until - time(NULL)) : 1);
+			ok = PDU.AReleaseRP::Read(PDU);
+			if (SCStopWatch(watch)) { ok = FALSE; timedout = TRUE; }
+			PDU.SetTimeOut(TCPIPTimeOut);
+			}
+		}
+	if (!ok && (timedout || PDU.Link.Connected))
+		{
+		OperatorConsole.printf("*** Storage commitment: no release reply from %s within %d s (%s): association aborted\n", ae, limit, what);
+		if (PDU.Link.Connected) PDU.AAbortRQ::Write(PDU);
+		}
+	PDU.Link.Close();
+	}
+
 // After an accepted N-ACTION: wait up to OutgoingSCSameAssocWait seconds for the result on
 // this association; an N-EVENT-REPORT of the storage commitment class is checked and
 // recorded by SCProcessEventReport and answered. Returns FALSE when the link is gone.
@@ -26231,9 +26276,11 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 			OperatorConsole.printf("*** Storage commitment: could not connect to %s (%s %s) for transaction %s\n", ae, ip, port, TxUID);
 		return 1;
 		}
+	char what[128];
+	sprintf(what, "request association, transaction %.64s", TxUID);
 	if (!PDU.IsAbstractSyntaxAccepted(scclass))
 		{
-		PDU.Close();
+		SCRelease(PDU, PDU.Pending(), ae, what);
 		return 2;
 		}
 
@@ -26270,7 +26317,7 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	if (status!=0)
 		{
 		OperatorConsole.printf("*** Storage commitment: N-ACTION refused by %s with status 0x%04x (transaction %s)\n", ae, status, TxUID);
-		if (!PDU.Close()) PDU.Link.Close();
+		SCRelease(PDU, PDU.Pending(), ae, what);
 		return 1;
 		}
 	OperatorConsole.printf("Storage commitment request accepted by %s (transaction %s)\n", ae, TxUID);
@@ -26280,7 +26327,7 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 		PDU.Link.Close();
 		return 0;
 		}
-	if (!PDU.Close()) PDU.Link.Close();
+	SCRelease(PDU, PDU.Pending(), ae, what);
 	return 0;
 	}
 
@@ -27277,7 +27324,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 			OperatorConsole.printf("Storage commitment: re-sent %s to %s (re-send %d)\n", it[i].inst, ae, it[i].res);
 		nsent++;
 		}
-	if (!PDU.Close()) PDU.Link.Close();
+	SCRelease(PDU, FALSE, ae, "re-send association");
 	for (i=0; i<n; i++) free(it[i].file);
 	OperatorConsole.printf("Storage commitment: %d of %d object(s) re-sent to %s\n", nsent, n, ae);
 	return SC_CHUNK_DONE;

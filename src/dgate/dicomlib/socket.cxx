@@ -51,6 +51,7 @@
 20261027	mmd	Unix: the TLS waits, the TLS connect and the ConnectTimeOut connect wait with poll()
 			(no FD_SETSIZE limit); Poll and the plain ReadBinary never put a descriptor >=
 			FD_SETSIZE in an fd_set (Poll: poll(); plain ReadBinary: console line, closed)
+20261027	mmd	Plain connect: bounded (non-blocking, SocketConnectBefore) also when only Deadline is set
 
 */
 
@@ -502,7 +503,7 @@ DicomError(DCM_ERROR_DEBUG, "Connected by address: %08x", sa.sin_addr.s_addr);
 #	include	<time.h>
 
 // Plain TCP connect that ends at time end (seconds since the epoch); only used with
-// ConnectTimeOut. Non-blocking connect, then the socket is blocking again (the plain
+// ConnectTimeOut or Deadline. Non-blocking connect, then the socket is blocking again (the plain
 // reads and writes expect that). Returns 0 connected, 1 failed (e.g. refused; the
 // caller may retry), 2 timed out.
 static	int	SocketConnectBefore(int fd, struct sockaddr_in *sa, long end)
@@ -640,8 +641,8 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 	sa.sin_port = secopy.s_port;
 
 	// all connect attempts together end at the deadline: in TLS mode always (TimeOut, or
-	// ConnectTimeOut when set), plain only with ConnectTimeOut (a node that does not answer
-	// would otherwise block for the kernel's connect timeout, per attempt)
+	// ConnectTimeOut when set), plain only with ConnectTimeOut or Deadline (a node that does not
+	// answer would otherwise block for the kernel's connect timeout, per attempt)
 	int	ConnectLimit = ConnectTimeOut > 0 ? ConnectTimeOut : (TimeOut > 0 ? TimeOut : 300);
 	long	ConnectEnd = (long) time(NULL) + ConnectLimit;
 	if ( Deadline > 0 && Deadline < ConnectEnd )
@@ -667,7 +668,7 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 			}
 		else
 #endif
-		if ( ConnectTimeOut > 0 )
+		if ( ConnectTimeOut > 0 || Deadline > 0 )
 			{
 			int r = SocketConnectBefore(Socketfd, &sa, ConnectEnd);
 			if ( r == 2 )

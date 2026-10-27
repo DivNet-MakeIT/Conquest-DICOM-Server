@@ -1495,6 +1495,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			60 s, 1..3600) the write is refused before anything is written (C-STORE answered with
 			StorageFailedErrorCode, *** line); also a write without a usable SOP instance UID while any
 			delete runs. The write starts before the file name is chosen. No 0 write during delete
+20261027	mmd	Outgoing storage commitment: SCRelease without a watchdog (no duplicate descriptor or thread,
+			always on Windows) writes nothing unbounded: with Socket::Deadline (Unix) the release goes on
+			bounded by it, otherwise the connection is closed without A-RELEASE (console line) and no
+			A-ABORT is written. Test-only key SCTestNoWatch
 ENDOFUPDATEHISTORY
 */
 
@@ -1688,6 +1692,7 @@ int	SCTestDelayBeforeRecord=0;			// TEST ONLY: ms the worker waits between takin
 int	SCTestNoFileStamp=0;				// TEST ONLY: 1 = no file has a file stamp (as on a system without nanosecond times)
 int	SCTestDelayVerifyStep=0;			// TEST ONLY: ms sc_verify_now: waits after step 7, before its last check (0 = none)
 int	SCTestDelayBeforeDelete=0;			// TEST ONLY: ms sc_verify_and_delete: waits before the delete, writes blocked (0 = none)
+int	SCTestNoWatch=0;				// TEST ONLY: 1 = no watchdog can be started (as on Windows)
 
 // jpeg, jpeg2k global stuff
 int	gJpegQuality=95;				// The quality of the lossy jpeg or j2k image
@@ -25907,6 +25912,7 @@ void SCReadWorkerConfig(const char *root)
 	SCTestNoFileStamp       = SCIniInt(root, "SCTestNoFileStamp",       0,     0, 1);
 	SCTestDelayVerifyStep   = SCIniInt(root, "SCTestDelayVerifyStep",   0,     0, 60000);
 	SCTestDelayBeforeDelete = SCIniInt(root, "SCTestDelayBeforeDelete", 0,     0, 60000);
+	SCTestNoWatch           = SCIniInt(root, "SCTestNoWatch",           0,     0, 1);
 	SCReadRetryInterval(root);
 	SCUnsafeFileConfig(root);
 	}
@@ -26621,6 +26627,7 @@ static BOOL WINAPI SCWatchThread(void *arg)
 // or no thread: the caller must then not read (fail closed)
 static SCWatch *SCStartWatch(int fd, time_t until)
 	{
+	if (SCTestNoWatch) return NULL;		// test only
 	int dfd = SCDupSocket(fd);
 	if (dfd<0) return NULL;
 	SCWatch *w = (SCWatch *)malloc(sizeof(SCWatch));
@@ -26662,7 +26669,11 @@ static BOOL SCStopWatch(SCWatch *w)
 // A reply that has started is read under the watchdog (as in the same-association wait), so it
 // cannot stall halfway either. The writes are bounded too: a destination that stopped reading
 // (full send buffer) cannot block the A-RELEASE-RQ past the deadline, nor the A-ABORT more than
-// 2 s (watchdog; without one, as before). buffered: data is already read into the PDU buffer
+// 2 s (watchdog). Without a watchdog (no duplicate descriptor or no thread; always on Windows)
+// nothing is written unbounded: on a connection with Socket::Deadline (sc_verify_now:; Unix: the
+// plain and TLS writes end at it) the release goes on bounded by the deadline (the reply is read
+// too: reads end at the deadline as well), otherwise the connection is closed without A-RELEASE
+// (console line) and no A-ABORT is written. buffered: data is already read into the PDU buffer
 // (it is read at once); what: the association, for the console line.
 static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const char *what)
 	{
@@ -26674,7 +26685,19 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 	time_t until = time(NULL) + limit;
 	if (PDU.Link.Deadline > 0 && (time_t)PDU.Link.Deadline < until)
 		until = (time_t)PDU.Link.Deadline;	// a connection with a deadline (sc_verify_now:) ends by it
+	// without a watchdog only a connection whose writes end at its Deadline may be written to
+#ifdef WIN32
+	BOOL	bounded = FALSE;		// Windows: a plain send is not cut at the deadline
+#else
+	BOOL	bounded = PDU.Link.Deadline > 0;
+#endif
 	SCWatch *wwatch = SCStartWatch(PDU.Link.Socketfd, until);	// bounds the write
+	if (!wwatch && !bounded)
+		{
+		OperatorConsole.printf("Storage commitment: no watchdog for the release write (%s, %s): connection closed without A-RELEASE\n", ae, what);
+		PDU.Link.Close();
+		return;
+		}
 	ok = PDU.AReleaseRQ::Write(PDU);
 	if (SCStopWatch(wwatch)) { ok = FALSE; timedout = TRUE; }
 	while (ok && !buffered && PDU.Link.Connected && !PDU.Link.Poll())
@@ -26686,7 +26709,7 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 		{
 		if (until < time(NULL) + 1) until = time(NULL) + 1;
 		SCWatch *watch = SCStartWatch(PDU.Link.Socketfd, until);
-		if (!watch) ok = FALSE;		// no watchdog: do not read (fail closed), abort
+		if (!watch && !bounded) ok = FALSE;	// no watchdog and no deadline: do not read (fail closed), abort
 		else
 			{
 			PDU.SetTimeOut((int)(until - time(NULL)) > 0 ? (int)(until - time(NULL)) : 1);
@@ -26701,7 +26724,7 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 		if (PDU.Link.Connected)
 			{
 			SCWatch *awatch = SCStartWatch(PDU.Link.Socketfd, time(NULL) + 2);	// bounds the write
-			PDU.AAbortRQ::Write(PDU);
+			if (awatch || bounded) PDU.AAbortRQ::Write(PDU);	// else only closed (no unbounded write)
 			SCStopWatch(awatch);
 			}
 		}

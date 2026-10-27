@@ -18,8 +18,8 @@ All AE titles and addresses in the documents are examples. All tests used synthe
 | | Variant A | Variant B |
 |---|---|---|
 | Branch | `sc-incoming` ("incoming") | `sc-outgoing-tls` ("sending and TLS") |
-| Tag | `sc-incoming-v1` | `sc-outgoing-tls-rc2` |
-| Commits on `f8c0057` | 3 | the whole series (see §8 of this page) |
+| Tag | `sc-incoming-v1.1` (`sc-incoming-v1`: the same code without the readme addendum and the binary) | `sc-outgoing-tls-rc2` |
+| Commits on `f8c0057` | 3 code commits, plus the readme addendum, the upstream Windows build fix `62cbec0` (as `e32a0ab`) and a Windows binary | the whole series (see §9 of this page) |
 | Contents | storage commitment SCP only: dgate answers N-ACTION requests for data it received | A + outgoing storage commitment (SCU) + DICOM TLS (strict and legacy profile) + verify-before-delete |
 | Startup line | `Build variant: SC-in ...` | `Build variant: SC-in SC-out ...` (without OpenSSL) or `Build variant: SC-in SC-out TLS ...` |
 
@@ -197,9 +197,15 @@ only with `sc_verify_and_delete:` / `scverifyanddelete`, or right after `sc_veri
 **Windows, mingw-w64 cross build** (Building-Windows.md §3): `build/windows-mingw` has a Dockerfile
 and `build-mingw.sh` for plain and TLS builds from a Linux or macOS host (`-O0`, as `maklinux`).
 
-**Windows binaries.** `install64/dgate64.exe` (plain) and `install64/dgate64tls.exe` (TLS, OpenSSL
-linked statically) built from this branch are added in a separate commit named "Windows
-binaries". Both need `lua5.1.dll` from `install64` next to them.
+**Windows binaries.** On this branch, `install64/dgate64.exe` (plain) and
+`install64/dgate64tls.exe` (TLS, OpenSSL linked statically) are built with Visual Studio 2022 from
+the series up to `985d5bd`; the later commits change no dgate source. They are added by the last
+commit of the branch, "Windows binaries: dgate64.exe (plain) and dgate64tls.exe (OpenSSL,
+static) ...", whose message has the sha256 sums and the build commands. Variant A has its own
+plain `install64/dgate64.exe`, built from its own source (commit "Windows binaries: dgate64.exe
+(plain) ..." on `sc-incoming`). Both need `lua5.1.dll` from `install64` next to them (the
+upstream file, unchanged). `install32/dgate.exe` and the prebuilt GUI `ConquestDICOMServer.exe`
+are upstream's and not rebuilt (32-bit builds were not tried; the GUI, Building-Windows.md §6).
 
 ## 6. Test coverage
 
@@ -395,12 +401,18 @@ converter forwards `fb167a9` `cb8c648` `8b385ab`
 `62cbec0` no `#define _errno errno` ·
 `5e27ec6` optional TLS build in `amake.bat`, mingw-w64 cross build ·
 `985d5bd` quote OpenSSL library paths ·
-a separate "Windows binaries" commit adds the prebuilt executables
+`180bc80` GUI: "Save configuration" keeps the SC and TLS keys, `dgatesop.lst` lists storage
+commitment (GUI source and lua installers) ·
+"Windows binaries: dgate64.exe (plain) and dgate64tls.exe (OpenSSL, static) ..." (last commit of
+the branch) adds the prebuilt executables
 
 **Documentation**
 `627fe7c` `cca3b99` `52c13f4` `6988a72` `e8f48b3` `e6629ff` `fd39233` main document ·
 `5e27ec6` Building-Windows.md ·
-"Docs: fork overview for review" (this page)
+`b8609d0` Windows GUI (Building-Windows.md §6) ·
+`1ef1904` this page ·
+`0788b52` readme addendum ·
+"Docs: final commit map and cross-references"
 
 ## 10. How to review
 
@@ -419,7 +431,7 @@ A suggested order, from the smallest and least risky change to the largest:
 6. **Outgoing storage commitment** (parts 1–3, then the review fixes): the largest part, mostly new
    code in `dgate.cpp` behind `OutgoingStorageCommitment`; read main document §3.3–3.6 first.
 7. **Verify-before-delete** (§3.9 first, then `68fc2f4` onwards): the only path that deletes.
-8. **Windows build** (`5e27ec6`, `985d5bd`) and Building-Windows.md.
+8. **Windows build** (`5e27ec6`, `985d5bd`), the GUI source (`180bc80`) and Building-Windows.md.
 
 If separate pull requests per area are easier to review than one branch, the series can be split
 along these lines.

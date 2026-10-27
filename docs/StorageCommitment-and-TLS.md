@@ -1084,4 +1084,16 @@ and ARM64, mingw-w64, plain and TLS) were run on Windows 11 against a Linux dgat
 **Windows builds**
 - `f06fdc8` Ini cache: the lock is made at its first use (Windows startup crash)
 - `62cbec0` odbci.cpp: no #define _errno errno (Visual Studio 2015+ and mingw-w64)
-- this commit: Windows build: optional TLS build in amake.bat, mingw-w64 cross build, docs
+- `5e27ec6` Windows build: optional TLS build in amake.bat, mingw-w64 cross build, docs
+- `37d849b` Ini cache: one-time initialisation of the lock
+- `985d5bd` Windows build: quote OpenSSL library paths
+
+**Windows GUI, overview, binaries**
+- `180bc80` GUI: Save configuration keeps the SC and TLS keys; dgatesop.lst lists storage commitment
+- `b8609d0` Docs: Windows GUI and the storage commitment / TLS configuration
+- `1ef1904` Docs: fork overview for review (docs/README.md)
+- `0788b52` Readme: move the fork note to an addendum at the end
+- Docs: final commit map and cross-references
+- Windows binaries: dgate64.exe (plain) and dgate64tls.exe (OpenSSL, static), built with Visual
+  Studio 2022 from `985d5bd` (last commit of the branch; sha256 sums and build commands in its
+  message)

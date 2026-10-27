@@ -10,6 +10,9 @@
 -- archive and committed (its file stamp differs from the one recorded with the committed send, the
 -- committed row is gone after OutgoingSCKeepDays, or there is no stamp: a system without nanosecond
 -- file times or a send path that records none). Send the study again and let it commit first.
+-- It is false ("content transformed at send") when the committed send may have changed the content
+-- (a script on the sent copy, a lossy or changing compression, C-MOVE processing): the archive does
+-- not hold the local content then.
 --
 -- Needs OutgoingStorageCommitment = 1 in dicom.ini and SC (or TSC) for the archive in acrnema.map.
 -- Call it from a script that runs in the server, e.g. a [lua] nightly or background script, with

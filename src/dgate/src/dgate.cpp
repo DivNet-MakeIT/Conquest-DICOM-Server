@@ -1456,6 +1456,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			writes of the study that start during the delete wait for it (at most 60 s); a write whose
 			SOP instance UID cannot be tracked (missing, longer than 64) counts as a write of every study
 			for the deletes. Test-only keys SCTestDelayVerifyStep, SCTestDelayBeforeDelete
+20261027	mmd	Outgoing storage commitment: FileStamp format v2 ("v2:size:mtime.ns:ctime.ns:inode"): the
+			change time (which a user tool cannot set back) is part of it (the device number is not: it
+			changes when a file system is mounted again); a stamp only when both times have nanoseconds. Stamps of earlier builds count as none (step 7: no
+			match; reconciliation: the whole-second rule)
 
 ENDOFUPDATEHISTORY
 */
@@ -4031,14 +4035,22 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 void SCNoteSentPDU(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq);
 int SCModeMayDiffer(const char *mode);
 
-// Outgoing storage commitment, file stamp (SCObject.FileStamp): size, modification time (seconds and
-// nanoseconds) and inode of the local file of a send. A send path takes it right before it reads the
-// file (SCStampFile) and checks it right after (SCStampCheck); the queue carries it to the worker.
+// Outgoing storage commitment, file stamp (SCObject.FileStamp): size, modification time and change
+// time (seconds and nanoseconds) and inode of the local file of a send. A send path takes it
+// right before it reads the file (SCStampFile) and checks it right after (SCStampCheck); the queue
+// carries it to the worker. The change time is set by the system on every write, also when a tool
+// sets the modification time back (touch -d, cp -p, rsync -t); it is not proof against a privileged
+// user who sets the clock or writes to the device, only against ordinary rewrites.
 // valid = 0 (no stamp; the reconciliation then uses its whole-second rule for that send) when the
 // file changed while it was read, when the path does not read a local file, or when the stamp would
-// be weak: only systems that give nanoseconds (Linux, macOS) and only with a non-zero inode and a
-// non-zero nanosecond part (a file system with whole-second times gives 0).
-struct SCStamp { long long size, sec, nsec; unsigned long long ino; int valid; };
+// be weak: only systems that give nanoseconds (Linux, macOS) and only with a non-zero inode and
+// non-zero nanosecond parts of both times (a file system with whole-second times gives 0).
+// The device number is not part of it: it is assigned when a file system is mounted and can change
+// at a remount (container restart on overlay storage, device-mapper numbering after a reboot), which
+// would make every stamp differ after exactly the unclean restart the reconciliation is for.
+// Text format v2 (SCStampText): "v2:size:mtime.ns:ctime.ns:inode"; a text without the "v2:"
+// prefix (an earlier build: size:mtime.ns:inode) is never a stamp of this build.
+struct SCStamp { long long size, sec, nsec, csec, cnsec; unsigned long long ino; int valid; };
 #define SC_STAMPLEN 96
 
 extern int SCTestNoFileStamp;
@@ -4049,13 +4061,16 @@ static void SCStampFromStat(const struct stat *st, SCStamp *s)
 	memset(s, 0, sizeof(SCStamp));
 	s->size = (long long)st->st_size;
 	s->sec  = (long long)st->st_mtime;
+	s->csec = (long long)st->st_ctime;
 	s->ino  = (unsigned long long)st->st_ino;
 #if defined(__linux__)
-	s->nsec = (long long)st->st_mtim.tv_nsec;
-	s->valid = s->nsec!=0 && s->ino!=0;
+	s->nsec  = (long long)st->st_mtim.tv_nsec;
+	s->cnsec = (long long)st->st_ctim.tv_nsec;
+	s->valid = s->nsec!=0 && s->cnsec!=0 && s->ino!=0;
 #elif defined(__APPLE__)
-	s->nsec = (long long)st->st_mtimespec.tv_nsec;
-	s->valid = s->nsec!=0 && s->ino!=0;
+	s->nsec  = (long long)st->st_mtimespec.tv_nsec;
+	s->cnsec = (long long)st->st_ctimespec.tv_nsec;
+	s->valid = s->nsec!=0 && s->cnsec!=0 && s->ino!=0;
 #endif
 	if (SCTestNoFileStamp) s->valid = 0;	// test only: as on a system without strong stamps
 	}
@@ -4074,14 +4089,18 @@ static void SCStampCheck(const char *file, SCStamp *s)
 	SCStamp now;
 	if (!s->valid) return;
 	SCStampFile(file, &now);
-	if (!now.valid || now.size!=s->size || now.sec!=s->sec || now.nsec!=s->nsec || now.ino!=s->ino) s->valid = 0;
+	if (!now.valid || now.size!=s->size || now.sec!=s->sec || now.nsec!=s->nsec || now.csec!=s->csec ||
+	    now.cnsec!=s->cnsec || now.ino!=s->ino) s->valid = 0;
 	}
 
-// the text kept in SCObject.FileStamp ("" = no stamp); out: SC_STAMPLEN bytes
+// the text kept in SCObject.FileStamp ("" = no stamp, also when it would not fit); out: SC_STAMPLEN bytes
 static void SCStampText(const SCStamp *s, char *out)
 	{
 	out[0] = 0;
-	if (s && s->valid) snprintf(out, SC_STAMPLEN, "%lld:%lld.%09lld:%llu", s->size, s->sec, s->nsec, s->ino);
+	if (!s || !s->valid) return;
+	int n = snprintf(out, SC_STAMPLEN, "v2:%lld:%lld.%09lld:%lld.%09lld:%llu", s->size, s->sec, s->nsec,
+		s->csec, s->cnsec, s->ino);
+	if (n<0 || n>=SC_STAMPLEN) out[0] = 0;
 	}
 
 void SCNoteSentPDUStamp(PDU_Service *PDU, const char *SOPClassUID, const char *SOPInstanceUID, const char *StudyUID, int MayDiffer, unsigned int seq, const SCStamp *stamp);
@@ -28029,9 +28048,10 @@ static void SCPurge(Database &DB, unsigned int now)
 // any other state that a late result can still turn into COMMITTED (a COMMITTED result applies
 // to every row WHERE Gen = member Gen, whatever its state: NOTED, REQUESTED, FAILED, TIMEOUT, HELD,
 // CANCELLED). An object is reconciled unless its current local file is known to be the one sent:
-// - every row of the object that is not CHANGED has a FileStamp (recorded with its send) and the
-//   current local file has one: reconciled when any of these stamps differs from that of the file
-//   (equal stamps: size, modification time to the nanosecond and inode; not written since the send);
+// - every row of the object that is not CHANGED has a FileStamp of this build (v2, recorded with
+//   its send) and the current local file has one: reconciled when any of these stamps differs from
+//   that of the file (equal stamps: size, modification and change time to the nanosecond and
+//   inode; not written since the send);
 // - otherwise (a row without a stamp: earlier builds, a path or system without one): reconciled
 //   when any such row has a LastSent (when its last send was noted) that is not before the
 //   modification time of the current local file (whole seconds);
@@ -28083,8 +28103,9 @@ static int SCReconcile(Database &DB)
 			strcpy(list[n].inst, inst);
 			list[n].last = (unsigned int)strtoul(last, NULL, 10);
 			SCTrim(lo); SCTrim(hi);
-			if (strlen(lo)>=SC_STAMPLEN || strlen(hi)>=SC_STAMPLEN || !SCSqlText(lo, SC_STAMPLEN) || !SCSqlText(hi, SC_STAMPLEN))
-				lo[0] = hi[0] = 0;	// not a stamp of ours: the whole-second rule
+			if (strlen(lo)>=SC_STAMPLEN || strlen(hi)>=SC_STAMPLEN || !SCSqlText(lo, SC_STAMPLEN) || !SCSqlText(hi, SC_STAMPLEN) ||
+			    strncmp(lo, "v2:", 3)!=0 || strncmp(hi, "v2:", 3)!=0)
+				lo[0] = hi[0] = 0;	// not a stamp of this build (also an earlier format): the whole-second rule
 			strcpy(list[n].lo, lo);
 			strcpy(list[n].hi, hi);
 			n++;

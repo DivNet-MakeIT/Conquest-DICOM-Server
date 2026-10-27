@@ -58,6 +58,9 @@ mvh 20220206: Allow regen of selected folders/files (pass own * wildcards to Reg
 mvh 20250718: Added TestDICOM to avoid loading loads of invalid files
 mmd 20261026: Regen passes rebuild the database record only (SaveToDataBaseEx Rebuild): outgoing storage
 	      commitment rows are not invalidated; RegenFile (one file named by the operator) still invalidates
+mmd 20261027: Outgoing storage commitment: the record is entered under an admission of its study
+	      (SCStudyHoldBegin): refused while a verified delete of the study still runs after
+	      OutgoingSCDeleteWriteWait, skipped when the file was removed after it was read
 */
 
 // #define MULTITHREAD
@@ -121,6 +124,9 @@ TestDICOM(char *Path)
 // This routine checks the file extension and only accepts v2=raw, dcm/img=chapter 10 (or other)
 
 extern "C" void lua_setvar(ExtendedPDU_Service *pdu, char *name, char *value);
+extern int OutgoingStorageCommitment;
+int  SCStudyHoldBegin(const char *study, const char *what);
+void SCStudyHoldEnd(int slot);
 
 // Rebuild: TRUE for a regen pass over the archive (metadata only, the file did not change);
 // FALSE for RegenFile, where the operator may have put a new file in place
@@ -172,12 +178,44 @@ RegenToDatabase(Database *DB, char *basename, char *filename, const char *device
 	int rc = CallImportConverterN(NULL, pDDO, 2500, NULL, NULL, NULL, NULL, &PDU, NULL, NULL);
         if (rc==2) return ( FALSE );
 
+	// outgoing storage commitment: the record is entered under an admission of its study, so no
+	// verified delete of the study runs meanwhile. Refused while one still runs after
+	// OutgoingSCDeleteWriteWait (*** line); skipped when the file is gone once admitted (a verified
+	// delete removed it after it was read here): no record for a deleted file
+	int scHold = -2;
+	if (OutgoingStorageCommitment)
+		{
+		char study[68], what[1200];
+		VR *vr = pDDO->GetVR(0x0020, 0x000d);
+		study[0] = 0;
+		if (vr && vr->Data && vr->Length>0 && vr->Length<sizeof(study))
+			{ memcpy(study, vr->Data, vr->Length); study[vr->Length] = 0; }
+		snprintf(what, sizeof(what), "regen of %s (record not entered)", filename);
+		scHold = SCStudyHoldBegin(study, what);
+		if (scHold==-4)
+			{
+			delete pDDO;
+			return ( FALSE );
+			}
+		FILE *f = fopen(filename, "rb");
+		if (f) fclose(f);
+		else
+			{
+			SCStudyHoldEnd(scHold);
+			delete pDDO;
+			OperatorConsole.printf("***[Regen] %s -SKIPPED: the file was removed (verified delete) after it was read: record not entered\n", filename);
+			return ( FALSE );
+			}
+		}
+
 	if(!SaveToDataBaseEx(*DB, pDDO, basename, device, FALSE, Rebuild))
 		{
+		SCStudyHoldEnd(scHold);
 		delete pDDO;
 		OperatorConsole.printf("***[Regen] %s -FAILED: Error SQL Add\n", filename);
 		return ( FALSE );
 		}
+	SCStudyHoldEnd(scHold);
 	delete pDDO;
 	OperatorConsole.printf("[Regen] %s -SUCCESS\n", filename);
 	return ( TRUE );

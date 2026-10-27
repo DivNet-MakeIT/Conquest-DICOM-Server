@@ -1442,6 +1442,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			file has the FileStamp of a COMMITTED SCObject row of the AE (the archive holds the UIDs, but
 			a file rewritten after its committed send is newer than the archived copy); read only, can
 			only turn 1 into 0. Test-only key SCTestNoFileStamp
+20261027	mmd	Outgoing storage commitment: SCObject.DestTLS 2 for a send with the TLS legacy profile (TL; 1 =
+			T, 0 = plain): a node switched between T and TL is a destination change (HELD, no re-send)
 
 ENDOFUPDATEHISTORY
 */
@@ -20526,6 +20528,29 @@ BOOL	SCPrepareTLS(PDU_Service &PDU, ACRNemaAddress &E)
 	return PDU.SetTLS((E.Flags & ACR_TLSLEGACY) ? 2 : 1, E.Name);
 	}
 
+// The transport of a map entry as SCObject.DestTLS records it: 0 plain, 1 TLS (T), 2 TLS with the
+// legacy profile (TL). A node switched between T and TL is a destination change like a new address.
+int	SCMapTLS(ACRNemaAddress &E)
+	{
+	if (!(E.Flags & ACR_TLS)) return 0;
+	return (E.Flags & ACR_TLSLEGACY) ? 2 : 1;
+	}
+
+// map entry flags with the transport of a recorded DestTLS (for SCPrepareTLS)
+int	SCFlagsForTLS(int Flags, int tls)
+	{
+	Flags &= ~(ACR_TLS | ACR_TLSLEGACY);
+	if (tls==1) Flags |= ACR_TLS;
+	if (tls==2) Flags |= ACR_TLS | ACR_TLSLEGACY;
+	return Flags;
+	}
+
+// for the console: "", " TLS", " TLS legacy"
+const char *SCTLSName(int tls)
+	{
+	return tls==2 ? " TLS legacy" : tls ? " TLS" : "";
+	}
+
 // Connect sites (fix round 1): resolve the called AE ONCE and take address, port,
 // compression AND transport from that single map entry. GetACRNema followed by a
 // second lookup for the TLS flag could see two map versions (read_amap/put_amap in
@@ -24940,7 +24965,7 @@ void SCNoteSentEx2(const char *CalledAE, const char *IP, const char *Port, int T
 		strcpy(q->ae, ae);
 		strcpy(q->ip, IP);
 		strcpy(q->port, Port);
-		q->tls = TLS ? 1 : 0;
+		q->tls = (TLS==1 || TLS==2) ? TLS : (TLS ? 1 : 0);	// 0 plain, 1 TLS, 2 TLS legacy profile
 		strcpy(q->cls, SOPClassUID);
 		strcpy(q->inst, SOPInstanceUID);
 		if (StudyUID && SCIsUID(StudyUID)) strcpy(q->study, StudyUID);
@@ -25005,7 +25030,7 @@ void SCNoteSentSeq(const char *AE, const char *SOPClassUID, const char *SOPInsta
 	strncpy(ae, AE, 16);
 	SCTrim(ae);
 	if (!SCIsAE(ae) || !GetACRNemaEntryByAE(ae, &E)) return;
-	SCNoteSentEx2(ae, E.IP, E.Port, (E.Flags & ACR_TLS) ? 1 : 0, SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq, NULL);
+	SCNoteSentEx2(ae, E.IP, E.Port, SCMapTLS(E), SOPClassUID, SOPInstanceUID, StudyUID, MayDiffer, seq, NULL);
 	}
 
 // without a send sequence: the send is taken as started now
@@ -26436,7 +26461,7 @@ static int SCSendAction(const char *ae, ACRNemaAddress *E, const char *TxUID, SC
 	// cannot be used)
 	ACRNemaAddress EE = *E;
 	strcpy(EE.Name, called);
-	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
+	EE.Flags = SCFlagsForTLS(EE.Flags, it[0].tls);
 	SCPrepareTLS(PDU, EE);
 
 	BOOL timedout;
@@ -27136,14 +27161,14 @@ static int SCSendChunk(Database &DB, const char *ae, const char *study, SCItem *
 		}
 
 	// objects sent to another address (or TLS setting) than the map has now -> HELD
-	tls = (E.Flags & ACR_TLS) ? 1 : 0;
+	tls = SCMapTLS(E);			// 0 plain, 1 T, 2 TL
 	for (i=k=0; i<n; i++)
 		{
 		if (strcmp(it[i].ip, E.IP)!=0 || strcmp(it[i].port, E.Port)!=0 || it[i].tls!=tls)
 			{
 			if (nheld++==0)
 				OperatorConsole.printf("*** Storage commitment ALARM: %s changed in acrnema.map (sent to %s %s%s, now %s %s%s)\n",
-					ae, it[i].ip, it[i].port, it[i].tls ? " TLS" : "", E.IP, E.Port, tls ? " TLS" : "");
+					ae, it[i].ip, it[i].port, SCTLSName(it[i].tls), E.IP, E.Port, SCTLSName(tls));
 			SCSetItems(DB, ae, it+i, 1, "HELD");
 			}
 		else
@@ -27375,7 +27400,7 @@ static BOOL SCResendStillAllowed(Database &DB, const char *ae, const char *aew, 
 	char state[16];
 	int rlimit = SCResendLimit(ae, &E);
 	if (!rlimit) return FALSE;
-	if (strcmp(x->ip, E.IP)!=0 || strcmp(x->port, E.Port)!=0 || x->tls!=((E.Flags & ACR_TLS) ? 1 : 0)) return FALSE;
+	if (strcmp(x->ip, E.IP)!=0 || strcmp(x->port, E.Port)!=0 || x->tls!=SCMapTLS(E)) return FALSE;
 	if (rlimit!=ACR_RESEND_ALWAYS && ((long long)x->first < (long long)now - OutgoingSCDeadline || x->res > rlimit)) return FALSE;
 	SCObjectState(DB, aew, x->inst, state);
 	return strcmp(state, "FAILED")==0;
@@ -27399,7 +27424,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 	SCAEWhere(DB, aew, ae);
 	rlimit = SCResendLimit(ae, &E);			// checked again at reservation
 	if (!rlimit) return SC_CHUNK_DONE;
-	tls = (E.Flags & ACR_TLS) ? 1 : 0;
+	tls = SCMapTLS(E);			// 0 plain, 1 T, 2 TL
 
 	// sent to another address or TLS setting than the map has now -> HELD, never to the new address
 	for (i=k=0; i<n; i++)
@@ -27408,7 +27433,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 			{
 			if (nheld++==0)
 				OperatorConsole.printf("*** Storage commitment ALARM: %s changed in acrnema.map (sent to %s %s%s, now %s %s%s), no re-send\n",
-					ae, it[i].ip, it[i].port, it[i].tls ? " TLS" : "", E.IP, E.Port, tls ? " TLS" : "");
+					ae, it[i].ip, it[i].port, SCTLSName(it[i].tls), E.IP, E.Port, SCTLSName(tls));
 			SCResendUpdate(DB, aew, it[i].inst, "State = 'HELD'");
 			}
 		else it[k++] = it[i];
@@ -27484,7 +27509,7 @@ static int SCResendBatch(Database &DB, const char *ae, SCResendItem *it, int n, 
 	// only the recorded destination of the first send (equal to the map: others were HELD above)
 	ACRNemaAddress EE = E;
 	strcpy(EE.Name, ae);
-	EE.Flags = it[0].tls ? (EE.Flags | ACR_TLS) : (EE.Flags & ~ACR_TLS);
+	EE.Flags = SCFlagsForTLS(EE.Flags, it[0].tls);
 	SCPrepareTLS(PDU, EE);
 
 	char attempt[64];

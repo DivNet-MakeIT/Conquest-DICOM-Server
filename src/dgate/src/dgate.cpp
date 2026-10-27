@@ -1366,6 +1366,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261027	mmd	Converter forwards: a kept association is closed and made again when its TLS mode differs
 			from the map now (e.g. T added by a map reload while a plain association is open) or,
 			with TLS on either side, its address, port, called AE or certificate AE differ
+20261027	mmd	Converter forwards with a dest clause: TLS when the "to" entry or the entry of the called
+			AE (dest) has T (legacy profile only when every such entry has L); the certificate is
+			checked against the line of the called AE in TLSNodeCertsFile, else that of the "to" AE
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -6276,7 +6279,7 @@ BOOL CallExportConverterN(char *pszFileName, int N, char *pszModality, char *psz
 	q = strchr(line+offset, ' '); if (q) *q=0;
 	c=compress; 
 	if (compress[0]) c=dummy;
-	if(!ForwardResolve(line+offset, (char *)host, (char *)port, (char *)c, &FT))
+	if(!ForwardResolve(line+offset, (char *)dest, (char *)host, (char *)port, (char *)c, &FT))
         { // it does not exist: get host:port
 	  strcpy(host, line+offset);
           p = strchr(host, ':');
@@ -10776,7 +10779,7 @@ int CallImportConverterN(DICOMCommandObject *DCO, DICOMDataObject *DDO, int N, c
       c=compress; 
       if (compress[0]) c=dummy;
       // resolved into FT: PDU[channel] is shared and only changed under import_critical below
-      if(!ForwardResolve(line+offset, (char *)host, (char *)port, (char *)c, &FT))
+      if(!ForwardResolve(line+offset, (char *)dest, (char *)host, (char *)port, (char *)c, &FT))
       { strcpy(host, line+offset);
         p = strchr(host, ':');
         if (p) 
@@ -20680,30 +20683,56 @@ static	void	ForwardTrimAE(const char *AE, char *ae)
 		ae[strlen(ae)-1] = 0;
 	}
 
-// Converter forwards ("forward to X"): X is resolved ONCE into ip, port, compress and T
-// (transport from the same map entry, as GetACRNemaForConnect) without touching a PDU. The
-// forward PDUs of the import converters are shared by all threads (one per converter and
-// channel), so the transport is set on a PDU only under the lock of that PDU, right before
-// its Connect (ForwardApplyTLS): no other thread can change the transport, or the AE whose
-// certificate is checked, of a connection being made. Returns FALSE when X is not in the map
-// (T->Mode 0: the caller's host:port fallback stays plain, as before). compress may be NULL.
-BOOL	ForwardResolve(char *to, char *ip, char *port, char *compress, ForwardTarget *T)
+static	int	TLSNodeCertListed(const char *AE);	// below: AE has a line in TLSNodeCertsFile
+
+// Converter forwards ("forward to X [dest Y]"): X is resolved ONCE into ip, port, compress
+// (as GetACRNemaForConnect) and T, without touching a PDU. The forward PDUs of the import
+// converters are shared by all threads (one per converter and channel), so the transport is
+// set on a PDU only under the lock of that PDU, right before its Connect (ForwardApplyTLS):
+// no other thread can change the transport, or the AE whose certificate is checked, of a
+// connection being made.
+// Transport: TLS when the entry of X or, with dest, the entry of the called AE Y has T (the
+// node behind the address of X is reached as Y); the legacy profile only when every one of
+// them with T also has L, else strict. Certificate: the line of Y in TLSNodeCertsFile, else
+// the line of X (when X is in the map and has one), else Y; without dest, X as before.
+// Returns FALSE when X is not in the map: the caller's host:port fallback (plain, as before,
+// unless Y has T). compress may be NULL.
+BOOL	ForwardResolve(char *to, char *dest, char *ip, char *port, char *compress, ForwardTarget *T)
 	{
-	ACRNemaAddress	E;
+	ACRNemaAddress	E, D;
+	BOOL		haveE, needE, needD = FALSE;
+	char		called[20], toae[20];
 
 	memset(T, 0, sizeof(*T));
-	if (!to || !GetACRNemaEntryByAE(to, &E))
-		return FALSE;
-	strcpy(ip, E.IP);
-	strcpy(port, E.Port);
-	if (compress)
-		strcpy(compress, E.Compress);
-	if (E.Flags & ACR_TLS)
+	haveE = to && GetACRNemaEntryByAE(to, &E);
+	if (haveE)
 		{
-		T->Mode = (E.Flags & ACR_TLSLEGACY) ? 2 : 1;
-		ForwardTrimAE(to, T->CertAE);
+		strcpy(ip, E.IP);
+		strcpy(port, E.Port);
+		if (compress)
+			strcpy(compress, E.Compress);
 		}
-	return TRUE;
+	needE = haveE && (E.Flags & ACR_TLS);
+	if (dest && dest[0] && GetACRNemaEntryByAE(dest, &D))
+		needD = (D.Flags & ACR_TLS) != 0;
+	if (needE || needD)
+		{
+		BOOL legacyE = !needE || (E.Flags & ACR_TLSLEGACY);
+		BOOL legacyD = !needD || (D.Flags & ACR_TLSLEGACY);
+		T->Mode = legacyE && legacyD ? 2 : 1;
+		ForwardTrimAE(to, toae);
+		if (dest && dest[0])
+			{
+			ForwardTrimAE(dest, called);
+			if (!TLSNodeCertListed(called) && haveE && TLSNodeCertListed(toae))
+				strcpy(T->CertAE, toae);
+			else
+				strcpy(T->CertAE, called);
+			}
+		else
+			strcpy(T->CertAE, toae);
+		}
+	return haveE;
 	}
 
 // The transport of T on PDU for its next Connect (call it under the PDU's lock)
@@ -21582,6 +21611,15 @@ static	int	TLSNodeCertLookup(const char *AE, unsigned char fp[2][TLS_FP_BYTES], 
 	return r;
 	}
 
+// AE has a line (valid or not) in TLSNodeCertsFile: its certificate is bound by that line
+static	int	TLSNodeCertListed(const char *AE)
+	{
+	unsigned char	fp[2][TLS_FP_BYTES];
+	char		file[256];
+	int		n = 0;
+	return AE && AE[0] && TLSNodeCertLookup(AE, fp, &n, file, sizeof(file)) != 0;
+	}
+
 // The SHA-256 fingerprint of cert against the n listed fingerprints. hex gets the certificate's
 // fingerprint (2*EVP_MAX_MD_SIZE+1 bytes). 1 = one matches, 0 = none, -1 = no certificate.
 static	int	TLSNodeCertMatches(X509 *cert, unsigned char fp[2][TLS_FP_BYTES], int n, char *hex)
@@ -21892,6 +21930,7 @@ static	struct	TLSHooksInit
 
 // without OpenSSL: node certificates are not used; read_tlscerts: says so
 void	StartTLSNodeCerts(void) { }
+static	int	TLSNodeCertListed(const char *AE) { return 0; }
 BOOL	ReadTLSNodeCerts(void)
 	{
 	OperatorConsole.printf("*** TLS: read_tlscerts: this dgate was built without TLS support\n");

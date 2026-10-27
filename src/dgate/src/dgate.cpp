@@ -1460,6 +1460,10 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			change time (which a user tool cannot set back) is part of it (the device number is not: it
 			changes when a file system is mounted again); a stamp only when both times have nanoseconds. Stamps of earlier builds count as none (step 7: no
 			match; reconciliation: the whole-second rule)
+20261027	mmd	Outgoing storage commitment: OutgoingSCConnectTimeout is one absolute deadline (Socket
+			Deadline) for TCP connect, TLS handshake, A-ASSOCIATE-RQ and the A-ASSOCIATE-AC read of
+			the worker's requests and re-sends: a peer that never answers or sends the AC byte by byte
+			is cut off at the deadline
 
 ENDOFUPDATEHISTORY
 */
@@ -26271,18 +26275,23 @@ static void SCResendAttempt(int a, int rlimit, ACRNemaAddress *E, char *out)
 	}
 
 // Connect for the worker (a request or a re-send): TCP connect, TLS handshake and the association
-// setup within OutgoingSCConnectTimeout, so that a destination that does not answer holds up the
-// others for at most that long (ordinary C-STORE and forwards keep TCPIPTimeOut); afterwards the
-// socket time limit is TCPIPTimeOut again. *timedout: failed because the limit ran out.
+// setup (A-ASSOCIATE-RQ written, A-ASSOCIATE-AC read) all end by ONE deadline, OutgoingSCConnectTimeout
+// after the start (Socket::Deadline: every wait is cut to it, and past it every read and write
+// fails at once, so a peer that never answers or trickles the AC byte by byte cannot hold the
+// worker), so that a destination that does not answer holds up the others for at most that long
+// (ordinary C-STORE and forwards keep TCPIPTimeOut); afterwards the socket time limit is
+// TCPIPTimeOut again and there is no deadline. *timedout: failed because the limit ran out.
 static BOOL SCConnect(PDU_Service &PDU, char *ip, char *port, BOOL *timedout)
 	{
 	time_t t0 = time(NULL);
 	BOOL ok;
 	PDU.Link.ConnectTimeOut = OutgoingSCConnectTimeout;
+	PDU.Link.Deadline = (long)t0 + OutgoingSCConnectTimeout;
 	PDU.SetTimeOut(OutgoingSCConnectTimeout);
 	ok = PDU.Connect((unsigned char *)ip, (unsigned char *)port);
 	PDU.SetTimeOut(TCPIPTimeOut);
 	PDU.Link.ConnectTimeOut = 0;
+	PDU.Link.Deadline = 0;
 	*timedout = !ok && (PDU.Link.ConnectTimedOut || (long)(time(NULL) - t0) >= OutgoingSCConnectTimeout);
 	return ok;
 	}

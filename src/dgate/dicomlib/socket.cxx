@@ -44,6 +44,8 @@
 20261026	mmd	ConnectTimeOut (0 = as before): when set, all connect attempts end at that
 			limit also for plain sockets (non-blocking connect, then blocking again),
 			the TLS handshake is limited to it, and ConnectTimedOut tells a timeout
+20261027	mmd	Deadline (0 = as before): an absolute end for the connect attempts, the TLS
+			handshake, reads (plain and TLS) and writes; past it they fail at once
 
 */
 
@@ -143,6 +145,7 @@ Socket	::	Socket ()
 	TLSPeerAE[0] = 0;
 	ConnectTimeOut = 0;
 	ConnectTimedOut = FALSE;
+	Deadline = 0;
 	TimeOut = 60 * 5;	// 5 minutes	
 	UDP = 0;
 	if(! WinSockUsed )
@@ -240,6 +243,7 @@ Socket	::	Socket()
 	TLSPeerAE[0] = 0;
 	ConnectTimeOut = 0;
 	ConnectTimedOut = FALSE;
+	Deadline = 0;
 	}
 
 Socket	::	~Socket()
@@ -598,6 +602,8 @@ BOOL	Socket	::	Open ( char	*ip, char	*port)
 	// would otherwise block for the kernel's connect timeout, per attempt)
 	int	ConnectLimit = ConnectTimeOut > 0 ? ConnectTimeOut : (TimeOut > 0 ? TimeOut : 300);
 	long	ConnectEnd = (long) time(NULL) + ConnectLimit;
+	if ( Deadline > 0 && Deadline < ConnectEnd )
+		ConnectEnd = Deadline;		// the overall deadline comes first
 	for (int i=0; i<5; i++)
 		{
 #ifdef	HAVE_OPENSSL
@@ -743,6 +749,8 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 
 	for (int i=1; i<200; i++)
 		{
+		if ( Deadline > 0 && (long) time(NULL) >= Deadline )
+			return FALSE;		// past the overall deadline
 		long put = send ( Socketfd, (char *) s, count, 0);
 		if (put>0)
 			{
@@ -779,6 +787,14 @@ INT	Socket	::	ReadBinary(BYTE *s, UINT	count)
 	if ( TLSHandle )
 		return ( TLSRead(s, count) );
 #endif
+	if ( Deadline > 0 && TimeOut )
+		{
+		long left = Deadline - (long) time(NULL);
+		if ( left <= 0 )
+			return ( -1 );		// past the overall deadline: no more waiting
+		if ( left < (long) tv.tv_sec )
+			tv.tv_sec = left;
+		}
 #ifdef	MAC
 	memset((void*)&fds, 0, sizeof(struct fd_set));
 #else
@@ -1122,6 +1138,8 @@ BOOL	Socket	::	TLSOpen(char *host)
 	if (ConnectTimeOut > 0 && ConnectTimeOut < limit)
 		limit = ConnectTimeOut;
 	end = time(NULL) + limit;
+	if (Deadline > 0 && (time_t) Deadline < end)
+		end = (time_t) Deadline;	// the overall deadline comes first
 	for (;;)
 		{
 		ERR_clear_error();
@@ -1306,6 +1324,8 @@ BOOL	Socket	::	TLSSend(BYTE *s, UINT count)
 			return ( FALSE );
 			}
 		left = (int)(end - time(NULL));
+		if (Deadline > 0 && (long)(Deadline - time(NULL)) < left)
+			left = (int)(Deadline - time(NULL));	// the overall deadline comes first
 		if (left <= 0 || TLSWait(w, left) <= 0)
 			{
 			SocketTLSPrint(0, "*** TLS: send to %s timed out", TLSPeerAE);
@@ -1327,6 +1347,8 @@ INT	Socket	::	TLSRead(BYTE *s, UINT count)
 	time_t	end = time(NULL) + TimeOut;
 	char	why[256];
 
+	if (Deadline > 0 && (time_t) Deadline < end)
+		end = (time_t) Deadline;	// the overall deadline comes first
 	if (count > 0x40000000) count = 0x40000000;
 	for (;;)
 		{

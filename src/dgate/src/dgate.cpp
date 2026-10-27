@@ -20551,7 +20551,7 @@ const char *SCTLSName(int tls)
 	return tls==2 ? " TLS legacy" : tls ? " TLS" : "";
 	}
 
-// Connect sites (fix round 1): resolve the called AE ONCE and take address, port,
+// Connect sites: resolve the called AE ONCE and take address, port,
 // compression AND transport from that single map entry. GetACRNema followed by a
 // second lookup for the TLS flag could see two map versions (read_amap/put_amap in
 // between) and connect to the old address with the new entry's transport, so a node
@@ -20765,7 +20765,7 @@ static	BOOL	TLSSetLegacyCiphers(SSL_CTX *ctx)
 	}
 
 // TRUE when ssl was made from a legacy context (map option L or TLSLegacyPort)
-static	SSL_CTX	*TLSLegacyServerCtx = NULL;	// incoming TLSLegacyPort (L2); NULL until then
+static	SSL_CTX	*TLSLegacyServerCtx = NULL;	// incoming TLSLegacyPort; NULL until then
 static	BOOL	TLSIsLegacy(SSL *ssl)
 	{
 	SSL_CTX	*c = ssl ? SSL_get_SSL_CTX(ssl) : NULL;
@@ -21162,7 +21162,7 @@ static	BOOL	TLSCertMatchesHost(X509 *cert, const char *host)
 	}
 
 ////////////////////////////////////////////////////////////////////////////////
-// Node certificates: TLSNodeCertsFile (fix round 1, T9). One mechanism, no dicom.ini keys
+// Node certificates: TLSNodeCertsFile. One mechanism, no dicom.ini keys
 // per AE. The table is built aside and swapped in under TLSNodeCertCritical; lookups copy
 // the entry out under the lock (as acrnema.map in amap.cpp).
 #define	TLS_FP_BYTES	32		// SHA-256
@@ -21450,7 +21450,7 @@ static	int	TLSNodeCertMatches(X509 *cert, unsigned char fp[2][TLS_FP_BYTES], int
 	return 0;
 	}
 
-// The operator console line of every TLS connection (owner: TLS data in the normal log):
+// The operator console line of every TLS connection (all TLS data in the normal log):
 // dir "connected to" (outgoing) or "incoming from" (incoming), AE, peer IP, protocol,
 // cipher, profile and the node certificate result. Refusals have their own "*** TLS:" lines.
 static	void	TLSLogConnection(SSL *ssl, const char *dir, const char *AE, const char *peer, const char *cert)
@@ -21638,7 +21638,7 @@ static	BOOL	TLSPortSameAsTCPPort(void)
 	return TLSPortsSame(TLSPort, Port);
 	}
 
-// Incoming legacy profile (L2): the third listener, only when TLSLegacyPort is set
+// Incoming legacy profile: the third listener, only when TLSLegacyPort is set
 static	void	StartTLSLegacyListener(void)
 	{
 	SSL_CTX	*ctx;
@@ -21874,7 +21874,7 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 
 // Entry (optional): the map entry the address came from, with Name = the move
 // destination as looked up (before SendUpperCaseAE), so that the C-MOVE
-// sub-association takes its transport from the same lookup (fix round 1)
+// sub-association takes its transport from the same lookup
 BOOL
 QualifyOn(
 	BYTE	*ACRNema,
@@ -25132,7 +25132,7 @@ static int SCNotedLength(unsigned int *dropped)
 // destination), or an older COMMITTED row can stand for a send that went somewhere else. Which
 // studies are affected is not known, so the first drop sets "commitment unsafe" (sentinel file,
 // SCUnsafeSet, no database): no study is confirmed until the queue has drained and the operator
-// clears it with sc_unsafe_clear: (or sc_overflow_clear:, the same). Builds of round 2 kept this
+// clears it with sc_unsafe_clear: (or sc_overflow_clear:, the same). Earlier development builds kept this
 // epoch in table SCMarker (Name 'OVERFLOW'); such a row is taken over once by the worker
 // (SCMarkerTakeOver) and removed by the clear.
 

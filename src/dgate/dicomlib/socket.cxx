@@ -54,6 +54,8 @@
 20261027	mmd	Plain connect: bounded (non-blocking, SocketConnectBefore) also when only Deadline is set
 20261027	mmd	Deadline bounds plain sends: Unix SocketSendBefore (MSG_DONTWAIT, poll() for writability,
 			partial writes counted, FALSE at the deadline); Windows checks the deadline before the send
+20261027	mmd	Windows: Deadline bounds plain sends too (SocketSendBefore: FIONBIO for the send, partial
+			writes counted, select() for writability cut to the deadline, blocking again afterwards)
 
 */
 
@@ -767,8 +769,44 @@ BOOL	Socket	::	Poll(void)
 	}
 
 #ifdef	WINDOWS
-// Windows: with Deadline set the send fails once the deadline has passed; a plain send that has
-// started is not cut at the deadline (blocking socket, as upstream; TLS sends are bounded)
+// Windows, plain, Deadline set: send all count bytes by the deadline (as SocketSendBefore on Unix).
+// Windows has no MSG_DONTWAIT: the socket is non-blocking (ioctlsocket FIONBIO) for this send only
+// and blocking again afterwards (the other plain paths expect that; one association is used by one
+// thread at a time). Partial writes are counted; while the send buffer is full (WSAEWOULDBLOCK) the
+// wait for writability is select() cut to the deadline (SocketWaitFd; a Windows fd_set is a list of
+// sockets, no descriptor-value limit). FALSE when the deadline passes first, the connection fails,
+// or the mode cannot be set or restored.
+static	BOOL	SocketSendBefore(int fd, BYTE *s, UINT count, long end)
+	{
+	u_long	nb = 1;
+	UINT	done = 0;
+	BOOL	ok = TRUE;
+	if (ioctlsocket(fd, FIONBIO, &nb) != 0)
+		return ( FALSE );
+	while (done < count)
+		{
+		long left = end - (long) time(NULL);
+		if (left <= 0)
+			{ ok = FALSE; break; }
+		int put = send(fd, (char *) s + done, (int) (count - done), 0);
+		if (put > 0)
+			{
+			done += (UINT) put;
+			continue;
+			}
+		if (put == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
+			{ ok = FALSE; break; }
+		if (SocketWaitFd(fd, 1, (int) left) < 0)
+			{ ok = FALSE; break; }
+		}
+	nb = 0;
+	if (ioctlsocket(fd, FIONBIO, &nb) != 0)
+		ok = FALSE;
+	return ( ok );
+	}
+
+// Windows: with Deadline set the send is bounded by it (SocketSendBefore); without, as upstream
+// (blocking send). TLS sends are bounded by TLSSend.
 BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	{
 	if ( !Connected)
@@ -777,9 +815,9 @@ BOOL		Socket	::	SendBinary(BYTE *s, UINT	count)
 	if ( TLSHandle )
 		return ( TLSSend(s, count) );
 #endif
-	if ( Deadline > 0 && (long) time(NULL) >= Deadline )
-		return ( FALSE );		// past the overall deadline
-	
+	if ( Deadline > 0 )
+		return ( SocketSendBefore(Socketfd, s, count, Deadline) );
+
 	if(send ( Socketfd, (char *) s, count, 0)<0)
 		{
 //		fprintf(stderr, "SOCKET END ERROR: %d\n", GetLastError());

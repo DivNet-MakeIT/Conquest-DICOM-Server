@@ -1507,6 +1507,8 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 			whose store was refused by a verified delete of its study (*** line, no retries, no
 			RejectedImageConverter; a later pass imports it); an archive with a refused object is kept
 			(AddImageFile, AttachFile: SCRefused through SaveToDisk). Other failures as before
+20261027	mmd	Outgoing storage commitment: SCRelease without a watchdog on Windows too goes on bounded by
+			Socket::Deadline (Windows plain sends now end at it)
 ENDOFUPDATEHISTORY
 */
 
@@ -26839,8 +26841,8 @@ static BOOL SCStopWatch(SCWatch *w)
 // cannot stall halfway either. The writes are bounded too: a destination that stopped reading
 // (full send buffer) cannot block the A-RELEASE-RQ past the deadline, nor the A-ABORT more than
 // 2 s (watchdog). Without a watchdog (no duplicate descriptor or no thread; always on Windows)
-// nothing is written unbounded: on a connection with Socket::Deadline (sc_verify_now:; Unix: the
-// plain and TLS writes end at it) the release goes on bounded by the deadline (the reply is read
+// nothing is written unbounded: on a connection with Socket::Deadline (sc_verify_now:; the plain
+// and TLS writes end at it, Unix and Windows) the release goes on bounded by the deadline (the reply is read
 // too: reads end at the deadline as well), otherwise the connection is closed without A-RELEASE
 // (console line) and no A-ABORT is written. buffered: data is already read into the PDU buffer
 // (it is read at once); what: the association, for the console line.
@@ -26855,11 +26857,7 @@ static void SCRelease(PDU_Service &PDU, BOOL buffered, const char *ae, const cha
 	if (PDU.Link.Deadline > 0 && (time_t)PDU.Link.Deadline < until)
 		until = (time_t)PDU.Link.Deadline;	// a connection with a deadline (sc_verify_now:) ends by it
 	// without a watchdog only a connection whose writes end at its Deadline may be written to
-#ifdef WIN32
-	BOOL	bounded = FALSE;		// Windows: a plain send is not cut at the deadline
-#else
-	BOOL	bounded = PDU.Link.Deadline > 0;
-#endif
+	BOOL	bounded = PDU.Link.Deadline > 0;	// plain and TLS writes end at it (Unix and Windows)
 	SCWatch *wwatch = SCStartWatch(PDU.Link.Socketfd, until);	// bounds the write
 	if (!wwatch && !bounded)
 		{

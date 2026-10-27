@@ -1369,6 +1369,9 @@ Spectra0013 Wed, 5 Feb 2014 16:57:49 -0200: Fix cppcheck bugs #8 e #9
 20261027	mmd	Converter forwards with a dest clause: TLS when the "to" entry or the entry of the called
 			AE (dest) has T (legacy profile only when every such entry has L); the certificate is
 			checked against the line of the called AE in TLSNodeCertsFile, else that of the "to" AE
+20261027	mmd	TLSNodeCertsFile set but not loaded (unreadable or damaged at its first load in the
+			process): every TLS association is refused, outgoing and incoming, until it loads
+			(read_tlscerts:); a failed reload keeps the previous table as before
 20261026	mmd	Outgoing storage commitment: a local rewrite is marked "in progress" from the moment its
 			rows are demoted until its file is written; sends noted or recorded meanwhile are stale,
 			and after the write the rows are demoted again synchronously (Gen + 1, CHANGED)
@@ -21362,6 +21365,10 @@ static	TLSNodeCertEntry	*TLSNodeCertTable = NULL;
 static	int		TLSNodeCertCount = 0;
 static	int		TLSNodeCertTried = 0;		// a load was attempted in this process
 static	int		TLSNodeCertHave = 0;			// the file was loaded (kept when a reload fails)
+// TLSNodeCertsFile is set but no table was ever loaded from it (unreadable or damaged at the
+// first load): every TLS association is refused until a load succeeds (fail closed; an empty
+// table would leave every node unbound without anyone noticing)
+static	int		TLSNodeCertUnavailable = 0;
 static	char		TLSNodeCertFileName[256] = "";	// the file the table came from
 
 // TLSNodeCertsFile: a name without a path is in the dgate directory, as acrnema.map
@@ -21404,11 +21411,12 @@ static BOOL TLSNodeCertsKeep(const char *path, const char *why)
 	int have, n;
 	EnterCriticalSection(&TLSNodeCertCritical);
 	have = TLSNodeCertHave; n = TLSNodeCertCount; TLSNodeCertTried = 1;
+	if (!have) TLSNodeCertUnavailable = 1;
 	LeaveCriticalSection(&TLSNodeCertCritical);
 	if (have)
 		OperatorConsole.printf("*** TLS: node certificate file %s %s: the node certificates loaded before (%d AEs) are kept\n", path, why, n);
 	else
-		OperatorConsole.printf("*** TLS: node certificate file %s %s: none loaded, no TLS node is bound to a certificate\n", path, why);
+		OperatorConsole.printf("*** TLS: node certificate file %s %s: none loaded, every TLS association is refused until it loads (read_tlscerts:)\n", path, why);
 	return FALSE;
 	}
 
@@ -21427,6 +21435,7 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 		{
 		EnterCriticalSection(&TLSNodeCertCritical);
 		old = TLSNodeCertTable; TLSNodeCertTable = NULL; TLSNodeCertCount = 0; TLSNodeCertTried = 1; TLSNodeCertHave = 0;
+		TLSNodeCertUnavailable = 0;
 		TLSNodeCertFileName[0] = 0;
 		LeaveCriticalSection(&TLSNodeCertCritical);
 		if (old) free(old);
@@ -21455,11 +21464,12 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 		{
 		EnterCriticalSection(&TLSNodeCertCritical);
 		have = TLSNodeCertHave; i = TLSNodeCertCount; TLSNodeCertTried = 1;
+		if (!have) TLSNodeCertUnavailable = 1;
 		LeaveCriticalSection(&TLSNodeCertCritical);
 		if (have)
 			OperatorConsole.printf("*** TLS: node certificate file %s cannot be read: the node certificates loaded before (%d AEs) are kept\n", path, i);
 		else
-			OperatorConsole.printf("*** TLS: node certificate file %s cannot be read: none loaded, no TLS node is bound to a certificate\n", path);
+			OperatorConsole.printf("*** TLS: node certificate file %s cannot be read: none loaded, every TLS association is refused until it loads (read_tlscerts:)\n", path);
 		return FALSE;
 		}
 
@@ -21570,6 +21580,7 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 
 	EnterCriticalSection(&TLSNodeCertCritical);
 	old = TLSNodeCertTable; TLSNodeCertTable = table; TLSNodeCertCount = count; TLSNodeCertTried = 1; TLSNodeCertHave = 1;
+	TLSNodeCertUnavailable = 0;
 	snprintf(TLSNodeCertFileName, sizeof(TLSNodeCertFileName), "%s", path);
 	LeaveCriticalSection(&TLSNodeCertCritical);
 	if (old) free(old);
@@ -21578,8 +21589,9 @@ static	BOOL	LoadTLSNodeCerts(BOOL tell)
 	}
 
 // The node certificate fingerprints of AE (compared without case). Returns 0 = AE not
-// listed, 1 = listed (fp, n), -1 = the line of AE is invalid: refuse. file gets the
-// file name for messages.
+// listed, 1 = listed (fp, n), -1 = the line of AE is invalid: refuse, -2 = TLSNodeCertsFile
+// is set but was never loaded (TLSNodeCertUnavailable): refuse every TLS association. file
+// gets the file name for messages.
 // A process that did not load the file at startup loads it on first use.
 static	int	TLSNodeCertLookup(const char *AE, unsigned char fp[2][TLS_FP_BYTES], int *n, char *file, int filelen)
 	{
@@ -21594,6 +21606,12 @@ static	int	TLSNodeCertLookup(const char *AE, unsigned char fp[2][TLS_FP_BYTES], 
 	*n = 0;
 	EnterCriticalSection(&TLSNodeCertCritical);
 	snprintf(file, filelen, "%s", TLSNodeCertFileName[0] ? TLSNodeCertFileName : "TLSNodeCertsFile");
+	if (TLSNodeCertUnavailable)
+		{
+		LeaveCriticalSection(&TLSNodeCertCritical);
+		TLSNodeCertsFilePath(file, filelen);
+		return -2;
+		}
 	for (i=0; i<TLSNodeCertCount; i++)
 		if (stricmp(TLSNodeCertTable[i].AE, AE)==0)
 			{
@@ -21657,6 +21675,13 @@ static	BOOL	TLSAfterHandshake(void *s, const char *AE, const char *host)
 	char		file[256], hex[2*EVP_MAX_MD_SIZE+1];
 	unsigned char	fp[2][TLS_FP_BYTES];
 	int		good = 0, n = 0, r;
+
+	// TLSNodeCertsFile set but never loaded: no TLS association at all (fail closed)
+	if (TLSNodeCertLookup(AE, fp, &n, file, sizeof(file)) == -2)
+		{
+		OperatorConsole.printf("*** TLS: connection to %s (%s) refused: node certificate file %s (TLSNodeCertsFile) is not loaded; every TLS association is refused until it loads (read_tlscerts:)\n", AE, host, file);
+		return FALSE;
+		}
 
 	// legacy profile: ephemeral key, chain keys and signatures (TLSLegacyPolicy)
 	if (TLSIsLegacy(ssl))
@@ -21749,6 +21774,11 @@ static	BOOL	TLSCheckIncomingNodeCert(PDU_Service *PDU, const char *AE, const cha
 	int		good, n = 0, r;
 
 	r = TLSNodeCertLookup(AE, fp, &n, file, sizeof(file));	// AE compared without case
+	if (r == -2)
+		{
+		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: node certificate file %s (TLSNodeCertsFile) is not loaded\n", AE, peer, file);
+		return FALSE;
+		}
 	if (r < 0)
 		{
 		OperatorConsole.printf("*** TLS: association from %s (%s) rejected: certificate of %s in %s is invalid (see the load warning)\n", AE, peer, AE, file);
@@ -21999,6 +22029,17 @@ BOOL	TLSCheckCallingAE(PDU_Service *PDU, BYTE *CallingAE)
 	if (PDU->Link.TLSHandle)
 		{
 #ifdef	HAVE_OPENSSL
+		// TLSNodeCertsFile set but never loaded: no TLS association at all (fail closed)
+			{
+			char		ufile[256];
+			unsigned char	ufp[2][TLS_FP_BYTES];
+			int		un;
+			if (TLSNodeCertLookup("", ufp, &un, ufile, sizeof(ufile)) == -2)
+				{
+				OperatorConsole.printf("*** TLS: association from %s rejected: node certificate file %s (TLSNodeCertsFile) is not loaded; every TLS association is refused until it loads (read_tlscerts:)\n", peer, ufile);
+				return FALSE;
+				}
+			}
 		form = TLSCanonicalAE(CallingAE, ae);
 		if (form==0)
 			{

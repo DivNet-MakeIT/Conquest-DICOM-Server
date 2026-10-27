@@ -46,8 +46,9 @@ Lua scripts can read the same string in the global `buildvariant`, next to `vers
 - The changes never delete images. Deletion stays with the operator's scripts (see 3.9).
 
 The TLS build flags (`-DHAVE_OPENSSL -lssl -lcrypto`, OpenSSL ≥ 1.1.1) are **not** added to
-`maklinux` or other upstream build files. That is left to the maintainer. Windows (MSVC, Schannel or
-OpenSSL DLL packaging) was not built or tested.
+`maklinux` or other upstream build files. That is left to the maintainer. Windows builds (Visual
+Studio with `amake.bat`, an optional TLS build with OpenSSL, mingw-w64) and the Windows
+limits are described in [Building-Windows.md](Building-Windows.md).
 
 ---
 
@@ -580,8 +581,8 @@ C-MOVE when it was rewritten locally or sent by a path without a stamp.
   - every write: TLS on every platform; plain writes are non-blocking and end at the deadline (an
     archive that accepts the association and then stops reading cannot hold a large N-ACTION):
     on Unix with `MSG_DONTWAIT` and `poll()`, on Windows with the socket non-blocking for the send
-    (`FIONBIO`) and `select()` (the Windows path is compiled by reasoning and a mingw-w64 check,
-    not run);
+    (`FIONBIO`) and `select()` (run on Windows 11: a peer that stops reading gives `0 no result`
+    at the timeout, see [Building-Windows.md](Building-Windows.md));
   - the release: without a watchdog (always on Windows) a verification's release is written
     bounded by the deadline, its reply read the same way.
 - One console line per verification (3.7), plus one per request and per result.
@@ -863,7 +864,9 @@ SC worker opens its own `Database` connection.
 The test harness lives outside this repository (Docker, synthetic data only, generated UIDs, a
 synthetic patient). Suites were run against sqlite, MariaDB and PostgreSQL builds, plain and TLS
 (DCMTK `storescp`/`storescu`/`echoscu +tls` and pynetdicom as peers), on Linux x86_64 and arm64
-containers. Every commit keeps the compile warning count at the baseline.
+containers. Every commit keeps the compile warning count at the baseline. Windows builds (MSVC x64
+and ARM64, mingw-w64, plain and TLS) were run on Windows 11 against a Linux dgate
+([Building-Windows.md](Building-Windows.md)).
 
 | Area | Covered |
 |---|---|
@@ -894,6 +897,9 @@ containers. Every commit keeps the compile warning count at the baseline.
   N-EVENT-REPORT-RSP is not evaluated, as in the original code.
 - Per-node SC timing keys and binding a certificate to an AE title (rather than a fingerprint) are
   not implemented.
+- Windows: `sc_verify_now:` never answers `1` (no file stamps, so `sc_verify_and_delete:` never
+  deletes), and the result of a storage commitment request always comes on a new association (no
+  same-association wait without a watchdog). See [Building-Windows.md](Building-Windows.md), section 5.
 
 **Upstream observations**
 1. **`AllowOnlyMappedRemoteAE` / `AllowOnlyMappedLocalAE` / `CheckIPofRemoteAE` are inactive.**
@@ -1051,4 +1057,9 @@ containers. Every commit keeps the compile warning count at the baseline.
 **Final studies of replacements and regen**
 - `b24c9bd` Outgoing storage commitment: replacements admit the study the worklist writes them to
 - `9b9123e` Outgoing storage commitment: regen admits the study of the file as well as that of the record
-- this commit: Docs: the final study of replacements and regen, commit map
+- `7f3b228` Docs: the final study of replacements and regen, commit map
+
+**Windows builds**
+- `23284c6` Ini cache: the lock is made at its first use (Windows startup crash)
+- `294b633` odbci.cpp: no #define _errno errno (Visual Studio 2015+ and mingw-w64)
+- this commit: Windows build: optional TLS build in amake.bat, mingw-w64 cross build, docs

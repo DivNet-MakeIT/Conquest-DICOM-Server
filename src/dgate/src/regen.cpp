@@ -61,6 +61,8 @@ mmd 20261026: Regen passes rebuild the database record only (SaveToDataBaseEx Re
 mmd 20261027: Outgoing storage commitment: the record is entered under an admission of its study
 	      (SCStudyHoldBegin): refused while a verified delete of the study still runs after
 	      OutgoingSCDeleteWriteWait, skipped when the file was removed after it was read
+mmd 20261027: Outgoing storage commitment: the study of the file before the import converter (2500) is
+	      admitted too when the converter changed the StudyInstanceUID of the record
 */
 
 // #define MULTITHREAD
@@ -128,6 +130,15 @@ extern int OutgoingStorageCommitment;
 int  SCStudyHoldBegin(const char *study, const char *what);
 void SCStudyHoldEnd(int slot);
 
+// outgoing storage commitment: the StudyInstanceUID of pDDO into study (68 bytes; "" if none)
+static void RegenStudyOf(DICOMDataObject *pDDO, char *study)
+	{
+	VR *vr = pDDO->GetVR(0x0020, 0x000d);
+	study[0] = 0;
+	if (vr && vr->Data && vr->Length>0 && vr->Length<68)
+		{ memcpy(study, vr->Data, vr->Length); study[vr->Length] = 0; }
+	}
+
 // Rebuild: TRUE for a regen pass over the archive (metadata only, the file did not change);
 // FALSE for RegenFile, where the operator may have put a new file in place
 BOOL
@@ -174,33 +185,48 @@ RegenToDatabase(Database *DB, char *basename, char *filename, const char *device
 	else
 		return FALSE;
 
+	// outgoing storage commitment: the study of the file as read, before the import converter (which
+	// may change the StudyInstanceUID of the record; the file keeps it)
+	char scFileStudy[68];
+	scFileStudy[0] = 0;
+	if (OutgoingStorageCommitment) RegenStudyOf(pDDO, scFileStudy);
+
 	lua_setvar(&PDU, "Filename", filename);
 	int rc = CallImportConverterN(NULL, pDDO, 2500, NULL, NULL, NULL, NULL, &PDU, NULL, NULL);
         if (rc==2) return ( FALSE );
 
-	// outgoing storage commitment: the record is entered under an admission of its study, so no
-	// verified delete of the study runs meanwhile. Refused while one still runs after
-	// OutgoingSCDeleteWriteWait (*** line); skipped when the file is gone once admitted (a verified
-	// delete removed it after it was read here): no record for a deleted file
-	int scHold = -2;
+	// outgoing storage commitment: the record is entered under an admission of the study of the file
+	// and of the study of the record (when the import converter changed it), so no verified delete of
+	// either runs meanwhile. Refused while one still runs after OutgoingSCDeleteWriteWait (*** line);
+	// skipped when the file is gone once admitted (a verified delete removed it after it was read
+	// here): no record for a deleted file
+	int scHold = -2, scHold2 = -2;
 	if (OutgoingStorageCommitment)
 		{
 		char study[68], what[1200];
-		VR *vr = pDDO->GetVR(0x0020, 0x000d);
-		study[0] = 0;
-		if (vr && vr->Data && vr->Length>0 && vr->Length<sizeof(study))
-			{ memcpy(study, vr->Data, vr->Length); study[vr->Length] = 0; }
+		RegenStudyOf(pDDO, study);
 		snprintf(what, sizeof(what), "regen of %s (record not entered)", filename);
-		scHold = SCStudyHoldBegin(study, what);
+		scHold = SCStudyHoldBegin(scFileStudy, what);
 		if (scHold==-4)
 			{
 			delete pDDO;
 			return ( FALSE );
 			}
+		if (strcmp(study, scFileStudy)!=0)
+			{
+			scHold2 = SCStudyHoldBegin(study, what);
+			if (scHold2==-4)
+				{
+				SCStudyHoldEnd(scHold);
+				delete pDDO;
+				return ( FALSE );
+				}
+			}
 		FILE *f = fopen(filename, "rb");
 		if (f) fclose(f);
 		else
 			{
+			SCStudyHoldEnd(scHold2);
 			SCStudyHoldEnd(scHold);
 			delete pDDO;
 			OperatorConsole.printf("***[Regen] %s -SKIPPED: the file was removed (verified delete) after it was read: record not entered\n", filename);
@@ -210,11 +236,13 @@ RegenToDatabase(Database *DB, char *basename, char *filename, const char *device
 
 	if(!SaveToDataBaseEx(*DB, pDDO, basename, device, FALSE, Rebuild))
 		{
+		SCStudyHoldEnd(scHold2);
 		SCStudyHoldEnd(scHold);
 		delete pDDO;
 		OperatorConsole.printf("***[Regen] %s -FAILED: Error SQL Add\n", filename);
 		return ( FALSE );
 		}
+	SCStudyHoldEnd(scHold2);
 	SCStudyHoldEnd(scHold);
 	delete pDDO;
 	OperatorConsole.printf("[Regen] %s -SUCCESS\n", filename);

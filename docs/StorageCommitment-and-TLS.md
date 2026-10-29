@@ -52,22 +52,22 @@ limits are described in [Building-Windows.md](Building-Windows.md).
 
 ### 1.3 Windows GUI
 
-The Windows GUI (`ConquestDICOMServer.exe`) has no fields for the keys of this series. Its
-source (`src/gui/Serverdriver.pas`) is changed here, but the prebuilt exe is older and has not been
-rebuilt (Delphi VCL). With the prebuilt GUI:
-- Edit `dicom.ini` with a text editor, in `[sscscp]`. **"Save configuration" in the GUI drops every
-  `[sscscp]` key it has no field for**, including all keys of this series and
-  `EnableStorageCommitment`, and then restarts dgate. Add the keys again after each save and
-  restart dgate.
-- Its `dgatesop.lst` has no storage commitment line; add
-  `StorageCommitmentPushModel  1.2.840.10008.1.20.1  sop` by hand.
+The Windows GUI (`ConquestDICOMServer.exe`) has no fields for the keys of this series. The
+prebuilt GUI is upstream's (`0676009`, rebuilt upstream in `f671a60`); this branch adds one prefix
+to its source and has not rebuilt it (Delphi VCL). With the prebuilt GUI:
+- Edit `dicom.ini` with a text editor, in `[sscscp]`. "Save configuration" keeps the `[sscscp]`
+  lines that start with `OutgoingSC`, `OutgoingStorageCommitment`, `EnableStorageCommitment`,
+  `SCUnsafeFile` or `SCTest` (not indented), but **drops the `TLS*` keys**, and then restarts
+  dgate. Add the TLS keys again after each save and restart dgate. A GUI older than `f671a60`
+  drops all keys of this series.
+- Its `dgatesop.lst` lists the storage commitment line commented out; remove the `#` (or add
+  `StorageCommitmentPushModel  1.2.840.10008.1.20.1  sop` by hand) and restart dgate.
 - Its `acrnema.map` header does not describe the 5th column. Paste the description on the
   "Known DICOM providers" page ("Save this list" also reloads the map in dgate), or run
   `dgate64.exe --write_amap:` while the server runs (it drops comments).
 
-A GUI rebuilt from this source keeps the storage commitment and TLS keys when it saves, lists the
-storage commitment class in a new `dgatesop.lst`, and writes the options description in a new
-map. Details, a block of keys to paste and an example map:
+A GUI rebuilt from this source also keeps the TLS keys when it saves, and writes the options
+description in a new map; its `dgatesop.lst` line stays commented out, as upstream's. Details, a block of keys to paste and an example map:
 [Building-Windows.md](Building-Windows.md), section 6.
 
 ---
@@ -98,7 +98,9 @@ association refuses it as before.
   affected. Without this check, any SCU could probe for SOP Instance UIDs, and the return address
   for a new association can only come from the map anyway. This check is done by
   `StorageCommitmentSupport` itself for every N-ACTION it reads; it does not depend on the upstream
-  keys `AllowOnlyMappedRemoteAE` / `CheckIPofRemoteAE`, which have no effect (section 7).
+  keys `AllowOnlyMappedRemoteAE` / `CheckIPofRemoteAE` (section 7). With
+  `AllowOnlyMappedRemoteAE = 1` an unmapped AE is already refused at association (A-ASSOCIATE-RJ)
+  and this check is not reached.
 - Request without an instance list: **0x0120**.
 - N-ACTION that cannot be read: no event.
 - `OutgoingStorageCommitment=1` with `EnableStorageCommitment=0`: an incoming N-ACTION gets
@@ -924,22 +926,33 @@ and ARM64, mingw-w64, plain and TLS) were run on Windows 11 against a Linux dgat
   same-association wait without a watchdog). See [Building-Windows.md](Building-Windows.md), section 5.
 
 **Upstream observations**
-1. **`AllowOnlyMappedRemoteAE` / `AllowOnlyMappedLocalAE` / `CheckIPofRemoteAE` are inactive.**
-   - `flpdu.hpp` declares `virtual BOOL ShouldIAcceptRemoteMapped(BYTE *)` (and `…LocalMapped`).
-   - `ExtendedPDU_Service` in `nkiqrsop.hpp` defines `ShouldIAcceptRemoteMapped(BYTE *A, int ip)`.
-   - Because the signatures differ, this hides the virtual function instead of overriding it.
-     `flpdu.cxx` calls the base version, which always accepts, so the keys have no effect.
-   - This change does not alter it. The new `ShouldIAcceptRemoteTransport` hook uses a matching
-     signature.
+1. **`AllowOnlyMappedRemoteAE` / `AllowOnlyMappedLocalAE` / `CheckIPofRemoteAE`: active since
+   upstream `0676009`.**
+   - Up to `f8c0057` the keys had no effect: `ExtendedPDU_Service` in `nkiqrsop.hpp` defined
+     `ShouldIAcceptRemoteMapped(BYTE *A, int ip)` while `flpdu.hpp` declared the virtual function as
+     `(BYTE *)`, so the derived one hid it instead of overriding it.
+   - `0676009` gives the virtual functions the `(BYTE *, int)` signature and calls them from
+     `flpdu.cxx` with the cleaned AE (cut at the first space) and `Link.sa.sin_addr.s_addr`. The
+     new `ShouldIAcceptRemoteTransport` hook of this branch is called right after
+     `ShouldIAcceptRemoteMapped`, with the raw 16-byte title (its own canonical form checks every
+     byte; for a title without a space inside both give the same AE). Checked here on the DICOM
+     port: with `AllowOnlyMappedRemoteAE = 1` an AE without an exact, non-wildcard map entry gets
+     A-ASSOCIATE-RJ and a mapped AE is served; the N-ACTION check of commit `cef67a7` is then not
+     reached. With `= 0` (default) that check answers 0x0124 as before.
    - The N-ACTION refusal of commit `cef67a7` does not rely on these keys. `StorageCommitmentSupport`
      looks up the calling AE with `GetACRNema` for every N-ACTION it reads (only with
      `EnableStorageCommitment=1`), whatever the keys say, and answers 0x0124 when no entry matches.
      It follows `GetACRNema` matching (an entry whose name ends in `*` matches by prefix, then exact,
      then case-insensitive), so a catch-all wildcard entry admits every calling AE, and it does not
-     compare the source address. That commit's message describes `AllowOnlyMappedRemoteAE` as
-     rejecting such an association earlier; with the keys inactive that never happens, and this
-     check is the only acrnema.map check of the calling AE of an N-ACTION (on the TLS ports the TLS
-     checks of section 4 come on top).
+     compare the source address (on the TLS ports the TLS checks of section 4 come on top).
+   - **Upstream limitation, NOT COVERED here:** `CheckIPofRemoteAE = 1` compares the map address
+     with `Link.sa`, but for an incoming association `Link.sa` is never filled: the listeners accept
+     on their own socket and `PDU_Service::Multiplex(int)` only takes the descriptor. The address
+     passed is therefore always 0, on the DICOM port and on the TLS ports alike. Checked here: with
+     `CheckIPofRemoteAE = 1` an AE mapped at its real address is refused and an AE mapped at
+     `0.0.0.0` is accepted. The address is IPv4 only (`sockaddr_in`), as everywhere in dgate. Not
+     changed in this branch; the TLS checks of section 4 take the peer address from the socket
+     (`getpeername`) themselves.
 2. **gpps ini cache (`gpps.cpp`): fixed here** (`e477062`, `cba1ee6`, `3cdcb7b`).
    - A cache hit was copied with an unbounded `strcpy` (up to 1023 characters, whatever the caller's
      buffer length was). It is now copied bounded, under the lock.
@@ -1089,7 +1102,7 @@ and ARM64, mingw-w64, plain and TLS) were run on Windows 11 against a Linux dgat
 - `16ee3f2` Windows build: quote OpenSSL library paths
 
 **Windows GUI, overview, binaries**
-- `8fbf2fe` GUI: Save configuration keeps the SC and TLS keys; dgatesop.lst lists storage commitment
+- `8fbf2fe` GUI: Save configuration also keeps the TLS keys; lua installers list storage commitment
 - `bb327cd` Docs: Windows GUI and the storage commitment / TLS configuration
 - `58d3853` Docs: fork overview for review (docs/README.md)
 - `27c17b9` Readme: move the fork note to an addendum at the end

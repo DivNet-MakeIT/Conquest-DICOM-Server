@@ -202,14 +202,15 @@ only with `sc_verify_and_delete:` / `scverifyanddelete`, or right after `sc_veri
 **Windows, mingw-w64 cross build** (Building-Windows.md §3): `build/windows-mingw` has a Dockerfile
 and `build-mingw.sh` for plain and TLS builds from a Linux or macOS host (`-O0`, as `maklinux`).
 
-**Windows binaries.** On this branch, `install64/dgate64.exe` (plain) and
-`install64/dgate64tls.exe` (TLS, OpenSSL linked statically) are built with Visual Studio 2022 from
+**Windows binaries.** On this branch, `install64-sc/dgate64.exe` (plain) and
+`install64-sc/dgate64tls.exe` (TLS, OpenSSL linked statically) are built with Visual Studio 2022 from
 the series up to `16ee3f2`; the later commits change no dgate source. They are added by the last
 commit of the branch, "Windows binaries: dgate64.exe (plain) and dgate64tls.exe (OpenSSL,
 static) ...", whose message has the sha256 sums and the build commands. Variant A has its own
-plain `install64/dgate64.exe`, built from its own source (commit "Windows binaries: dgate64.exe
-(plain) ..." on `sc-incoming`). Both need `lua5.1.dll` from `install64` next to them (the
-upstream file, unchanged). `install32/dgate.exe` and the prebuilt GUI `ConquestDICOMServer.exe`
+plain `install64-sc/dgate64.exe`, built from its own source (commit "Windows binaries:
+dgate64.exe (plain) ..." on `sc-incoming`). The upstream files in `install64/` are not changed;
+copy ours over `dgate64.exe` in the server folder (Building-Windows.md §4). Both need `lua5.1.dll`
+from `install64` next to them (the upstream file, unchanged). `install32/dgate.exe` and the prebuilt GUI `ConquestDICOMServer.exe`
 are upstream's and not rebuilt (32-bit builds were not tried; the GUI, Building-Windows.md §6).
 
 ## 6. Test coverage
@@ -299,16 +300,19 @@ From main document §7, §3.9, §4.5 and Building-Windows.md §5:
 
 ## 8. Observations on upstream code
 
-These were found while working on the series. Items 1, 5 and 9 are left as they are; the others
-are fixed or worked around here.
+These were found while working on the series. Item 1 is fixed upstream (`0676009`) except for
+its last part; items 5 and 9 are left as they are; the others are fixed or worked around here.
 
-1. **`AllowOnlyMappedRemoteAE`, `AllowOnlyMappedLocalAE` and `CheckIPofRemoteAE` have no effect.**
-   `flpdu.hpp` declares `virtual BOOL ShouldIAcceptRemoteMapped(BYTE *)` (and `...LocalMapped`);
-   `ExtendedPDU_Service` in `nkiqrsop.hpp` defines `ShouldIAcceptRemoteMapped(BYTE *A, int ip)`.
-   The signatures differ, so the derived function hides the virtual one instead of overriding it,
-   and `flpdu.cxx` calls the base version, which always accepts. Not changed here; the new
-   `ShouldIAcceptRemoteTransport` hook uses a matching signature, and the SC refusal of unmapped
-   AEs does its own map lookup (§7, item 1).
+1. **`AllowOnlyMappedRemoteAE`, `AllowOnlyMappedLocalAE` and `CheckIPofRemoteAE`.** Up to
+   `f8c0057` they had no effect (the `nkiqrsop.hpp` functions had another signature than the
+   virtual ones in `flpdu.hpp` and hid them). Fixed upstream in `0676009`; this branch takes its
+   signatures and call sites as they are and calls its own `ShouldIAcceptRemoteTransport` right
+   after `ShouldIAcceptRemoteMapped`. Checked here: `AllowOnlyMappedRemoteAE = 1` refuses an
+   unmapped AE at association, so the SC refusal of unmapped AEs (0x0124, its own map lookup, §7
+   item 1) is then not reached. **Still open upstream (not changed here):** for an incoming
+   association `Link.sa` is never filled (`PDU_Service::Multiplex(int)` only takes the
+   descriptor), so `CheckIPofRemoteAE = 1` compares the map address with 0.0.0.0, on every port:
+   an AE mapped at its real address is refused (checked).
 2. **gpps ini cache:** a cache hit was copied with an unbounded `strcpy` (up to 1023 characters,
    whatever the caller's buffer). Fixed: bounded copy under the lock; values that do not fit the
    cache arrays are not cached; results for values that fit are byte-identical (`e477062`,
@@ -406,8 +410,8 @@ converter forwards `c3fe55d` `74dd8f4` `5cac87e`
 `294b633` no `#define _errno errno` ·
 `d7c9881` optional TLS build in `amake.bat`, mingw-w64 cross build ·
 `16ee3f2` quote OpenSSL library paths ·
-`8fbf2fe` GUI: "Save configuration" keeps the SC and TLS keys, `dgatesop.lst` lists storage
-commitment (GUI source and lua installers) ·
+`8fbf2fe` GUI: "Save configuration" also keeps the TLS keys (one prefix added to upstream
+`f671a60`), lua installers list storage commitment ·
 "Windows binaries: dgate64.exe (plain) and dgate64tls.exe (OpenSSL, static) ..." (last commit of
 the branch) adds the prebuilt executables
 

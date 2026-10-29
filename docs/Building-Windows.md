@@ -120,9 +120,12 @@ Notes:
 
 ## 4. Running
 
-- Prebuilt: `install64/dgate64.exe` (plain) and `install64/dgate64tls.exe` (TLS, OpenSSL linked
-  statically), built with `amake.bat` and Visual Studio 2022 x64 as in 2.2 and 2.3 (commit
-  "Windows binaries", last on this branch; sha256 sums in its message). They need only
+- Prebuilt: `install64-sc/dgate64.exe` (plain) and `install64-sc/dgate64tls.exe` (TLS, OpenSSL
+  linked statically), built with `amake.bat` and Visual Studio 2022 x64 as in 2.2 and 2.3 (commit
+  "Windows binaries", last on this branch; sha256 sums in its message). The upstream files in
+  `install64/` and `install32/` are not changed. To use one, stop the server and copy it over
+  `dgate64.exe` in the server folder (with the GUI: the GUI's folder; a new GUI installation copies
+  the upstream `install64/dgate64.exe` there, so copy after that; 6.1). They need only
   `lua5.1.dll` from `install64` and Windows system DLLs. `install32/dgate.exe` is upstream's and
   was not rebuilt.
 - Files next to `dgate64.exe`:
@@ -179,9 +182,11 @@ These follow from the code and were checked on the test machine.
 ## 6. Windows GUI (`ConquestDICOMServer.exe`)
 
 The Windows distribution ships a prebuilt GUI. It starts `dgate64.exe` from its own folder and
-writes `dicom.ini`, `acrnema.map` and `dgatesop.lst` itself. This series changes the GUI source
-(`src/gui/Serverdriver.pas`), but the prebuilt `ConquestDICOMServer.exe` is older than these
-changes. The GUI is a Delphi VCL project for Embarcadero RAD Studio (`src/gui/amake.bat`,
+writes `dicom.ini`, `acrnema.map` and `dgatesop.lst` itself. The prebuilt
+`ConquestDICOMServer.exe` of upstream `0676009` (rebuilt upstream in `f671a60`) keeps the storage
+commitment keys on "Save configuration" but not the TLS keys (6.2), and writes the storage
+commitment line of `dgatesop.lst` commented out (6.3). This series adds the TLS keys to the GUI
+source (`src/gui/Serverdriver.pas`). The GUI is a Delphi VCL project for Embarcadero RAD Studio (`src/gui/amake.bat`,
 `ConquestDICOMServer.dproj`). It uses VCL, ADODB, DBGrids, `System.RegularExpressions` and the ICS
 sockets, so it cannot be built with Free Pascal or Lazarus; it has not been rebuilt here. Until it
 is rebuilt, 6.1 to 6.4 apply.
@@ -189,24 +194,28 @@ is rebuilt, 6.1 to 6.4 apply.
 ### 6.1 TLS build
 
 The GUI always runs `dgate64.exe`. To use the TLS build, stop the server, close the GUI, rename
-`dgate64.exe` (e.g. to `dgate64-plain.exe`) and `dgate64tls.exe` to `dgate64.exe`.
+`dgate64.exe` in its folder (e.g. to `dgate64-plain.exe`) and copy `install64-sc/dgate64tls.exe`
+there as `dgate64.exe`.
 
 ### 6.2 `dicom.ini`
 
 - The GUI has no fields for the keys of this series. Edit `dicom.ini` with a text editor
   (Notepad), inside `[sscscp]`: anywhere after the `[sscscp]` line and before the next `[...]`
   line. Keys in `[lua]` (e.g. `OutgoingSCStudyConfirmed`) go in `[lua]`.
-- **The prebuilt GUI drops these keys.** "Save configuration" (Configuration page) rewrites
-  `dicom.ini` from its fields (`SaveConfigButtonClick`: `Rewrite`, then one line per field). Every
-  `[sscscp]` key without a field is lost: all keys of this series, also `EnableStorageCommitment`.
-  Other sections are kept as they were. The GUI then kills and restarts dgate, so the server runs
-  without them at once. The same save runs from "Make ODBC data source" (Installation page) and
-  at a new installation.
-  - Effect: storage commitment is off in both directions and there are no TLS listeners. Nodes with
-    `T` in the map still get TLS only, never plain, but without the certificate keys these
-    connections normally fail.
-  - After every "Save configuration": open `dicom.ini` again, add the keys again, then "Kill and
-    restart the server" (Server status page).
+- **The prebuilt GUI drops the TLS keys.** "Save configuration" (Configuration page) rewrites
+  `dicom.ini` from its fields (`SaveConfigButtonClick`: `Rewrite`, then one line per field). Since
+  upstream `f671a60` (`ScKeptDgateIniLines`, in the prebuilt GUI of `0676009`) it first reads the
+  `[sscscp]` lines that start with `OutgoingSC`, `OutgoingStorageCommitment`,
+  `EnableStorageCommitment`, `SCUnsafeFile` or `SCTest` and writes them back unchanged, in a block
+  headed `# Storage commitment (no fields in this GUI; kept as found)`; names are compared in lower
+  case without trimming, so an indented line is not kept. Every other `[sscscp]` key without a
+  field is lost, i.e. all `TLS*` keys. Other sections are kept as they were. The GUI then kills and
+  restarts dgate. The same save runs from "Make ODBC data source" (Installation page) and at a new
+  installation. A GUI older than `f671a60` also drops the storage commitment keys.
+  - Effect: there are no TLS listeners. Nodes with `T` in the map still get TLS only, never plain,
+    but without the certificate keys these connections normally fail.
+  - After every "Save configuration": open `dicom.ini` again, add the TLS keys again, then "Kill
+    and restart the server" (Server status page).
   - Most of these keys are read at startup only (sections 3.2 and 4.1 of
     [StorageCommitment-and-TLS.md](StorageCommitment-and-TLS.md)); restart dgate after an edit.
 - The GUI reads `dicom.ini` only at its start. An edit made while the GUI is open is kept until
@@ -215,11 +224,8 @@ The GUI always runs `dgate64.exe`. To use the TLS build, stop the server, close 
   key that is already in the file. A key that is not there yet is appended at the **end of the
   file**, i.e. in the last section, which in a GUI-written `dicom.ini` is usually not `[sscscp]`
   (checked: it landed in `[lua]`). Use it only for keys that are already present.
-- **Rebuilt GUI (this source):** "Save configuration" keeps the `[sscscp]` lines that start with
-  `TLS`, `OutgoingSC`, `OutgoingStorageCommitment`, `EnableStorageCommitment`, `SCUnsafeFile` or
-  `SCTest`, unchanged, in a block headed `# Storage commitment and DICOM TLS (no fields in this
-  GUI; kept as found)` after the GUI's own keys. A `dicom.ini` without such keys is written as
-  before.
+- **Rebuilt GUI (this source):** the same function also keeps the `[sscscp]` lines that start
+  with `TLS`, in the same block. A `dicom.ini` without such keys is written as before.
 
 Block to paste (the defaults; only the first lines are needed to switch the features on):
 
@@ -253,8 +259,10 @@ The keys left empty above are empty by default (an empty `TLSPrivateKey` means t
 
 ### 6.3 `dgatesop.lst`
 
-- A `dgatesop.lst` made by the prebuilt GUI has no storage commitment class. Add this line after
-  the `Verification` line (tabs or spaces), then restart dgate:
+- A `dgatesop.lst` made by the GUI lists the storage commitment class commented out
+  (`#StorageCommitmentPushModel ...`, upstream `f671a60`; a GUI older than that does not list it).
+  Remove the `#` (or add this line after the `Verification` line, tabs or spaces), then restart
+  dgate:
 
   ```
   StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop
@@ -264,8 +272,8 @@ The keys left empty above are empty by default (an empty `TLSPrivateKey` means t
   comes on a new association (section 5). With `EnableStorageCommitment` and
   `OutgoingStorageCommitment` both 0, dgate refuses the class even when it is listed.
 - Switching "Enable Explicit and JPEG transfers" (Configuration page) and answering Yes to
-  "Update DGATESOP.LST?" writes the file again and removes the line; add it again.
-- **Rebuilt GUI:** a new `dgatesop.lst` has the line.
+  "Update DGATESOP.LST?" writes the file again with the line commented out; edit it again. This
+  is the same in a GUI rebuilt from this source (the line is kept as upstream wrote it).
 
 ### 6.4 `acrnema.map`
 

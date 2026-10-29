@@ -718,6 +718,7 @@ When            Who     What
 20261009	mvh	Write MyACRNema to webserver and zbs dicom.ini and -h to config.php files
 20261027	mvh     Keep SC lines in dicom.ini to prepare for Storage Commitment by mmd
 20261027	mvh     Added StorageCommitmentPushModel in dgatesop.lst, but blocked out by default
+20261026	mmd	New acrnema.map header describes the 5th-column options (T, L, SC, R, Rn, RI)
 
 Todo for odbc: dgate64 -v "-sSQL Server;DSN=conquest;Description=bla;Server=.\SQLEXPRESS;Database=conquest;Trusted_Connection=Yes"
 Update -e command
@@ -2812,6 +2813,19 @@ begin
     writeln(f, ' *                                                          *');
     writeln(f, ' * The syntax for each entry is :                           *');
     writeln(f, ' *   AE   <IP adress|Host name>   port number   compression *');
+    writeln(f, ' *   [options]                                              *');
+    writeln(f, ' *                                                          *');
+    writeln(f, ' * Options (optional 5th column, letters in this order):    *');
+    writeln(f, ' *   T   = node needs DICOM TLS: this dgate has no TLS,     *');
+    writeln(f, ' *         every association to it is refused (L = with     *');
+    writeln(f, ' *         T: legacy TLS profile, refused the same way)     *');
+    writeln(f, ' *   SC  = storage commitment for data sent to this node    *');
+    writeln(f, ' *   R   = re-send missing objects, limit from dicom.ini    *');
+    writeln(f, ' *         (OutgoingSCResendMax); R needs SC                *');
+    writeln(f, ' *   Rn  = re-send at most n times (n = 1..999), e.g. R5    *');
+    writeln(f, ' *   RI  = re-send until committed (I = infinite)           *');
+    writeln(f, ' * Examples: SC  SCR5  SCRI                                 *');
+    writeln(f, ' * No options = as in previous versions.                    *');
     writeln(f, ' *                                                          *');
     writeln(f, ' * For compression see manual. Values are un=uncompressed;  *');
     writeln(f, ' * ul=littleendianexplicit,ub=bigendianexplicit,ue=both     *');

@@ -63,6 +63,8 @@
 -- 20250425 Some fixed for runlocal (ladle)
 -- 20250911 Fallback for failed jpeg-c ./configure on debian 13
 -- 20260813 Changed ladle() call
+-- 20261027 dgatesop.lst lists StorageCommitmentPushModel (refused by dgate while
+--          EnableStorageCommitment and OutgoingStorageCommitment are 0)
 
 local server = 'unknown'
 local sep, dsep = '\\', '\\\\'
@@ -837,6 +839,7 @@ s = s or '#'
 #None				none				LocalAE
 #DICOM				1.2.840.10008.3.1.1.1		application
 Verification			1.2.840.10008.1.1		sop
+StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop
 RETIRED_StoredPrintStorage                           1.2.840.10008.5.1.1.27		sop
 RETIRED_HardcopyGrayscaleImageStorage                1.2.840.10008.5.1.1.29		sop
 RETIRED_HardcopyColorImageStorage                    1.2.840.10008.5.1.1.30		sop

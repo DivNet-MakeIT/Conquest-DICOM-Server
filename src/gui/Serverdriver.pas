@@ -718,6 +718,7 @@ When            Who     What
 20261009	mvh	Write MyACRNema to webserver and zbs dicom.ini and -h to config.php files
 20261027	mvh     Keep SC lines in dicom.ini to prepare for Storage Commitment by mmd
 20261027	mvh     Added StorageCommitmentPushModel in dgatesop.lst, but blocked out by default
+20261029	mmd	ScKeptDgateIniLines also keeps the DICOM TLS keys of [sscscp] (TLS*)
 
 Todo for odbc: dgate64 -v "-sSQL Server;DSN=conquest;Description=bla;Server=.\SQLEXPRESS;Database=conquest;Trusted_Connection=Yes"
 Update -e command
@@ -4317,7 +4318,7 @@ begin
 end;
 
 
-// dgate keys for storage commitment have no fields in this GUI. Save configuration
+// dgate keys for storage commitment and DICOM TLS have no fields in this GUI. Save configuration
 // rewrites dicom.ini from its fields, so the [sscscp] lines that start with these names are read
 // here from the old file and written back unchanged (before, they were dropped).
 // Lines are matched as by RestoreconfigButtonClick: lower case, no trimming.
@@ -4342,6 +4343,7 @@ begin
       else if Copy(s, 1, 1) = '[' then
         inmain := false
       else if inmain and (
+        (Copy(s, 1, length('tls')) = 'tls') or
         (Copy(s, 1, length('outgoingsc')) = 'outgoingsc') or
         (Copy(s, 1, length('outgoingstoragecommitment')) = 'outgoingstoragecommitment') or
         (Copy(s, 1, length('enablestoragecommitment')) = 'enablestoragecommitment') or

@@ -91,15 +91,18 @@ Notes:
 
 ## 4. Running
 
-- Prebuilt: `install64/dgate64.exe` (commit "Windows binaries: dgate64.exe", last on this branch;
-  sha256 sum and build commands in its message). It needs only `lua5.1.dll` from `install64` and
-  Windows system DLLs. `install32/dgate.exe` is upstream's and was not rebuilt.
+- Prebuilt: `install64-sc/dgate64.exe` (commit "Windows binaries: dgate64.exe", last on this
+  branch; sha256 sum and build commands in its message). The upstream files in `install64/` and
+  `install32/` are not changed. To use it, stop the server and copy it over `dgate64.exe` in the
+  server folder (with the GUI: the GUI's folder; a new GUI installation copies the upstream
+  `install64/dgate64.exe` there, so copy after that). It needs only `lua5.1.dll` from `install64`
+  and Windows system DLLs. `install32/dgate.exe` is upstream's and was not rebuilt.
 - Files next to `dgate64.exe`:
   - `lua5.1.dll` from `install64` (x64 builds with `LUA51EXTERN`);
   - `dicom.ini` and `acrnema.map`;
   - `dgate.dic`;
-  - `dgatesop.lst`, which needs the Storage Commitment Push Model line for incoming SC and for
-    outgoing SC (the result comes on a new association, section 5);
+  - `dgatesop.lst`, which needs the Storage Commitment Push Model line, not commented out, for
+    incoming SC and for outgoing SC (the result comes on a new association, section 5; 6.2);
   - `dicom.sql`.
 
   Then `dgate64.exe -v -r` once, and `dgate64.exe -v` to serve.
@@ -147,27 +150,30 @@ These follow from the code and were checked on the test machine.
 ## 6. Windows GUI (`ConquestDICOMServer.exe`)
 
 The Windows distribution ships a prebuilt GUI. It starts `dgate64.exe` from its own folder and
-writes `dicom.ini`, `acrnema.map` and `dgatesop.lst` itself. This series changes the GUI source
-(`src/gui/Serverdriver.pas`), but the prebuilt `ConquestDICOMServer.exe` is older than these
-changes. The GUI is a Delphi VCL project for Embarcadero RAD Studio (`src/gui/amake.bat`,
+writes `dicom.ini`, `acrnema.map` and `dgatesop.lst` itself. The prebuilt
+`ConquestDICOMServer.exe` of upstream `0676009` (rebuilt upstream in `f671a60`) keeps the storage
+commitment keys on "Save configuration" (6.1) and writes the storage commitment line of
+`dgatesop.lst` commented out (6.2). This branch changes the GUI source only in the `acrnema.map`
+header (6.3). The GUI is a Delphi VCL project for Embarcadero RAD Studio (`src/gui/amake.bat`,
 `ConquestDICOMServer.dproj`). It uses VCL, ADODB, DBGrids, `System.RegularExpressions` and the ICS
-sockets, so it cannot be built with Free Pascal or Lazarus; it has not been rebuilt here. Until it
-is rebuilt, 6.1 to 6.3 apply.
+sockets, so it cannot be built with Free Pascal or Lazarus; it has not been rebuilt here.
 
 ### 6.1 `dicom.ini`
 
 - The GUI has no fields for the keys of this series. Edit `dicom.ini` with a text editor
   (Notepad), inside `[sscscp]`: anywhere after the `[sscscp]` line and before the next `[...]`
   line. Keys in `[lua]` (e.g. `OutgoingSCStudyConfirmed`) go in `[lua]`.
-- **The prebuilt GUI drops these keys.** "Save configuration" (Configuration page) rewrites
-  `dicom.ini` from its fields (`SaveConfigButtonClick`: `Rewrite`, then one line per field). Every
-  `[sscscp]` key without a field is lost: all keys of this series, also `EnableStorageCommitment`.
-  Other sections are kept as they were. The GUI then kills and restarts dgate, so the server runs
-  without them at once. The same save runs from "Make ODBC data source" (Installation page) and
-  at a new installation.
-  - Effect: storage commitment is off in both directions.
-  - After every "Save configuration": open `dicom.ini` again, add the keys again, then "Kill and
-    restart the server" (Server status page).
+- **"Save configuration" keeps these keys** (upstream `f671a60`, `ScKeptDgateIniLines`; in the
+  prebuilt GUI of `0676009`). It rewrites `dicom.ini` from its fields (`SaveConfigButtonClick`:
+  `Rewrite`, then one line per field), but first reads the `[sscscp]` lines that start with
+  `OutgoingSC`, `OutgoingStorageCommitment`, `EnableStorageCommitment`, `SCUnsafeFile` or `SCTest`
+  and writes them back unchanged, in a block headed `# Storage commitment (no fields in this GUI;
+  kept as found)` after the GUI's own keys. Names are compared in lower case without trimming: an
+  indented line is not kept. Other sections are kept as they were. The GUI then kills and restarts
+  dgate. The same save runs from "Make ODBC data source" (Installation page) and at a new
+  installation.
+  - A GUI older than `f671a60` drops every `[sscscp]` key without a field: with it, add the keys
+    again after every "Save configuration", then "Kill and restart the server".
   - Most of these keys are read at startup only (section 3.2 of
     [StorageCommitment.md](StorageCommitment.md)); restart dgate after an edit.
 - The GUI reads `dicom.ini` only at its start. An edit made while the GUI is open is kept until
@@ -176,11 +182,6 @@ is rebuilt, 6.1 to 6.3 apply.
   key that is already in the file. A key that is not there yet is appended at the **end of the
   file**, i.e. in the last section, which in a GUI-written `dicom.ini` is usually not `[sscscp]`
   (checked: it landed in `[lua]`). Use it only for keys that are already present.
-- **Rebuilt GUI (this source):** "Save configuration" keeps the `[sscscp]` lines that start with
-  `OutgoingSC`, `OutgoingStorageCommitment`, `EnableStorageCommitment`, `SCUnsafeFile` or
-  `SCTest`, unchanged, in a block headed `# Storage commitment (no fields in this GUI; kept as
-  found)` after the GUI's own keys. A `dicom.ini` without such keys is written as
-  before.
 
 Block to paste (the defaults; only the first lines are needed to switch the features on):
 
@@ -200,8 +201,10 @@ OutgoingSCConnectTimeout  = 30
 
 ### 6.2 `dgatesop.lst`
 
-- A `dgatesop.lst` made by the prebuilt GUI has no storage commitment class. Add this line after
-  the `Verification` line (tabs or spaces), then restart dgate:
+- A `dgatesop.lst` made by the GUI lists the storage commitment class commented out
+  (`#StorageCommitmentPushModel ...`, upstream `f671a60`; a GUI older than that does not list it).
+  Remove the `#` (or add this line after the `Verification` line, tabs or spaces), then restart
+  dgate:
 
   ```
   StorageCommitmentPushModel	1.2.840.10008.1.20.1		sop
@@ -211,8 +214,7 @@ OutgoingSCConnectTimeout  = 30
   comes on a new association (section 5). With `EnableStorageCommitment` and
   `OutgoingStorageCommitment` both 0, dgate refuses the class even when it is listed.
 - Switching "Enable Explicit and JPEG transfers" (Configuration page) and answering Yes to
-  "Update DGATESOP.LST?" writes the file again and removes the line; add it again.
-- **Rebuilt GUI:** a new `dgatesop.lst` has the line.
+  "Update DGATESOP.LST?" writes the file again with the line commented out; edit it again.
 
 ### 6.3 `acrnema.map`
 

@@ -182,11 +182,13 @@ and point `AsetCompiler64.bat` at the Visual Studio prompt's compiler.
 and `build-mingw.sh` (`build-mingw.sh /src /out`) for a build from a Linux or macOS host (`-O0`, as
 `maklinux`).
 
-**Windows binaries.** On this branch, `install64/dgate64.exe` is added by the last commit of the
-branch, "Windows binaries: dgate64.exe", whose message has the sha256 sum and the build commands.
-It needs `lua5.1.dll` from `install64` next to it (the upstream file, unchanged).
-`install32/dgate.exe` and the prebuilt GUI `ConquestDICOMServer.exe` are upstream's and not rebuilt
-(32-bit builds were not tried; the GUI, Building-Windows.md §6).
+**Windows binaries.** On this branch, `install64-sc/dgate64.exe` is added by the last commit of
+the branch, "Windows binaries: dgate64.exe", whose message has the sha256 sum and the build
+commands. The upstream files in `install64/` and `install32/` are not changed; copy the file over
+`dgate64.exe` in the server folder (Building-Windows.md §4). It needs `lua5.1.dll` from `install64`
+next to it (the upstream file, unchanged). `install32/dgate.exe` and the prebuilt GUI
+`ConquestDICOMServer.exe` are upstream's and not rebuilt (32-bit builds were not tried; the GUI,
+Building-Windows.md §6).
 
 ## 6. Test coverage
 
@@ -203,6 +205,9 @@ synthetic patients and pixel data), DCMTK and pynetdicom as peers.
 - the ini cache concurrency stress test;
 - a test of the refusal of nodes with `T`: no association to them, never plain text; storage
   commitment requests and `sc_verify_now:` send nothing.
+- the upstream key `AllowOnlyMappedRemoteAE` (active since `0676009`) together with the storage
+  commitment refusal: with `= 1` an unmapped AE gets A-ASSOCIATE-RJ and a mapped AE is served;
+  with `= 0` the unmapped AE gets N-ACTION 0x0124; `CheckIPofRemoteAE = 1` (§8 item 1).
 
 **On `sc-outgoing-tls`**, whose storage commitment code this branch has unchanged, the same suites
 ran on sqlite, MariaDB and PostgreSQL builds (x86_64 and arm64), together with the Windows 11 tests
@@ -244,15 +249,17 @@ From main document §6, §3.9 and Building-Windows.md §5:
 
 ## 8. Observations on upstream code
 
-These were found while working on the series. Items 1, 5 and 9 are left as they are; the others
-are fixed or worked around here.
+These were found while working on the series. Item 1 is fixed upstream (`0676009`) except for
+its last part; items 5 and 9 are left as they are; the others are fixed or worked around here.
 
-1. **`AllowOnlyMappedRemoteAE`, `AllowOnlyMappedLocalAE` and `CheckIPofRemoteAE` have no effect.**
-   `flpdu.hpp` declares `virtual BOOL ShouldIAcceptRemoteMapped(BYTE *)` (and `...LocalMapped`);
-   `ExtendedPDU_Service` in `nkiqrsop.hpp` defines `ShouldIAcceptRemoteMapped(BYTE *A, int ip)`.
-   The signatures differ, so the derived function hides the virtual one instead of overriding it,
-   and `flpdu.cxx` calls the base version, which always accepts. Not changed here; the SC refusal
-   of unmapped AEs does its own map lookup (§6, item 1).
+1. **`AllowOnlyMappedRemoteAE`, `AllowOnlyMappedLocalAE` and `CheckIPofRemoteAE`.** Up to
+   `f8c0057` they had no effect (the `nkiqrsop.hpp` functions had another signature than the
+   virtual ones in `flpdu.hpp` and hid them). Fixed upstream in `0676009`; checked here:
+   `AllowOnlyMappedRemoteAE = 1` refuses an unmapped AE at association, so the SC refusal of
+   unmapped AEs (0x0124, its own map lookup, §6 item 1) is then not reached. **Still open
+   upstream (not changed here):** for an incoming association `Link.sa` is never filled
+   (`PDU_Service::Multiplex(int)` only takes the descriptor), so `CheckIPofRemoteAE = 1` compares
+   the map address with 0.0.0.0: an AE mapped at its real address is refused (checked).
 2. **gpps ini cache:** a cache hit was copied with an unbounded `strcpy` (up to 1023 characters,
    whatever the caller's buffer). Fixed: bounded copy under the lock; values that do not fit the
    cache arrays are not cached; results for values that fit are byte-identical.
@@ -287,7 +294,7 @@ In order on top of `0676009` (hashes: `git log 0676009..sc-outgoing`):
 3. odbci.cpp: no #define _errno errno (Visual Studio 2015+ and mingw-w64)
 4. Outgoing storage commitment (SCU), re-send and verify-before-delete, without DICOM TLS
 5. Windows build: mingw-w64 cross build
-6. GUI: Save configuration keeps the storage commitment keys
+6. GUI: acrnema.map header describes the 5th-column options
 7. Docs: storage commitment without TLS
 8. Readme: addendum for this branch
 9. Windows binaries: dgate64.exe
